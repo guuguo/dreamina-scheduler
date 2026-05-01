@@ -1,0 +1,26 @@
+[package]
+name = "dreamina-scheduler"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "dreamina_scheduler_lib"
+path = "src/lib.rs"
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2.7.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+arboard = "3.6.1"
+png = "0.17.16"
+reqwest = { version = "0.12", features = ["blocking"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

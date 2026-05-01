@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#6C5CE7"/>
+      <stop offset="50%" style="stop-color:#7168FF"/>
+      <stop offset="100%" style="stop-color:#5B5CF6"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#A29BFE"/>
+      <stop offset="100%" style="stop-color:#6C5CE7"/>
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <!-- Rounded square background -->
+  <rect x="32" y="32" width="960" height="960" rx="192" ry="192" fill="url(#bg)"/>
+  <!-- Inner subtle shape -->
+  <rect x="80" y="80" width="864" height="864" rx="160" ry="160" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="2"/>
+  <!-- Film strip / scheduler visual metaphor -->
+  <!-- Left film perforations -->
+  <rect x="120" y="280" width="40" height="56" rx="8" fill="rgba(255,255,255,0.15)"/>
+  <rect x="120" y="360" width="40" height="56" rx="8" fill="rgba(255,255,255,0.15)"/>
+  <rect x="120" y="440" width="40" height="56" rx="8" fill="rgba(255,255,255,0.15)"/>
+  <rect x="120" y="520" width="40" height="56" rx="8" fill="rgba(255,255,255,0.15)"/>
+  <rect x="120" y="600" width="40" height="56" rx="8" fill="rgba(255,255,255,0.15)"/>
+  <rect x="120" y="680" width="40" height="56" rx="8" fill="rgba(255,255,255,0.15)"/>
+  <!-- Right film perforations -->
+  <rect x="864" y="280" width="40" height="56" rx="8" fill="rgba(255,255,255,0.15)"/>
+  <rect x="864" y="360" width="40" height="56" rx="8" fill="rgba(255,255,255,0.15)"/>
+  <rect x="864" y="440" width="40" height="56" rx="8" fill="rgba(255,255,255,0.15)"/>
+  <rect x="864" y="520" width="40" height="56" rx="8" fill="rgba(255,255,255,0.15)"/>
+  <rect x="864" y="600" width="40" height="56" rx="8" fill="rgba(255,255,255,0.15)"/>
+  <rect x="864" y="680" width="40" height="56" rx="8" fill="rgba(255,255,255,0.15)"/>
+  <!-- Center play button / spark -->
+  <circle cx="512" cy="480" r="120" fill="rgba(255,255,255,0.12)"/>
+  <polygon points="470,400 470,560 590,480" fill="white" filter="url(#glow)"/>
+  <!-- Sparkle dots (AI creativity) -->
+  <circle cx="340" cy="320" r="8" fill="white" opacity="0.7"/>
+  <circle cx="360" cy="300" r="4" fill="white" opacity="0.5"/>
+  <circle cx="700" cy="350" r="6" fill="white" opacity="0.6"/>
+  <circle cx="720" cy="330" r="3" fill="white" opacity="0.4"/>
+  <circle cx="300" cy="640" r="5" fill="white" opacity="0.5"/>
+  <circle cx="740" cy="620" r="7" fill="white" opacity="0.55"/>
+  <circle cx="720" cy="600" r="3" fill="white" opacity="0.35"/>
+  <!-- Schedule timeline at bottom -->
+  <line x1="200" y1="780" x2="824" y2="780" stroke="rgba(255,255,255,0.25)" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="280" cy="780" r="10" fill="rgba(255,255,255,0.5)"/>
+  <circle cx="420" cy="780" r="10" fill="rgba(255,255,255,0.5)"/>
+  <circle cx="560" cy="780" r="10" fill="#A29BFE"/>
+  <circle cx="700" cy="780" r="10" fill="rgba(255,255,255,0.3)"/>
+  <!-- "D" letterform subtle watermark -->
+  <text x="512" y="900" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="48" font-weight="900" fill="rgba(255,255,255,0.18)" letter-spacing="8">DREAMINA</text>
+</svg>
