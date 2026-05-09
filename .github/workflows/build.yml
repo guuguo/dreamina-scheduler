@@ -10,21 +10,7 @@ permissions:
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: macos-latest
-            args: '--target aarch64-apple-darwin'
-            rust-target: aarch64-apple-darwin
-          - platform: macos-13
-            args: '--target x86_64-apple-darwin'
-            rust-target: x86_64-apple-darwin
-          - platform: windows-latest
-            args: '--bundles nsis'
-            rust-target: ''
-
-    runs-on: ${{ matrix.platform }}
+    runs-on: windows-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -37,8 +23,6 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust-target }}
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
@@ -48,14 +32,12 @@ jobs:
       - name: Install frontend dependencies
         run: npm install
 
-      - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build Windows NSIS installer
+        run: npm run tauri build -- --bundles nsis
+
+      - name: Upload Windows installer artifact
+        uses: actions/upload-artifact@v4
         with:
-          tagName: v__VERSION__
-          releaseName: 'Dreamina Scheduler v__VERSION__'
-          releaseBody: 'See the assets below to download and install this version.'
-          releaseDraft: true
-          prerelease: false
-          args: ${{ matrix.args }}
+          name: dreamina-scheduler-windows-nsis
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
