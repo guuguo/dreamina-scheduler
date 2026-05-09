@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
+import { getVersion } from '@tauri-apps/api/app';
 import { open } from '@tauri-apps/plugin-dialog';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -15,6 +16,15 @@ import {
   buildTaskFormFromTaskForEdit,
 } from './app-logic.js';
 import { buildMentionItems } from './mention-utils.js';
+import {
+  createEmptyImageGenForm,
+  filterMentionItemsForImageGen,
+  addReferenceAsset,
+  removeReferenceAsset,
+  applyMentionRefsToImageGenForm,
+  shouldSuppressImageContextMenu,
+  IMAGEGEN_MAX_REFERENCES,
+} from './imagegen-utils.js';
 import PromptMentionEditor from './components/PromptMentionEditor.jsx';
 import {
   deriveCurrentExecutionRecord,
@@ -120,6 +130,37 @@ import { ImageModal } from './components/media/ImageModal.jsx';
 import { AudioPreviewRow } from './components/media/AudioPreviewRow.jsx';
 import { AudioAssetModal } from './components/media/AudioAssetModal.jsx';
 import { AiThinkingModal } from './components/AiThinkingModal.jsx';
+import { StatusPill } from './components/ui/StatusPill.jsx';
+import { ToggleSwitch } from './components/ui/ToggleSwitch.jsx';
+import { NumberedSection } from './components/ui/NumberedSection.jsx';
+import { PasswordInput } from './components/ui/PasswordInput.jsx';
+import { CopyableInput } from './components/ui/CopyableInput.jsx';
+import { StatCard } from './components/ui/StatCard.jsx';
+import { SearchBox } from './components/ui/SearchBox.jsx';
+import { FilterSelect } from './components/ui/FilterSelect.jsx';
+import { InlineCopyButton } from './components/ui/InlineCopyButton.jsx';
+import { Pager } from './components/ui/Pager.jsx';
+import {
+  normalizeLogEntry,
+  deriveLogStats,
+  deriveCategoryCounts,
+  filterLogs,
+  paginateLogs,
+  deriveLogAssociations,
+  buildLogExportPayload,
+  findDefaultSelectedLogId,
+  getQuickLocationFilters,
+  deriveTaskOptions,
+  LOG_LEVELS,
+  LOG_SOURCES,
+  LEVEL_VARIANT_MAP,
+  SOURCE_LABEL_MAP,
+  CATEGORY_LABEL_MAP,
+  SIDEBAR_CATEGORIES,
+  QUICK_LOCATIONS,
+  TIME_RANGE_OPTIONS,
+  DEFAULT_PAGE_SIZE,
+} from './log-view-utils.js';
 import './styles.css';
 
 const ratios = ['9:16', '16:9', '1:1', '3:4', '4:3', '21:9'];
@@ -137,6 +178,7 @@ const views = [
   { id: 'dashboard', label: '仪表盘', icon: Home },
   { id: 'roles', label: '角色库', icon: User },
   { id: 'queue', label: '任务中心', icon: ListChecks },
+  { id: 'imagegen', label: '生图', icon: Image },
   { id: 'logs', label: '日志', icon: Logs },
   { id: 'settings', label: '设置', icon: Settings },
 ];
@@ -185,6 +227,8 @@ function App() {
   const [roleEditor, setRoleEditor] = useState(null);
   const [dragActive, setDragActive] = useState(false);
   const [confirmModal, setConfirmModal] = useState(null);
+  const [appVersion, setAppVersion] = useState('');
+  useEffect(() => { getVersion().then(setAppVersion).catch(() => {}); }, []);
   const [creditInfo, setCreditInfo] = useState({ available: false, total: '', used: '', remaining: '', raw_text: '' });
   const [creditModalOpen, setCreditModalOpen] = useState(false);
   const [settingsForm, setSettingsForm] = useState(emptyState.settings);
@@ -194,6 +238,9 @@ function App() {
   };
   const [taskForm, setTaskForm] = useState(() => createEmptyTaskForm());
   const [editingTaskId, setEditingTaskId] = useState(null);
+  // 图片生成预览项提升到 App 层，避免切 tab 后 ImageGenView 卸载导致状态丢失
+  // 历史记录从 state.imagegen_history 派生（后端持久化）
+  const [imageGenPreview, setImageGenPreview] = useState(null);
   const dropContextRef = useRef({ activeView, selectedRoleId, roleEditor });
 
   async function refreshState() {
@@ -721,28 +768,34 @@ function App() {
     }
   }
 
+  async function importTempImages() {
+    const selected = await open({
+      multiple: true,
+      filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
+    });
+    if (!selected) return [];
+    const paths = Array.isArray(selected) ? selected : [selected];
+    const imported = [];
+    for (const path of paths) {
+      // eslint-disable-next-line no-await-in-loop
+      const name = path.split('/').pop().replace(/\.[^.]+$/, '') || '临时图片';
+      const asset = await invoke('import_temp_image_command', { input: { path, name } });
+      imported.push(asset);
+    }
+    await refreshState();
+    return imported;
+  }
+
   async function addTempImage() {
     try {
-      const selected = await open({
-        multiple: true,
-        filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
-      });
-      if (!selected) return;
-      const paths = Array.isArray(selected) ? selected : [selected];
-      const imported = [];
-      for (const path of paths) {
-        // eslint-disable-next-line no-await-in-loop
-        const name = path.split('/').pop().replace(/\.[^.]+$/, '') || '临时图片';
-        const asset = await invoke('import_temp_image_command', { input: { path, name } });
-        imported.push(asset);
-      }
+      const imported = await importTempImages();
+      if (!imported.length) return;
       setTaskForm((current) => ({
         ...current,
         temp_image_paths: [...current.temp_image_paths, ...imported.map((asset) => asset.stored_path)].slice(0, 9),
         temp_image_asset_ids: [...(current.temp_image_asset_ids || []), ...imported.map((asset) => asset.id)].slice(0, 9),
         image_asset_ids: uniqueValues([...(current.image_asset_ids || []), ...imported.map((asset) => asset.id)]).slice(0, 9),
       }));
-      await refreshState();
     } catch (error) {
       setFeedback(String(error));
     }
@@ -814,6 +867,7 @@ function App() {
             })),
           active_ai_model_id: settingsForm.active_ai_model_id || (settingsForm.ai_model_configs?.[0]?.id || defaultAiModelConfig.id),
           prevent_sleep: settingsForm.prevent_sleep ?? true,
+          image_model_config: settingsForm.image_model_config || null,
         },
       });
       setFeedback('设置已保存');
@@ -845,6 +899,7 @@ function App() {
                 type="button"
                 className={activeView === item.id ? 'active' : ''}
                 onClick={() => setActiveView(item.id)}
+                title={item.label}
               >
                 <Icon size={17} />
                 <span>{item.label}</span>
@@ -852,7 +907,7 @@ function App() {
             );
           })}
         </nav>
-        <span className="version">v0.1.0</span>
+        {appVersion ? <span className="version">v{appVersion}</span> : null}
       </aside>
 
       <section className="app-window">
@@ -861,13 +916,14 @@ function App() {
             <span className="traffic-spacer" data-tauri-drag-region />
             <div className="brand-mark small" />
             <strong>Dreamina Scheduler</strong>
-            <span className={`cli-status ${cli.available ? 'ok' : 'bad'}`}>
+            <StatusPill variant={cli.available ? 'ok' : 'bad'}>
               <CheckCircle2 size={13} />
               {cli.available ? 'dreamina CLI 已连接' : cli.message}
-            </span>
+            </StatusPill>
             {cli.available ? (
-              <span
-                className={`cli-status credit-badge ${creditInfo.available ? 'ok' : 'neutral'}`}
+              <StatusPill
+                variant={creditInfo.available ? 'ok' : 'neutral'}
+                style={{ cursor: 'pointer' }}
                 onClick={() => { refreshCredit(); setCreditModalOpen(true); }}
                 title="点击查看额度详情"
               >
@@ -875,7 +931,7 @@ function App() {
                 {creditInfo.available
                   ? (creditInfo.remaining ? `剩余 ${creditInfo.remaining}` : `总额 ${creditInfo.total}`)
                   : '额度未知'}
-              </span>
+              </StatusPill>
             ) : null}
           </div>
           <div className="window-actions">
@@ -905,6 +961,7 @@ function App() {
             selectedTaskId={selectedTaskId}
             setSelectedTaskId={setSelectedTaskId}
             setActiveView={setActiveView}
+            pendingTaskOps={pendingTaskOps}
           />
         ) : null}
         {activeView === 'create' ? (
@@ -983,7 +1040,21 @@ function App() {
             lastTickAt={lastTickAt}
           />
         ) : null}
-        {activeView === 'logs' ? <LogsView logs={state.logs} clearLogs={clearLogs} /> : null}
+        {activeView === 'imagegen' ? (
+          <ImageGenView
+            settingsForm={settingsForm}
+            history={state.imagegen_history || []}
+            previewItem={imageGenPreview}
+            setPreviewItem={setImageGenPreview}
+            state={state}
+            assetById={assetById}
+            importTempImages={importTempImages}
+            pasteClipboardImage={pasteClipboardImage}
+            pasteSystemClipboardImage={pasteSystemClipboardImage}
+            refreshState={refreshState}
+          />
+        ) : null}
+        {activeView === 'logs' ? <LogsView logs={state.logs} tasks={state.tasks} settings={state.settings} clearLogs={clearLogs} setActiveView={setActiveView} setSelectedTaskId={setSelectedTaskId} /> : null}
         {activeView === 'settings' ? (
           <SettingsView
             cli={cli}
@@ -1010,7 +1081,7 @@ function App() {
   );
 }
 
-function Dashboard({ state, cli, hostPlatform, queueStats, submitTask, queryTask, processQueueOnce, selectedTaskId, setSelectedTaskId, setActiveView }) {
+function Dashboard({ state, cli, hostPlatform, queueStats, submitTask, queryTask, processQueueOnce, selectedTaskId, setSelectedTaskId, setActiveView, pendingTaskOps = {} }) {
   const selectedTask = state.tasks.find((task) => task.id === selectedTaskId) || state.tasks[0] || null;
   return (
     <div className="dashboard-view">
@@ -1073,7 +1144,7 @@ function Dashboard({ state, cli, hostPlatform, queueStats, submitTask, queryTask
           <footer>共 {state.tasks.length} 条 · 等待 {queueStats.waiting} · 运行 {queueStats.running} · 成功 {queueStats.done}</footer>
         </div>
 
-        <TaskDetail task={selectedTask} submitTask={submitTask} queryTask={queryTask} />
+        <TaskDetail task={selectedTask} submitTask={submitTask} queryTask={queryTask} pendingTaskOps={pendingTaskOps} />
       </section>
     </div>
   );
@@ -2550,14 +2621,262 @@ function CommandPreviewModal({ title, commandText, onClose }) {
 }
 
 
-function LogsView({ logs, clearLogs }) {
+function LogsView({ logs, tasks, settings, clearLogs, setActiveView, setSelectedTaskId }) {
+  // ── 规范化 ──
+  const normalized = useMemo(() => (logs || []).map(normalizeLogEntry), [logs]);
+
+  // ── UI state ──
+  const [search, setSearch] = useState('');
+  const [levelFilter, setLevelFilter] = useState('');
+  const [sourceFilter, setSourceFilter] = useState('');
+  const [taskFilter, setTaskFilter] = useState('');
+  const [timeRange, setTimeRange] = useState('all');
+  const [category, setCategory] = useState('all');
+  const [selectedLogId, setSelectedLogId] = useState(null);
+  const [autoRefresh, setAutoRefresh] = useState(false);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
+
+  // ── 派生 ──
+  const stats = useMemo(() => deriveLogStats(normalized, settings?.log_retention_count || 500), [normalized, settings]);
+  const catCounts = useMemo(() => deriveCategoryCounts(normalized), [normalized]);
+  const filtered = useMemo(() => filterLogs(normalized, { search, level: levelFilter, source: sourceFilter, taskId: taskFilter, timeRange, category }), [normalized, search, levelFilter, sourceFilter, taskFilter, timeRange, category]);
+  const paginated = useMemo(() => paginateLogs(filtered, page, pageSize), [filtered, page, pageSize]);
+  const selectedLog = useMemo(() => normalized.find((l) => l.id === selectedLogId) || null, [normalized, selectedLogId]);
+  const associations = useMemo(() => deriveLogAssociations(normalized, selectedLog), [normalized, selectedLog]);
+  const taskOptions = useMemo(() => deriveTaskOptions(normalized), [normalized]);
+
+  // 默认选中
+  useEffect(() => {
+    if (!selectedLogId && normalized.length) {
+      setSelectedLogId(findDefaultSelectedLogId(normalized));
+    }
+  }, [normalized, selectedLogId]);
+
+  // 筛选变化时重置分页
+  useEffect(() => { setPage(1); }, [search, levelFilter, sourceFilter, taskFilter, timeRange, category]);
+
+  // 自动刷新
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const id = setInterval(() => { /* 依赖现有 refreshState 机制 */ }, 3000);
+    return () => clearInterval(id);
+  }, [autoRefresh]);
+
+  // ── 操作 ──
+  function handleExport(fmt) {
+    const content = buildLogExportPayload(filtered, fmt);
+    const blob = new Blob([content], { type: fmt === 'json' ? 'application/json' : 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `logs.${fmt}`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function handleCopyLog() {
+    if (!selectedLog) return;
+    const text = buildLogExportPayload([selectedLog], 'text');
+    navigator.clipboard.writeText(text);
+  }
+
+  function handleLocateTask() {
+    if (!selectedLog?.taskId) return;
+    const task = tasks?.find((t) => t.id === selectedLog.taskId);
+    if (task) {
+      setSelectedTaskId(task.id);
+      setActiveView('queue');
+    }
+  }
+
+  function handleViewContext() {
+    if (!selectedLog?.taskId && !selectedLog?.submitId) return;
+    if (selectedLog.taskId) setTaskFilter(selectedLog.taskId);
+  }
+
+  function handleClearFilters() {
+    setSearch(''); setLevelFilter(''); setSourceFilter(''); setTaskFilter(''); setTimeRange('all'); setCategory('all');
+  }
+
+  function handleQuickLocation(key) {
+    const f = getQuickLocationFilters(key);
+    if (f.level) setLevelFilter(f.level);
+    if (f.timeRange) setTimeRange(f.timeRange);
+  }
+
+  // ── 级别/来源选项 ──
+  const levelOptions = [{ key: '', label: '全部级别' }, ...LOG_LEVELS.map((l) => ({ key: l, label: l.toUpperCase() }))];
+  const sourceOptions = [{ key: '', label: '全部来源' }, ...LOG_SOURCES.map((s) => ({ key: s, label: SOURCE_LABEL_MAP[s] || s }))];
+  const taskFilterOptions = [{ key: '', label: '全部任务' }, ...taskOptions.map((t) => ({ key: t.id, label: t.title }))];
+
   return (
-    <div className="panel full-panel">
-      <PanelHeading title="日志" action={<button type="button" className="outline-button" onClick={clearLogs}>清空日志</button>} />
-      <div className="log-list">
-        {logs.map((line, index) => <p key={`${line}-${index}`}>{line}</p>)}
-        {!logs.length ? <p className="empty-cell">暂无日志。</p> : null}
+    <div className="log-center">
+      {/* 标题区 */}
+      <div className="log-center__header">
+        <div>
+          <h2 className="log-center__title">日志中心</h2>
+          <p className="log-center__subtitle">查看任务执行日志、CLI 输出、错误信息与系统事件</p>
+        </div>
+        <div className="log-center__header-actions">
+          <button type="button" className="outline-button" onClick={clearLogs}>清空日志</button>
+        </div>
       </div>
+
+      {/* 统计卡片 */}
+      <div className="log-center__stats">
+        <StatCard icon="List" title="今日日志" value={stats.today} tone="info" />
+        <StatCard icon="AlertCircle" title="错误" value={stats.errors} tone="error" />
+        <StatCard icon="AlertTriangle" title="警告" value={stats.warnings} tone="warn" />
+        <StatCard icon="Info" title="信息" value={stats.infos} tone="success" />
+        <StatCard icon="ShieldCheck" title="日志保留" value={stats.retention} />
+      </div>
+
+      {/* 筛选工具栏 */}
+      <div className="log-center__toolbar">
+        <SearchBox value={search} onChange={setSearch} placeholder="搜索日志内容、submit_id、任务名..." />
+        <FilterSelect value={levelFilter} onChange={setLevelFilter} options={levelOptions} label="级别" />
+        <FilterSelect value={sourceFilter} onChange={setSourceFilter} options={sourceOptions} label="来源" />
+        <FilterSelect value={taskFilter} onChange={setTaskFilter} options={taskFilterOptions} label="任务" />
+        <FilterSelect value={timeRange} onChange={setTimeRange} options={TIME_RANGE_OPTIONS} label="时间" />
+        <ToggleSwitch checked={autoRefresh} onChange={setAutoRefresh} label="自动刷新" />
+        <button type="button" className="outline-button" onClick={() => handleExport('json')} title="导出 JSON"><Download size={14} /> 导出</button>
+        <button type="button" className="outline-button" onClick={handleClearFilters}>清空筛选</button>
+      </div>
+
+      {/* 主体三栏 */}
+      <div className="log-center__body">
+        {/* 左侧分类 */}
+        <aside className="log-center__sidebar">
+          <div className="log-center__sidebar-section">
+            <h3 className="log-center__sidebar-heading">分类</h3>
+            {SIDEBAR_CATEGORIES.map((cat) => (
+              <button
+                key={cat.key}
+                type="button"
+                className={`log-center__sidebar-item${category === cat.key ? ' active' : ''}`}
+                onClick={() => setCategory(cat.key)}
+              >
+                <span>{cat.label}</span>
+                <em>{catCounts[cat.key] || 0}</em>
+              </button>
+            ))}
+          </div>
+          <div className="log-center__sidebar-section">
+            <h3 className="log-center__sidebar-heading">快速定位</h3>
+            {QUICK_LOCATIONS.map((ql) => (
+              <button
+                key={ql.key}
+                type="button"
+                className="log-center__sidebar-item"
+                onClick={() => handleQuickLocation(ql.key)}
+              >
+                <span>{ql.label}</span>
+              </button>
+            ))}
+          </div>
+        </aside>
+
+        {/* 中间表格 */}
+        <div className="log-center__table-wrap">
+          <table className="log-center__table">
+            <thead>
+              <tr>
+                <th className="log-center__th--time">时间</th>
+                <th className="log-center__th--level">级别</th>
+                <th className="log-center__th--source">来源</th>
+                <th className="log-center__th--task">任务 / submit_id</th>
+                <th className="log-center__th--msg">摘要</th>
+              </tr>
+            </thead>
+            <tbody>
+              {paginated.items.length ? paginated.items.map((log) => (
+                <tr
+                  key={log.id}
+                  className={`log-center__row${selectedLogId === log.id ? ' selected' : ''}`}
+                  onClick={() => setSelectedLogId(log.id)}
+                >
+                  <td className="log-center__td--time">{log.timestamp ? log.timestamp.slice(11, 19) : '-'}</td>
+                  <td className="log-center__td--level">
+                    <StatusPill variant={LEVEL_VARIANT_MAP[log.level] || 'neutral'}>{log.level}</StatusPill>
+                  </td>
+                  <td className="log-center__td--source">{SOURCE_LABEL_MAP[log.source] || log.source}</td>
+                  <td className="log-center__td--task">
+                    {log.taskTitle ? <span className="log-center__task-name">{log.taskTitle}</span> : null}
+                    {log.submitId ? <span className="log-center__submit-id">{log.submitId}</span> : null}
+                    {!log.taskTitle && !log.submitId ? '-' : null}
+                  </td>
+                  <td className="log-center__td--msg">{log.message}</td>
+                </tr>
+              )) : (
+                <tr><td colSpan={5} className="log-center__empty">无匹配日志</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        {/* 右侧详情 */}
+        <aside className="log-center__detail">
+          {selectedLog ? (
+            <div className="log-center__detail-inner">
+              <div className="log-center__detail-header">
+                <StatusPill variant={LEVEL_VARIANT_MAP[selectedLog.level] || 'neutral'}>{selectedLog.level}</StatusPill>
+                <InlineCopyButton text={selectedLog.message} title="复制消息" />
+              </div>
+              <div className="log-center__detail-fields">
+                <div className="log-center__detail-field"><span className="log-center__detail-label">时间</span><span className="log-center__detail-value">{selectedLog.timestamp || '-'}</span></div>
+                <div className="log-center__detail-field"><span className="log-center__detail-label">来源</span><span className="log-center__detail-value">{SOURCE_LABEL_MAP[selectedLog.source] || selectedLog.source}</span></div>
+                {selectedLog.taskTitle ? <div className="log-center__detail-field"><span className="log-center__detail-label">任务</span><span className="log-center__detail-value">{selectedLog.taskTitle}</span></div> : null}
+                {selectedLog.submitId ? <div className="log-center__detail-field"><span className="log-center__detail-label">submit_id</span><span className="log-center__detail-value">{selectedLog.submitId}<InlineCopyButton text={selectedLog.submitId} /></span></div> : null}
+                {selectedLog.module ? <div className="log-center__detail-field"><span className="log-center__detail-label">模块</span><span className="log-center__detail-value">{selectedLog.module}</span></div> : null}
+                {selectedLog.errorDetail ? <div className="log-center__detail-field"><span className="log-center__detail-label">错误详情</span><span className="log-center__detail-value log-center__detail-value--error">{selectedLog.errorDetail}</span></div> : null}
+              </div>
+              {selectedLog.detail ? (
+                <div className="log-center__detail-block">
+                  <h4 className="log-center__detail-block-title">日志详情</h4>
+                  <pre className="log-center__detail-pre">{selectedLog.detail}</pre>
+                </div>
+              ) : null}
+              {selectedLog.rawOutput || selectedLog.stdout || selectedLog.stderr ? (
+                <div className="log-center__detail-block">
+                  <h4 className="log-center__detail-block-title">原始输出</h4>
+                  {selectedLog.stdout ? <pre className="log-center__detail-pre">{selectedLog.stdout}</pre> : null}
+                  {selectedLog.stderr ? <pre className="log-center__detail-pre log-center__detail-pre--err">{selectedLog.stderr}</pre> : null}
+                  {selectedLog.rawOutput ? <pre className="log-center__detail-pre">{selectedLog.rawOutput}</pre> : null}
+                </div>
+              ) : null}
+              {associations.length ? (
+                <div className="log-center__detail-block">
+                  <h4 className="log-center__detail-block-title">关联事件</h4>
+                  {associations.map((a) => (
+                    <div key={a.id} className="log-center__assoc-item" onClick={() => setSelectedLogId(a.id)}>
+                      <StatusPill variant={LEVEL_VARIANT_MAP[a.level] || 'neutral'}>{a.level}</StatusPill>
+                      <span className="log-center__assoc-msg">{a.message}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              <div className="log-center__detail-actions">
+                <button type="button" className="outline-button" onClick={handleCopyLog}>复制日志</button>
+                {selectedLog.taskId ? <button type="button" className="gradient-button" onClick={handleLocateTask}>定位任务</button> : null}
+                {(selectedLog.taskId || selectedLog.submitId) ? <button type="button" className="outline-button" onClick={handleViewContext}>查看上下文</button> : null}
+              </div>
+            </div>
+          ) : (
+            <div className="log-center__detail-empty">选择日志查看详情</div>
+          )}
+        </aside>
+      </div>
+
+      {/* 分页 */}
+      <Pager
+        page={paginated.page}
+        totalPages={paginated.totalPages}
+        total={paginated.total}
+        pageSize={paginated.pageSize}
+        onPageChange={setPage}
+        onPageSizeChange={(s) => { setPageSize(s); setPage(1); }}
+      />
     </div>
   );
 }
@@ -2601,7 +2920,8 @@ function SchedulePickerModal({ title, mode = 'single', taskCount = 1, onClose, o
     return isBatch ? new Date(Date.now() + 1000).toISOString() : null;
   };
 
-  const handleApply = () => {
+  const [applying, setApplying] = useState(false);
+  const handleApply = async () => {
     setError('');
     let scheduledAt;
     try {
@@ -2614,7 +2934,12 @@ function SchedulePickerModal({ title, mode = 'single', taskCount = 1, onClose, o
       setError('计划时间必须晚于当前时间');
       return;
     }
-    onApply?.({ scheduledAt, intervalMinutes });
+    setApplying(true);
+    try {
+      await onApply?.({ scheduledAt, intervalMinutes });
+    } finally {
+      setApplying(false);
+    }
   };
 
   return (
@@ -2694,8 +3019,8 @@ function SchedulePickerModal({ title, mode = 'single', taskCount = 1, onClose, o
 
         <footer className="schedule-modal-actions">
           <button type="button" className="outline-button" onClick={onClose}>取消</button>
-          <button type="button" className="gradient-button" onClick={handleApply}>
-            <CalendarClock size={14} /> {isBatch ? '确认排布' : isPrepare ? (scheduleMode === 'immediate' ? '立即生成' : '确认定时生成') : '确认安排'}
+          <button type="button" className="gradient-button" onClick={handleApply} disabled={applying}>
+            {applying ? <><Loader2 size={14} className="spin" /> 处理中...</> : <><CalendarClock size={14} /> {isBatch ? '确认排布' : isPrepare ? (scheduleMode === 'immediate' ? '立即生成' : '确认定时生成') : '确认安排'}</>}
           </button>
         </footer>
       </section>
@@ -2707,28 +3032,19 @@ function SettingsView({ cli, settingsForm, setSettingsForm, checkCli, saveSettin
   const aiModelConfigs = settingsForm.ai_model_configs?.length ? settingsForm.ai_model_configs : [defaultAiModelConfig];
   const activeAiModelId = settingsForm.active_ai_model_id || aiModelConfigs[0]?.id || defaultAiModelConfig.id;
   const patchAiModel = (index, patch) => {
-    const next = aiModelConfigs.map((config, configIndex) => (
-      configIndex === index ? { ...config, ...patch } : config
-    ));
+    const next = aiModelConfigs.map((config, i) => (i === index ? { ...config, ...patch } : config));
     setSettingsForm({ ...settingsForm, ai_model_configs: next, active_ai_model_id: activeAiModelId });
   };
   const addAiModel = () => {
     const id = `openai-${Date.now()}`;
     setSettingsForm({
       ...settingsForm,
-      ai_model_configs: [
-        ...aiModelConfigs,
-        {
-          ...defaultAiModelConfig,
-          id,
-          name: `OpenAI 配置 ${aiModelConfigs.length + 1}`,
-        },
-      ],
+      ai_model_configs: [...aiModelConfigs, { ...defaultAiModelConfig, id, name: `OpenAI 配置 ${aiModelConfigs.length + 1}` }],
       active_ai_model_id: id,
     });
   };
   const removeAiModel = (id) => {
-    const next = aiModelConfigs.filter((config) => config.id !== id);
+    const next = aiModelConfigs.filter((c) => c.id !== id);
     const fallback = next[0] || defaultAiModelConfig;
     setSettingsForm({
       ...settingsForm,
@@ -2736,208 +3052,210 @@ function SettingsView({ cli, settingsForm, setSettingsForm, checkCli, saveSettin
       active_ai_model_id: activeAiModelId === id ? fallback.id : activeAiModelId,
     });
   };
+  const patchImageModel = (patch) => {
+    const base = settingsForm.image_model_config || { base_url: 'https://api.openai.com/v1', api_key: '', model: 'gpt-image-1' };
+    setSettingsForm({ ...settingsForm, image_model_config: { ...base, ...patch } });
+  };
 
   return (
-    <div className="settings-layout">
-      <form className="panel" onSubmit={saveSettings}>
-        <PanelHeading title="设置" />
-        <div className="setting-group">
-          <h3>CLI 配置</h3>
-          <label>CLI 路径<input value={cli.path || '未检测到'} readOnly /></label>
-          <p className={cli.available ? 'good-text' : 'error-text'}>{cli.available ? '检测正常' : cli.message}</p>
-          <div className="button-cluster">
-            <button className="outline-button" type="button" onClick={checkCli}>重新检测</button>
+    <form className="settings-page" onSubmit={saveSettings}>
+      <div className="settings-main">
+
+        {/* 1 CLI 配置 */}
+        <NumberedSection number={1} title="CLI 配置">
+          <label>
+            CLI 路径（只读）
+            <div className="settings-cli-path-row">
+              <input value={cli.path || '未检测到'} readOnly />
+              <StatusPill variant={cli.available ? 'ok' : 'bad'}>
+                {cli.available ? '检测成功' : '未检测到'}
+              </StatusPill>
+            </div>
+          </label>
+          <div className="button-cluster" style={{ justifyContent: 'flex-start', gap: 8 }}>
+            <button className="outline-button" type="button" onClick={checkCli}><RefreshCcw size={12} /> 重新检测</button>
             <button className="outline-button" type="button" onClick={installCli} disabled={installCliStatus === 'installing'}>
-              {installCliStatus === 'installing' ? '安装中…' : '一键安装'}
+              <Download size={12} /> {installCliStatus === 'installing' ? '安装中…' : '一键安装'}
             </button>
-            {installCliStatus === 'success' ? <p className="good-text">安装成功</p> : null}
-            {installCliStatus === 'failed' ? <p className="error-text">安装失败，请检查日志</p> : null}
+            {installCliStatus === 'success' && <StatusPill variant="ok">安装成功</StatusPill>}
+            {installCliStatus === 'failed' && <StatusPill variant="bad">安装失败</StatusPill>}
           </div>
-          <div className="button-cluster">
+          <div className="button-cluster" style={{ justifyContent: 'flex-start', gap: 8 }}>
             <button className="outline-button" type="button" onClick={() => loginCli(false)} disabled={!cli.available || loginCliStatus === 'logging'}>
-              {loginCliStatus === 'logging' ? '登录中…' : 'CLI 登录'}
+              <User size={12} /> {loginCliStatus === 'logging' ? '登录中…' : 'CLI 登录'}
             </button>
             <button className="outline-button" type="button" onClick={() => loginCli(true)} disabled={!cli.available || loginCliStatus === 'logging'}>
               Headless 登录
             </button>
-            {loginCliStatus === 'success' ? <p className="good-text">登录流程完成</p> : null}
-            {loginCliStatus === 'failed' ? <p className="error-text">登录失败，请检查日志</p> : null}
+            {loginCliStatus === 'success' && <StatusPill variant="ok">登录流程完成</StatusPill>}
+            {loginCliStatus === 'failed' && <StatusPill variant="bad">登录失败</StatusPill>}
           </div>
           <label>
             macOS 安装命令
-            <input
+            <CopyableInput
               value={settingsForm.mac_install_command || ''}
-              onChange={(event) => setSettingsForm({ ...settingsForm, mac_install_command: event.target.value })}
+              onChange={(e) => setSettingsForm({ ...settingsForm, mac_install_command: e.target.value })}
             />
           </label>
           <label>
             Windows PowerShell 安装命令
-            <input
+            <CopyableInput
               value={settingsForm.windows_install_command || ''}
               placeholder="填入官方 PowerShell 安装命令后启用 Windows 一键安装"
-              onChange={(event) => setSettingsForm({ ...settingsForm, windows_install_command: event.target.value })}
+              onChange={(e) => setSettingsForm({ ...settingsForm, windows_install_command: e.target.value })}
             />
           </label>
-        </div>
-        <div className="setting-group">
+        </NumberedSection>
+
+        {/* 2 AI 模型配置 */}
+        <NumberedSection number={2} title="AI 模型配置" subtitle="文字 AI，用于自动生成任务标题">
           <div className="setting-group-head">
-            <h3>AI 模型配置</h3>
-            <button className="outline-button" type="button" onClick={addAiModel}>
-              <Plus size={13} /> 新增模型
+            <label style={{ flex: 1, margin: 0 }}>
+              当前使用模型
+              <select
+                value={activeAiModelId}
+                onChange={(e) => setSettingsForm({ ...settingsForm, active_ai_model_id: e.target.value, ai_model_configs: aiModelConfigs })}
+              >
+                {aiModelConfigs.map((c) => <option key={c.id} value={c.id}>{c.name || c.model || c.id}</option>)}
+              </select>
+            </label>
+            <button className="outline-button" type="button" onClick={addAiModel} style={{ alignSelf: 'flex-end' }}>
+              <Plus size={12} /> 新增模型
             </button>
           </div>
-          <label>
-            当前使用模型
-            <select
-              value={activeAiModelId}
-              onChange={(event) => setSettingsForm({ ...settingsForm, active_ai_model_id: event.target.value, ai_model_configs: aiModelConfigs })}
-            >
-              {aiModelConfigs.map((config) => (
-                <option key={config.id} value={config.id}>{config.name || config.model || config.id}</option>
-              ))}
-            </select>
-          </label>
-          <p className="setting-hint">用于保存任务时自动生成简短标题；未配置 API Key 时会自动回退到本地标题。</p>
           <div className="ai-model-list">
-            {aiModelConfigs.map((config, index) => (
-              <div className={`ai-model-card${config.id === activeAiModelId ? ' active' : ''}`} key={config.id}>
-                <div className="ai-model-card-head">
-                  <strong>{config.name || '未命名模型'}</strong>
-                  <div className="ai-model-card-actions">
-                    <AiModelTestButton config={config} />
-                    <button
-                      type="button"
-                      className="icon-ghost mini"
-                      title="设为当前模型"
-                      onClick={() => setSettingsForm({ ...settingsForm, active_ai_model_id: config.id, ai_model_configs: aiModelConfigs })}
-                    >
-                      <CheckCircle2 size={12} />
-                    </button>
-                    <button
-                      type="button"
-                      className="icon-ghost mini"
-                      title="删除模型"
-                      disabled={aiModelConfigs.length <= 1}
-                      onClick={() => removeAiModel(config.id)}
-                    >
-                      <Trash2 size={12} />
-                    </button>
+            {aiModelConfigs.map((config, index) => {
+              const isActive = config.id === activeAiModelId;
+              return (
+                <div className={`ai-model-card${isActive ? ' active' : ''}`} key={config.id}>
+                  <div className="ai-model-card-head">
+                    <strong>{[config.name, config.model].filter(Boolean).join(' / ') || '未命名模型'}</strong>
+                    <div className="ai-model-card-actions">
+                      {isActive && <StatusPill variant="info">当前使用</StatusPill>}
+                      <AiModelTestButton config={config} />
+                      {!isActive && (
+                        <button type="button" className="icon-ghost mini" title="设为当前模型"
+                          onClick={() => setSettingsForm({ ...settingsForm, active_ai_model_id: config.id, ai_model_configs: aiModelConfigs })}>
+                          <Star size={12} />
+                        </button>
+                      )}
+                      <button type="button" className="icon-ghost mini" title="删除" disabled={aiModelConfigs.length <= 1}
+                        onClick={() => removeAiModel(config.id)}>
+                        <Trash2 size={12} />
+                      </button>
+                    </div>
                   </div>
+                  {isActive && (
+                    <div className="ai-model-grid">
+                      <label>名称<input value={config.name || ''} onChange={(e) => patchAiModel(index, { name: e.target.value })} /></label>
+                      <label>模式
+                        <select value={config.api_mode || 'responses'} onChange={(e) => patchAiModel(index, { api_mode: e.target.value })}>
+                          <option value="responses">OpenAI Responses</option>
+                          <option value="chat">Chat Completions</option>
+                        </select>
+                      </label>
+                      <label>Base URL<input value={config.base_url || ''} onChange={(e) => patchAiModel(index, { base_url: e.target.value })} /></label>
+                      <label>Model<input value={config.model || ''} onChange={(e) => patchAiModel(index, { model: e.target.value })} /></label>
+                      <label className="ai-model-secret">
+                        API Key
+                        <PasswordInput value={config.api_key || ''} placeholder="sk-..." onChange={(e) => patchAiModel(index, { api_key: e.target.value })} />
+                      </label>
+                    </div>
+                  )}
                 </div>
-                <div className="ai-model-grid">
-                  <label>
-                    名称
-                    <input value={config.name || ''} onChange={(event) => patchAiModel(index, { name: event.target.value })} />
-                  </label>
-                  <label>
-                    模式
-                    <select value={config.api_mode || 'responses'} onChange={(event) => patchAiModel(index, { api_mode: event.target.value })}>
-                      <option value="responses">OpenAI Responses</option>
-                      <option value="chat">Chat Completions</option>
-                    </select>
-                  </label>
-                  <label>
-                    Base URL
-                    <input value={config.base_url || ''} onChange={(event) => patchAiModel(index, { base_url: event.target.value })} />
-                  </label>
-                  <label>
-                    Model
-                    <input value={config.model || ''} onChange={(event) => patchAiModel(index, { model: event.target.value })} />
-                  </label>
-                  <label className="ai-model-secret">
-                    API Key
-                    <input
-                      type="password"
-                      value={config.api_key || ''}
-                      placeholder="sk-..."
-                      onChange={(event) => patchAiModel(index, { api_key: event.target.value })}
-                    />
-                  </label>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
-        </div>
-        <div className="setting-group">
-          <h3>自动查询设置</h3>
-          <label className="switch-line">
-            <input
-              type="checkbox"
-              checked={settingsForm.auto_query_enabled ?? true}
-              onChange={(event) => setSettingsForm({ ...settingsForm, auto_query_enabled: event.target.checked })}
-            />
-            提交后自动查询结果
-          </label>
+        </NumberedSection>
+
+        {/* 3 自动查询设置 */}
+        <NumberedSection number={3} title="自动查询设置">
+          <ToggleSwitch
+            checked={settingsForm.auto_query_enabled ?? true}
+            onChange={(v) => setSettingsForm({ ...settingsForm, auto_query_enabled: v })}
+            label="提交后自动查询结果"
+          />
           <label>
             轮询间隔（秒）
-            <input
-              type="number"
-              min="10"
-              max="300"
-              value={settingsForm.poll_interval_seconds ?? 60}
-              onChange={(event) => setSettingsForm({ ...settingsForm, poll_interval_seconds: Number(event.target.value) })}
-            />
+            <div className="settings-input-hint-row">
+              <input type="number" min="10" max="300" value={settingsForm.poll_interval_seconds ?? 60}
+                onChange={(e) => setSettingsForm({ ...settingsForm, poll_interval_seconds: Number(e.target.value) })} />
+              <span className="settings-range-hint">10-300</span>
+            </div>
           </label>
           <label>
             日志保留条数
-            <input
-              type="number"
-              min="50"
-              max="10000"
-              value={settingsForm.log_retention_count ?? 500}
-              onChange={(event) => setSettingsForm({ ...settingsForm, log_retention_count: Number(event.target.value) })}
-            />
+            <div className="settings-input-hint-row">
+              <input type="number" min="50" max="10000" value={settingsForm.log_retention_count ?? 500}
+                onChange={(e) => setSettingsForm({ ...settingsForm, log_retention_count: Number(e.target.value) })} />
+              <span className="settings-range-hint">50-10000</span>
+            </div>
           </label>
-          <label className="setting-row-check">
-            <span>预定任务期间防止系统睡眠</span>
-            <input
-              type="checkbox"
-              checked={settingsForm.prevent_sleep ?? true}
-              onChange={(event) => setSettingsForm({ ...settingsForm, prevent_sleep: event.target.checked })}
-            />
-            <small>仅在应用运行时有效，不能防止关机或退出应用。开启后可能增加耗电，但可提升准点提交概率。macOS 使用 caffeinate，Windows 使用 SetThreadExecutionState；Linux 暂不支持。</small>
-          </label>
-        </div>
-        <div className="setting-group">
-          <h3>并发限制策略</h3>
+          <ToggleSwitch
+            checked={settingsForm.prevent_sleep ?? true}
+            onChange={(v) => setSettingsForm({ ...settingsForm, prevent_sleep: v })}
+            label="预定任务期间防止系统睡眠"
+            hint="开启后可能增加耗电，但可提升准点提交概率。macOS 使用 caffeinate，Windows 使用 SetThreadExecutionState。"
+          />
+        </NumberedSection>
+
+        {/* 4 并发限制策略 */}
+        <NumberedSection number={4} title="并发限制策略">
           <label>
             并发限制策略
-            <select
-              value={settingsForm.concurrency_limit_policy || 'SilentRetry'}
-              onChange={(event) => setSettingsForm({ ...settingsForm, concurrency_limit_policy: event.target.value })}
-            >
+            <select value={settingsForm.concurrency_limit_policy || 'SilentRetry'}
+              onChange={(e) => setSettingsForm({ ...settingsForm, concurrency_limit_policy: e.target.value })}>
               <option value="SilentRetry">静默重试</option>
               <option value="SilentFail">静默失败</option>
             </select>
           </label>
           <label>
             最大重试次数
-            <input
-              type="number"
-              min="0"
-              value={settingsForm.concurrency_retry_max_attempts || 8}
-              onChange={(event) => setSettingsForm({ ...settingsForm, concurrency_retry_max_attempts: event.target.value })}
-            />
+            <div className="settings-input-hint-row">
+              <input type="number" min="0" value={settingsForm.concurrency_retry_max_attempts || 8}
+                onChange={(e) => setSettingsForm({ ...settingsForm, concurrency_retry_max_attempts: e.target.value })} />
+              <span className="settings-range-hint">0-20</span>
+            </div>
           </label>
           <label>
             并发重试间隔（秒）
-            <input
-              type="number"
-              min="30"
-              value={settingsForm.concurrency_retry_delay_seconds || 300}
-              onChange={(event) => setSettingsForm({ ...settingsForm, concurrency_retry_delay_seconds: event.target.value })}
-            />
+            <div className="settings-input-hint-row">
+              <input type="number" min="30" value={settingsForm.concurrency_retry_delay_seconds || 300}
+                onChange={(e) => setSettingsForm({ ...settingsForm, concurrency_retry_delay_seconds: e.target.value })} />
+              <span className="settings-range-hint">30-3600</span>
+            </div>
           </label>
-          <button className="gradient-button" type="submit">保存设置</button>
-        </div>
-      </form>
-      <aside className="panel roadmap">
-        <h3>未来功能</h3>
-        {['CLI 一键安装源配置', '完整任务历史筛选', '日志保留清理'].map((item) => (
-          <p key={item}><CheckCircle2 size={15} /> {item}<span>即将上线</span></p>
-        ))}
-      </aside>
-    </div>
+        </NumberedSection>
+
+        {/* 5 图片生成模型 - full width */}
+        <NumberedSection number={5} title="图片生成模型" subtitle='新增，用于"生图" Tab' className="numbered-section--full">
+          <div className="settings-img-row">
+            <label>
+              Base URL
+              <input value={settingsForm.image_model_config?.base_url ?? 'https://api.openai.com/v1'}
+                onChange={(e) => patchImageModel({ base_url: e.target.value })}
+                placeholder="https://api.openai.com/v1" />
+            </label>
+            <label>
+              API Key
+              <PasswordInput
+                value={settingsForm.image_model_config?.api_key ?? ''}
+                onChange={(e) => patchImageModel({ api_key: e.target.value })}
+                placeholder="sk-..."
+              />
+            </label>
+            <label>
+              模型名称
+              <input value={settingsForm.image_model_config?.model ?? 'gpt-image-1'}
+                onChange={(e) => patchImageModel({ model: e.target.value })}
+                placeholder="gpt-image-1 / dall-e-3" />
+            </label>
+            <button className="gradient-button" type="submit">保存设置</button>
+          </div>
+        </NumberedSection>
+
+      </div>
+    </form>
   );
 }
 
@@ -2974,7 +3292,7 @@ function SecondaryPageHeader({ title, backLabel, onBack, actions }) {
   );
 }
 
-function TaskDetail({ task, submitTask, queryTask }) {
+function TaskDetail({ task, submitTask, queryTask, pendingTaskOps = {} }) {
   if (!task) {
     return (
       <aside className="panel task-detail">
@@ -2991,8 +3309,8 @@ function TaskDetail({ task, submitTask, queryTask }) {
           <StatusBadge task={task} />
         </div>
         <div className="button-cluster">
-          <button type="button" onClick={() => submitTask(task.id)}><Play size={15} />立即生成</button>
-          <button type="button" onClick={() => queryTask(task.id)} disabled={!task.submit_id}><RefreshCcw size={15} />查询结果</button>
+          <button type="button" onClick={() => submitTask(task.id)} disabled={pendingTaskOps[task.id]?.submit}>{pendingTaskOps[task.id]?.submit ? <><Loader2 size={15} className="spin" />提交中...</> : <><Play size={15} />立即生成</>}</button>
+          <button type="button" onClick={() => queryTask(task.id)} disabled={!task.submit_id || pendingTaskOps[task.id]?.query}>{pendingTaskOps[task.id]?.query ? <><Loader2 size={15} className="spin" />查询中...</> : <><RefreshCcw size={15} />查询结果</>}</button>
         </div>
       </div>
       <dl>
@@ -3032,7 +3350,7 @@ function TaskDetail({ task, submitTask, queryTask }) {
   );
 }
 
-function TaskRow({ task, submitTask, queryTask }) {
+function TaskRow({ task, submitTask, queryTask, pendingTaskOps = {} }) {
   return (
     <article className="task-row">
       <div>
@@ -3042,8 +3360,8 @@ function TaskRow({ task, submitTask, queryTask }) {
       </div>
         <StatusBadge task={task} />
         <div className="row-actions">
-        <button type="button" title="立即生成" onClick={() => submitTask(task.id)}><Play size={14} /></button>
-        <button type="button" title="查询结果" disabled={!task.submit_id} onClick={() => queryTask(task.id)}><RefreshCcw size={14} /></button>
+        <button type="button" title="立即生成" onClick={() => submitTask(task.id)} disabled={pendingTaskOps[task.id]?.submit}>{pendingTaskOps[task.id]?.submit ? <Loader2 size={14} className="spin" /> : <Play size={14} />}</button>
+        <button type="button" title="查询结果" disabled={!task.submit_id || pendingTaskOps[task.id]?.query} onClick={() => queryTask(task.id)}>{pendingTaskOps[task.id]?.query ? <Loader2 size={14} className="spin" /> : <RefreshCcw size={14} />}</button>
       </div>
     </article>
   );
@@ -4071,4 +4389,458 @@ function statusLabel(status) {
   return labels[status] || status;
 }
 
-createRoot(document.getElementById('root')).render(<App />);
+const IMAGE_SIZE_OPTIONS = [
+  { value: '1024x1024', label: '1:1 · 1024×1024' },
+  { value: '1024x1536', label: '2:3 · 1024×1536' },
+  { value: '1536x1024', label: '3:2 · 1536×1024' },
+];
+
+function imageGenItemSrc(item) {
+  if (!item) return '';
+  if (item.storedPath) return convertFileSrc(item.storedPath);
+  return item.dataUrl || '';
+}
+
+function ImageGenView({
+  settingsForm,
+  history,
+  previewItem,
+  setPreviewItem,
+  state,
+  assetById,
+  importTempImages,
+  pasteClipboardImage,
+  pasteSystemClipboardImage,
+  refreshState,
+}) {
+  const [imagegenForm, setImagegenForm] = useState(() => createEmptyImageGenForm());
+  const [generating, setGenerating] = useState(false);
+  const [error, setError] = useState('');
+  const [copyMsg, setCopyMsg] = useState('');
+  const [promptExpanded, setPromptExpanded] = useState(false);
+  const [imageModalSrc, setImageModalSrc] = useState(null);
+
+  useEffect(() => { setPromptExpanded(false); }, [previewItem?.id]);
+
+  const hasConfig = Boolean(settingsForm.image_model_config?.api_key?.trim());
+  const promptIsEmpty = !imagegenForm.prompt?.trim();
+
+  // 预览项跟着 history 实时刷新（pending → completed 自动更新画面）
+  const livePreviewItem = useMemo(() => {
+    if (!previewItem) return null;
+    const fresh = history.find((h) => h.id === previewItem.id);
+    return fresh || previewItem;
+  }, [previewItem, history]);
+
+  // 用 ref 持有最新 refreshState，避免因函数引用变化导致 effect 反复重建
+  const refreshStateRef = useRef(refreshState);
+  refreshStateRef.current = refreshState;
+
+  // 只用 pendingIds 字符串作为 dep，而非整个 history 对象，避免 refreshState 后 history 引用
+  // 变化导致 effect cleanup→cancelled=true 把轮询提前终止
+  const pendingIds = useMemo(
+    () => history.filter((h) => h.status === 'pending').map((h) => h.id).join(','),
+    [history],
+  );
+
+  useEffect(() => {
+    if (!pendingIds) return;
+    const ids = pendingIds.split(',');
+    let cancelled = false;
+    let timer = null;
+    const tick = async () => {
+      for (const id of ids) {
+        if (cancelled) return;
+        try {
+          await invoke('query_image_task_command', { historyId: id });
+        } catch (err) {
+          console.warn('[imagegen] query task failed', id, err);
+        }
+      }
+      if (!cancelled) {
+        await refreshStateRef.current();
+        if (!cancelled) {
+          timer = setTimeout(tick, 3000);
+        }
+      }
+    };
+    timer = setTimeout(tick, 3000);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [pendingIds]);
+
+  const mentionItems = useMemo(() => {
+    const items = buildMentionItems({
+      roles: state?.roles || [],
+      assetById: assetById || new Map(),
+      tempImagePaths: imagegenForm.temp_image_paths,
+      tempImageAssetIds: imagegenForm.temp_image_asset_ids,
+    });
+    return filterMentionItemsForImageGen(items);
+  }, [state?.roles, assetById, imagegenForm.temp_image_paths, imagegenForm.temp_image_asset_ids]);
+
+  const referenceAssets = useMemo(
+    () => (imagegenForm.image_asset_ids || []).map((id) => assetById?.get(id)).filter(Boolean),
+    [imagegenForm.image_asset_ids, assetById],
+  );
+
+  const handleEditorUpdate = useCallback((plainText, refs) => {
+    if (refs?.imageAssetIds?.length) {
+      console.log('[imagegen] @mention imageAssetIds:', refs.imageAssetIds);
+    }
+    setImagegenForm((current) => {
+      const mentionIds = refs?.imageAssetIds || [];
+      const currentIds = current.image_asset_ids || [];
+      const toAdd = mentionIds.filter((id) => !currentIds.includes(id));
+      if (toAdd.length > 0) {
+        console.log('[imagegen] adding ids:', toAdd, 'new total:', [...currentIds, ...toAdd]);
+      }
+      if (toAdd.length === 0) {
+        // 仅文本变化，避免动 image_asset_ids 数组引用（防止编辑器联动重置）
+        if (current.prompt === plainText) return current;
+        return { ...current, prompt: plainText };
+      }
+      return {
+        ...current,
+        prompt: plainText,
+        image_asset_ids: [...currentIds, ...toAdd].slice(0, IMAGEGEN_MAX_REFERENCES),
+      };
+    });
+  }, []);
+
+  const handlePasteImageForEditor = useCallback(async (file) => {
+    const asset = await pasteClipboardImage(file);
+    setImagegenForm((current) => addReferenceAsset(current, asset));
+    return asset;
+  }, [pasteClipboardImage]);
+
+  const handlePasteSystemImageForEditor = useCallback(async () => {
+    const asset = await pasteSystemClipboardImage();
+    setImagegenForm((current) => addReferenceAsset(current, asset));
+    return asset;
+  }, [pasteSystemClipboardImage]);
+
+  async function handleAddTempImage() {
+    try {
+      const imported = await importTempImages();
+      if (!imported.length) return;
+      setImagegenForm((current) => {
+        let form = current;
+        for (const asset of imported) {
+          form = addReferenceAsset(form, asset);
+        }
+        return form;
+      });
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function generate() {
+    const promptText = imagegenForm.prompt?.trim();
+    if (!promptText) return;
+    setGenerating(true);
+    setError('');
+    try {
+      const refIds = (imagegenForm.image_asset_ids || []).length > 0
+        ? imagegenForm.image_asset_ids
+        : undefined;
+      const item = await invoke('generate_image_command', {
+        prompt: promptText,
+        size: imagegenForm.size,
+        referenceAssetIds: refIds,
+      });
+      await refreshState();
+      setPreviewItem(item);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setGenerating(false);
+    }
+  }
+
+  function downloadItem(item) {
+    const a = document.createElement('a');
+    a.href = imageGenItemSrc(item);
+    a.download = `imagegen_${item.id}.png`;
+    a.click();
+  }
+
+  async function copyItem(item) {
+    try {
+      await invoke('copy_imagegen_image_command', { historyId: item.id });
+      setCopyMsg(item.id);
+      setTimeout(() => setCopyMsg(''), 2000);
+    } catch (err) {
+      setError(`复制图片失败：${String(err)}`);
+    }
+  }
+
+  async function deleteItem(id) {
+    try {
+      await invoke('delete_imagegen_history_item_command', { id });
+      await refreshState();
+      if (previewItem?.id === id) setPreviewItem(null);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function clearHistory() {
+    try {
+      await invoke('clear_imagegen_history_command');
+      await refreshState();
+      setPreviewItem(null);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  function handleImageGenContextMenu(event) {
+    if (shouldSuppressImageContextMenu(event.target)) {
+      event.preventDefault();
+    }
+  }
+
+  return (
+    <div onContextMenu={handleImageGenContextMenu}>
+    <div className="imagegen-layout">
+      <div className="imagegen-main">
+        <div className="panel imagegen-panel">
+          <PanelHeading title="图片生成" />
+          {!hasConfig && (
+            <p className="imagegen-no-config">
+              <AlertCircle size={14} /> 请先在设置中配置「图片生成模型」API Key
+            </p>
+          )}
+          <div className="imagegen-form">
+            <div className="imagegen-input-row">
+              <div className="imagegen-ref-sidebar">
+                {referenceAssets.map((asset, idx) => (
+                  <div key={asset.id} className="imagegen-ref-thumb-wrap">
+                    <img
+                      src={convertFileSrc(asset.stored_path)}
+                      alt={asset.name}
+                      className="imagegen-ref-thumb"
+                    />
+                    <button
+                      type="button"
+                      className="imagegen-ref-remove"
+                      title="移除参考图"
+                      onClick={() => setImagegenForm((current) => removeReferenceAsset(current, asset.id, assetById))}
+                    >
+                      <X size={10} />
+                    </button>
+                  </div>
+                ))}
+                {referenceAssets.length < IMAGEGEN_MAX_REFERENCES && (
+                  <button type="button" className="imagegen-ref-add-btn" title="添加参考图" onClick={handleAddTempImage}>
+                    <ImagePlus size={15} />
+                  </button>
+                )}
+              </div>
+              <PromptMentionEditor
+                value={imagegenForm.prompt}
+                mentionItems={mentionItems}
+                maxLength={8000}
+                placeholder="描述想要生成的图片，输入 @ 可引用素材图…"
+                onUpdate={handleEditorUpdate}
+                onPasteImage={handlePasteImageForEditor}
+                onPasteSystemImage={handlePasteSystemImageForEditor}
+                tempImagePaths={imagegenForm.temp_image_paths}
+              />
+            </div>
+            <div className="imagegen-controls">
+              <select
+                value={imagegenForm.size}
+                onChange={(e) => setImagegenForm((f) => ({ ...f, size: e.target.value }))}
+              >
+                {IMAGE_SIZE_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>{o.label}</option>
+                ))}
+              </select>
+              <button
+                type="button"
+                className="gradient-button"
+                onClick={generate}
+                disabled={generating || promptIsEmpty || !hasConfig}
+              >
+                {generating
+                  ? <><Loader2 size={14} className="spin" /> 生成中…</>
+                  : <><Sparkles size={14} /> 生成</>}
+              </button>
+            </div>
+            {error && <p className="imagegen-error"><AlertCircle size={13} /> {error}</p>}
+          </div>
+
+          {livePreviewItem && (
+            <div className="imagegen-preview">
+              <div className="imagegen-preview-header">
+                <span className="imagegen-preview-title">预览{livePreviewItem.status === 'pending' ? ' · 生成中' : livePreviewItem.status === 'failed' ? ' · 失败' : ''}</span>
+                <button type="button" className="icon-ghost" title="关闭" onClick={() => setPreviewItem(null)}>
+                  <X size={14} />
+                </button>
+              </div>
+              {livePreviewItem.status === 'pending' ? (
+                <div className="imagegen-preview-img imagegen-preview-pending">
+                  <Loader2 size={32} className="spin" />
+                  <span style={{marginTop:8, fontSize:12, color:'var(--muted)'}}>异步生成中，请稍候…</span>
+                </div>
+              ) : livePreviewItem.status === 'failed' ? (
+                <div className="imagegen-preview-img imagegen-preview-pending">
+                  <AlertCircle size={32} style={{color:'#e03c3c'}} />
+                  <span style={{marginTop:8, fontSize:12, color:'#e03c3c', textAlign:'center', padding:'0 12px'}}>{livePreviewItem.error || '生成失败'}</span>
+                </div>
+              ) : (
+                <img
+                  src={imageGenItemSrc(livePreviewItem)}
+                  alt={livePreviewItem.prompt}
+                  className="imagegen-preview-img"
+                />
+              )}
+              {livePreviewItem.status === 'completed' && (
+                <div className="imagegen-preview-actions">
+                  <button type="button" className="outline-button" onClick={() => copyItem(livePreviewItem)}>
+                    <Copy size={13} /> {copyMsg === livePreviewItem.id ? '已复制！' : '复制图片'}
+                  </button>
+                  <button type="button" className="outline-button" onClick={() => setImageModalSrc(imageGenItemSrc(livePreviewItem))}>
+                    <ZoomIn size={13} /> 查看大图
+                  </button>
+                  <button type="button" className="outline-button" onClick={() => downloadItem(livePreviewItem)}>
+                    <Download size={13} /> 下载
+                  </button>
+                </div>
+              )}
+              <p className="imagegen-preview-meta">{livePreviewItem.size} · {new Date(livePreviewItem.createdAt).toLocaleString()}</p>
+              {livePreviewItem.prompt && (
+                <div className="imagegen-preview-prompt-wrap">
+                  <div className="imagegen-preview-prompt-header">
+                    <span className="imagegen-preview-refs-label">提示词</span>
+                    <button
+                      type="button"
+                      className="icon-ghost mini"
+                      title="复制提示词"
+                      onClick={() => { navigator.clipboard.writeText(livePreviewItem.prompt).catch(() => {}); setCopyMsg(`prompt_${livePreviewItem.id}`); setTimeout(() => setCopyMsg(''), 2000); }}
+                    >
+                      {copyMsg === `prompt_${livePreviewItem.id}` ? <span style={{fontSize:10}}>已复制</span> : <Copy size={11} />}
+                    </button>
+                  </div>
+                  <div className={`imagegen-preview-prompt${promptExpanded ? ' expanded' : ''}`}>
+                    {livePreviewItem.prompt}
+                  </div>
+                  {livePreviewItem.prompt.length > 150 && (
+                    <button type="button" className="imagegen-prompt-toggle" onClick={() => setPromptExpanded((v) => !v)}>
+                      {promptExpanded ? '收起' : '展开全部'}
+                    </button>
+                  )}
+                </div>
+              )}
+              {livePreviewItem.referenceAssetIds?.length > 0 && (
+                <div className="imagegen-preview-refs">
+                  <span className="imagegen-preview-refs-label">参考图</span>
+                  <div className="imagegen-ref-list">
+                    {livePreviewItem.referenceAssetIds.map((id) => {
+                      const asset = assetById?.get(id);
+                      if (!asset) return null;
+                      return (
+                        <div key={id} className="imagegen-ref-thumb-wrap">
+                          <img src={convertFileSrc(asset.stored_path)} alt={asset.name} className="imagegen-ref-thumb" />
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="panel imagegen-history">
+        <PanelHeading
+          title={`历史记录（${history.length}）`}
+          action={history.length > 0
+            ? <button type="button" className="outline-button" onClick={clearHistory}>清空</button>
+            : null}
+        />
+        {history.length === 0 && <p className="empty-cell">暂无记录</p>}
+        <div className="imagegen-history-list">
+          {history.map((item) => (
+            <div
+              key={item.id}
+              className={`imagegen-history-item${previewItem?.id === item.id ? ' active' : ''}`}
+            >
+              <div className="imagegen-thumb-wrap">
+                {item.status === 'pending' ? (
+                  <div className="imagegen-thumb imagegen-thumb-pending"><Loader2 size={18} className="spin" /></div>
+                ) : item.status === 'failed' ? (
+                  <div className="imagegen-thumb imagegen-thumb-failed" title={item.error || '生成失败'}><AlertCircle size={18} /></div>
+                ) : (
+                  <>
+                    <img src={imageGenItemSrc(item)} alt={item.prompt} className="imagegen-thumb" />
+                    <button
+                      type="button"
+                      className="imagegen-thumb-zoom"
+                      title="查看大图"
+                      onClick={(e) => { e.stopPropagation(); setImageModalSrc(imageGenItemSrc(item)); }}
+                    >
+                      <ZoomIn size={14} />
+                    </button>
+                  </>
+                )}
+                {item.referenceAssetIds?.length > 0 && (
+                  <span className="imagegen-ref-badge">{item.referenceAssetIds.length}</span>
+                )}
+              </div>
+              <div className="imagegen-history-meta imagegen-history-meta-clickable" onClick={() => setPreviewItem(item)}>
+                <span className="imagegen-history-prompt">{item.prompt.length > 60 ? item.prompt.slice(0, 60) + '…' : item.prompt}</span>
+                <span className="imagegen-history-time">{new Date(item.createdAt).toLocaleString()} · {item.size}</span>
+              </div>
+              <div className="imagegen-history-actions" onClick={(e) => e.stopPropagation()}>
+                {item.status === 'completed' && (
+                  <>
+                    <button type="button" className="icon-ghost mini" title="复制" onClick={(e) => { e.preventDefault(); e.stopPropagation(); copyItem(item); }}>
+                      <Copy size={12} />
+                    </button>
+                    <button type="button" className="icon-ghost mini" title="下载" onClick={(e) => { e.preventDefault(); e.stopPropagation(); downloadItem(item); }}>
+                      <Download size={12} />
+                    </button>
+                  </>
+                )}
+                <button type="button" className="icon-ghost mini" title="删除" onClick={(e) => { e.preventDefault(); e.stopPropagation(); deleteItem(item.id); }}>
+                  <Trash2 size={12} />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+    <ImageModal src={imageModalSrc} alt="" onClose={() => setImageModalSrc(null)} onCopy={() => { const item = history.find(h => imageGenItemSrc(h) === imageModalSrc); if (item) return copyItem(item); }} />
+    </div>
+  );
+}
+
+class AppErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null, info: null };
+  }
+  componentDidCatch(error, info) {
+    this.setState({ error, info });
+  }
+  render() {
+    if (!this.state.error) return this.props.children;
+    return (
+      <div style={{ padding: 24, fontFamily: 'Menlo, monospace', color: '#1f2944' }}>
+        <h2>应用启动失败</h2>
+        <pre style={{ whiteSpace: 'pre-wrap' }}>{String(this.state.error?.stack || this.state.error)}</pre>
+        <pre style={{ whiteSpace: 'pre-wrap' }}>{this.state.info?.componentStack || ''}</pre>
+      </div>
+    );
+  }
+}
+
+createRoot(document.getElementById('root')).render(<AppErrorBoundary><App /></AppErrorBoundary>);

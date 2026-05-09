@@ -7,6 +7,7 @@ import {
   promptTextToTiptapDoc,
   getPromptTextFromTiptapEditor,
   shouldBlockPromptTextInput,
+  getAllowedPromptPasteText,
   shouldSyncExternalPromptValue,
 } from './prompt-editor-utils.js';
 
@@ -285,6 +286,24 @@ test('shouldBlockPromptTextInput allows replacement even when old content is ove
     to: 8,
     text: '短',
   }), false);
+});
+
+test('getAllowedPromptPasteText truncates pasted text to remaining maxLength', () => {
+  assert.equal(getAllowedPromptPasteText({
+    maxLength: 10,
+    currentLength: 8,
+    selectedLength: 0,
+    text: 'abcdef',
+  }), 'ab');
+});
+
+test('getAllowedPromptPasteText allows replacement using selected text capacity', () => {
+  assert.equal(getAllowedPromptPasteText({
+    maxLength: 10,
+    currentLength: 10,
+    selectedLength: 4,
+    text: 'abcdef',
+  }), 'abcd');
 });
 
 test('shouldSyncExternalPromptValue detects preset text pushed from outside editor', () => {

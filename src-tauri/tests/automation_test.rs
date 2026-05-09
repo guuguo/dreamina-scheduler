@@ -1,14 +1,16 @@
 use chrono::{Duration, Utc};
 use dreamina_scheduler_lib::{
     backfill_draft_command_previews, backfill_execution_records_from_attempts, build_install_plan,
-    build_login_plan, classify_dreamina_error, create_draft_task, create_task_with_preview,
-    delete_execution_record_from_data, delete_role, delete_task_from_data, import_media_to_role,
-    needs_keep_awake, pause_task, process_next_due_task_with_runner, query_task_submit_id_once_with_runner,
-    recover_tasks_on_load, remove_media_from_role, reschedule_task, resume_task,
-    save_clipboard_image_asset, update_task_from_data, upsert_role, AppData, Asset, AssetKind,
-    ClipboardImageInput, ConcurrencyLimitPolicy, CreateRoleInput, DreaminaErrorKind,
-    ImportRoleMediaInput, RemoveRoleMediaInput, Role, ScheduledTask, SchedulerSettings,
-    TaskAttempt, TaskDraft, TaskExecutionInputSnapshot, TaskExecutionRecord, VideoParams,
+    build_login_plan, build_ai_title_request, build_multimodal2video_args, classify_dreamina_error,
+    create_draft_task, create_task_with_preview, delete_execution_record_from_data, delete_role,
+    delete_task_from_data, extract_generated_task_title, format_ai_model_test_log, import_media_to_role,
+    needs_keep_awake, parse_credit_info, parse_submit_output, pause_task, process_next_due_task_with_runner,
+    query_task_submit_id_once_with_runner, recover_tasks_on_load, remove_media_from_role, reschedule_task,
+    resolve_task_inputs, resume_task, sanitize_generated_task_title, save_clipboard_image_asset,
+    update_task_from_data, upsert_role, AppData, Asset, AssetKind, ClipboardImageInput,
+    ConcurrencyLimitPolicy, CreateRoleInput, DreaminaErrorKind, ImportRoleMediaInput, LogEntry, LogLevel,
+    LogSource, RemoveRoleMediaInput, Role, ScheduledTask, SchedulerSettings, TaskAttempt, TaskDraft,
+    TaskExecutionInputSnapshot, TaskExecutionRecord, VideoParams, AiModelConfig,
 };
 use std::fs;
 
@@ -51,6 +53,7 @@ fn default_data() -> AppData {
         roles: vec![],
         tasks: vec![],
         logs: vec![],
+        imagegen_history: vec![],
     }
 }
 
@@ -87,6 +90,7 @@ fn queued_task(id: &str) -> ScheduledTask {
         last_auto_query_at: None,
         auto_query_stopped: false,
         consecutive_no_result_queries: 0,
+        server_error_retry_count: 0,
     }
 }
 
@@ -397,6 +401,7 @@ fn concurrency_limit_silent_fail_policy() {
         ai_model_configs: SchedulerSettings::default().ai_model_configs,
         active_ai_model_id: SchedulerSettings::default().active_ai_model_id,
         prevent_sleep: true,
+        image_model_config: SchedulerSettings::default().image_model_config,
     };
     let classified = classify_dreamina_error(
         "api error: ret=1310, message=ExceedConcurrencyLimit",
@@ -1125,7 +1130,20 @@ fn log_retention_truncates_old_logs() {
     let mut data = default_data();
     data.settings.log_retention_count = 5;
     for i in 0..10 {
-        data.logs.push(format!("log entry {}", i));
+        data.logs.push(LogEntry {
+            id: format!("log-{}", i),
+            timestamp: String::new(),
+            level: LogLevel::Info,
+            source: LogSource::System,
+            category: String::new(),
+            event_type: String::new(),
+            message: format!("log entry {}", i),
+            detail: String::new(),
+            task_id: None, task_title: None, submit_id: None,
+            execution_record_id: None, error_detail: None,
+            raw_output: None, stdout: None, stderr: None, module: None,
+            legacy_string: None,
+        });
     }
     let max_logs = data.settings.log_retention_count as usize;
     if data.logs.len() > max_logs {
@@ -1133,7 +1151,7 @@ fn log_retention_truncates_old_logs() {
         data.logs.drain(0..drain);
     }
     assert_eq!(data.logs.len(), 5);
-    assert_eq!(data.logs[0], "log entry 5");
+    assert_eq!(data.logs[0].message, "log entry 5");
 }
 
 #[test]
@@ -1239,6 +1257,7 @@ fn draft_task_backfills_prompt_mentioned_role_image_and_audio_assets() {
         }],
         tasks: vec![],
         logs: vec![],
+        imagegen_history: vec![],
     };
     let draft = TaskDraft {
         title: String::new(),

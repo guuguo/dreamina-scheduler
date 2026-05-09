@@ -2,6 +2,7 @@ mod keep_awake;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fs,
     io::Cursor,
@@ -18,6 +19,8 @@ const MAX_IMAGES: usize = 9;
 const MAX_AUDIO: usize = 3;
 /// 自动查询最长等待时间（4小时），超过后停止自动查询，改为手动
 const MAX_WAIT_HOURS: i64 = 4;
+/// 5xx 服务器错误自动重试上限次数
+const MAX_SERVER_ERROR_RETRIES: u32 = 2;
 
 /// 退避间隔阶梯（秒），index = consecutive_no_result_queries 的次数映射
 const BACKOFF_INTERVALS_SECS: &[u64] = &[0, 60, 120, 300, 600];
@@ -215,6 +218,38 @@ fn encode_rgba_png(width: u32, height: u32, bytes: &[u8]) -> Result<Vec<u8>, Sch
     Ok(encoded)
 }
 
+fn decode_png_rgba(bytes: &[u8]) -> Result<(usize, usize, Vec<u8>), SchedulerError> {
+    let mut decoder = png::Decoder::new(Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|error| SchedulerError::Io(error.to_string()))?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader
+        .next_frame(&mut buf)
+        .map_err(|error| SchedulerError::Io(error.to_string()))?;
+    let data = &buf[..info.buffer_size()];
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => data.to_vec(),
+        png::ColorType::Rgb => data
+            .chunks_exact(3)
+            .flat_map(|chunk| [chunk[0], chunk[1], chunk[2], 255])
+            .collect(),
+        png::ColorType::Grayscale => data
+            .iter()
+            .flat_map(|value| [*value, *value, *value, 255])
+            .collect(),
+        png::ColorType::GrayscaleAlpha => data
+            .chunks_exact(2)
+            .flat_map(|chunk| [chunk[0], chunk[0], chunk[0], chunk[1]])
+            .collect(),
+        png::ColorType::Indexed => {
+            return Err(SchedulerError::Io("暂不支持索引色 PNG".to_string()));
+        }
+    };
+    Ok((info.width as usize, info.height as usize, rgba))
+}
+
 fn clipboard_image_extension(file_name: &str, mime: &str) -> Result<String, SchedulerError> {
     let file_ext = Path::new(file_name)
         .extension()
@@ -403,6 +438,9 @@ pub struct ScheduledTask {
     /// 连续无结果查询次数，用于退避阶梯
     #[serde(default)]
     pub consecutive_no_result_queries: u32,
+    /// 5xx 服务器错误重试次数（上限 MAX_SERVER_ERROR_RETRIES，超过后标 failed）
+    #[serde(default)]
+    pub server_error_retry_count: u32,
 }
 
 impl From<TaskDraft> for ScheduledTask {
@@ -446,6 +484,7 @@ impl From<TaskDraft> for ScheduledTask {
             last_auto_query_at: None,
             auto_query_stopped: false,
             consecutive_no_result_queries: 0,
+            server_error_retry_count: 0,
         }
     }
 }
@@ -473,13 +512,194 @@ fn normalize_task_title(title: &str, prompt: &str) -> String {
     }
 }
 
+// ── Structured Log System ──────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Success,
+    Debug,
+}
+
+impl Default for LogLevel {
+    fn default() -> Self { LogLevel::Info }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogSource {
+    CLI,
+    Scheduler,
+    Worker,
+    RetryPolicy,
+    System,
+    AI,
+    ImageGen,
+    Asset,
+    Role,
+    Settings,
+}
+
+impl Default for LogSource {
+    fn default() -> Self { LogSource::System }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogEntry {
+    pub id: String,
+    pub timestamp: String,
+    #[serde(default)]
+    pub level: LogLevel,
+    #[serde(default)]
+    pub source: LogSource,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub event_type: String,
+    pub message: String,
+    #[serde(default)]
+    pub detail: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub task_title: Option<String>,
+    #[serde(default)]
+    pub submit_id: Option<String>,
+    #[serde(default)]
+    pub execution_record_id: Option<String>,
+    #[serde(default)]
+    pub error_detail: Option<String>,
+    #[serde(default)]
+    pub raw_output: Option<String>,
+    #[serde(default)]
+    pub stdout: Option<String>,
+    #[serde(default)]
+    pub stderr: Option<String>,
+    #[serde(default)]
+    pub module: Option<String>,
+    /// Legacy compatibility: original string from old Vec<String> logs
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_string: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LogEntryDraft {
+    pub level: LogLevel,
+    pub source: LogSource,
+    pub category: String,
+    pub event_type: String,
+    pub message: String,
+    pub detail: String,
+    pub task_id: Option<String>,
+    pub task_title: Option<String>,
+    pub submit_id: Option<String>,
+    pub execution_record_id: Option<String>,
+    pub error_detail: Option<String>,
+    pub raw_output: Option<String>,
+    pub stdout: Option<String>,
+    pub stderr: Option<String>,
+    pub module: Option<String>,
+}
+
+/// Custom deserializer: accept both old `Vec<String>` and new `Vec<LogEntry>`.
+fn deserialize_logs_compat<'de, D>(deserializer: D) -> Result<Vec<LogEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{SeqAccess, Visitor};
+    use std::fmt;
+
+    struct LogsVisitor;
+
+    impl<'de> Visitor<'de> for LogsVisitor {
+        type Value = Vec<LogEntry>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a sequence of log entries (string or object)")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Vec<LogEntry>, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut logs = Vec::new();
+            let mut index: usize = 0;
+            while let Some(value) = seq.next_element::<serde_json::Value>()? {
+                match value {
+                    serde_json::Value::String(s) => {
+                        logs.push(LogEntry {
+                            id: format!("legacy_{index}"),
+                            timestamp: String::new(),
+                            level: LogLevel::Info,
+                            source: LogSource::System,
+                            category: "system".to_string(),
+                            event_type: "legacy_string_log".to_string(),
+                            message: s.clone(),
+                            detail: String::new(),
+                            task_id: None,
+                            task_title: None,
+                            submit_id: None,
+                            execution_record_id: None,
+                            error_detail: None,
+                            raw_output: None,
+                            stdout: None,
+                            stderr: None,
+                            module: None,
+                            legacy_string: Some(s),
+                        });
+                    }
+                    serde_json::Value::Object(_) => {
+                        let entry: LogEntry =
+                            serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                        logs.push(entry);
+                    }
+                    other => {
+                        let s = other.to_string();
+                        logs.push(LogEntry {
+                            id: format!("legacy_{index}"),
+                            timestamp: String::new(),
+                            level: LogLevel::Info,
+                            source: LogSource::System,
+                            category: "system".to_string(),
+                            event_type: "legacy_string_log".to_string(),
+                            message: s.clone(),
+                            detail: String::new(),
+                            task_id: None,
+                            task_title: None,
+                            submit_id: None,
+                            execution_record_id: None,
+                            error_detail: None,
+                            raw_output: None,
+                            stdout: None,
+                            stderr: None,
+                            module: None,
+                            legacy_string: Some(s),
+                        });
+                    }
+                }
+                index += 1;
+            }
+            Ok(logs)
+        }
+    }
+
+    deserializer.deserialize_seq(LogsVisitor)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppData {
     pub settings: SchedulerSettings,
     pub assets: Vec<Asset>,
     pub roles: Vec<Role>,
     pub tasks: Vec<ScheduledTask>,
-    pub logs: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_logs_compat")]
+    pub logs: Vec<LogEntry>,
+    #[serde(default)]
+    pub imagegen_history: Vec<ImageGenHistoryItem>,
 }
 
 impl Default for AppData {
@@ -490,9 +710,36 @@ impl Default for AppData {
             roles: vec![],
             tasks: vec![],
             logs: vec![],
+            imagegen_history: vec![],
         }
     }
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageGenHistoryItem {
+    pub id: String,
+    pub prompt: String,
+    pub size: String,
+    #[serde(default)]
+    pub stored_path: String,
+    #[serde(default)]
+    pub size_bytes: u64,
+    #[serde(default)]
+    pub mime: String,
+    #[serde(default)]
+    pub reference_asset_ids: Vec<String>,
+    pub created_at: String,
+    /// "pending" | "completed" | "failed"
+    #[serde(default = "default_status_completed")]
+    pub status: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+fn default_status_completed() -> String { "completed".to_string() }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CliStatus {
@@ -544,6 +791,23 @@ pub struct CreateRoleInput {
     pub asset_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageModelConfig {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+}
+
+impl Default for ImageModelConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: String::new(),
+            model: "gpt-image-1".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateSettingsInput {
     pub concurrency_limit_policy: ConcurrencyLimitPolicy,
@@ -560,6 +824,8 @@ pub struct UpdateSettingsInput {
     pub active_ai_model_id: String,
     #[serde(default = "default_true")]
     pub prevent_sleep: bool,
+    #[serde(default)]
+    pub image_model_config: Option<ImageModelConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -628,11 +894,7 @@ impl AppStore {
         recover_tasks_on_load(&mut data);
         backfill_draft_command_previews(&mut data);
         // 日志保留清理
-        let max_logs = data.settings.log_retention_count as usize;
-        if max_logs > 0 && data.logs.len() > max_logs {
-            let drain = data.logs.len() - max_logs;
-            data.logs.drain(0..drain);
-        }
+        apply_log_retention(&mut data);
         Self {
             root_dir,
             data: Mutex::new(data),
@@ -645,6 +907,10 @@ impl AppStore {
 
     pub fn assets_dir(&self) -> PathBuf {
         self.root_dir.join("role-media")
+    }
+
+    pub fn imagegen_dir(&self) -> PathBuf {
+        self.root_dir.join("imagegen")
     }
 
     pub fn mutate<F, T>(&self, mutate: F) -> Result<T, SchedulerError>
@@ -927,6 +1193,8 @@ pub struct SchedulerSettings {
     pub active_ai_model_id: String,
     #[serde(default = "default_true")]
     pub prevent_sleep: bool,
+    #[serde(default)]
+    pub image_model_config: Option<ImageModelConfig>,
 }
 
 fn default_true() -> bool {
@@ -956,6 +1224,7 @@ impl Default for SchedulerSettings {
             ai_model_configs: default_ai_model_configs(),
             active_ai_model_id: default_active_ai_model_id(),
             prevent_sleep: true,
+            image_model_config: None,
         }
     }
 }
@@ -1050,6 +1319,8 @@ pub struct SubmitOutput {
     pub submit_id: Option<String>,
     pub gen_status: Option<String>,
     pub fail_reason: Option<String>,
+    /// API 级别错误码（如 Dreamina 返回的 code 字段）。>= 400 时即使有 submit_id 也视为提交失败。
+    pub error_code: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1059,6 +1330,8 @@ pub struct QueryOutput {
     pub result_paths: Vec<String>,
     pub result_urls: Vec<String>,
     pub queue_info: Option<QueueInfo>,
+    /// API 级别错误码（如 Dreamina 返回的 code 字段）。>= 400 时视为查询失败。
+    pub error_code: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1256,11 +1529,21 @@ pub fn parse_submit_output(output: &str) -> SubmitOutput {
     if let Some(value) = &parsed {
         collect_json_strings(value, &mut text);
     }
+    let error_code = parsed.as_ref().and_then(|v| {
+        v.get("code")
+            .and_then(|c| c.as_i64())
+            .filter(|&c| c != 0 && c != 200)
+    });
     SubmitOutput {
-        submit_id: parsed
-            .as_ref()
-            .and_then(|value| find_json_string_field(value, "submit_id"))
-            .or_else(|| first_field(&text, "submit_id")),
+        submit_id: if error_code.map_or(false, |c| c >= 400) {
+            // API 报错时忽略响应中可能残留的 submit_id，避免把错误响应误判为成功提交
+            None
+        } else {
+            parsed
+                .as_ref()
+                .and_then(|value| find_json_string_field(value, "submit_id"))
+                .or_else(|| first_field(&text, "submit_id"))
+        },
         gen_status: parsed
             .as_ref()
             .and_then(|value| find_json_string_field(value, "gen_status"))
@@ -1281,6 +1564,7 @@ pub fn parse_submit_output(output: &str) -> SubmitOutput {
             .or_else(|| first_field(&text, "fail_reason"))
             .or_else(|| first_field(&text, "failReason"))
             .or_else(|| first_field(&text, "message")),
+        error_code,
     }
 }
 
@@ -1323,6 +1607,11 @@ pub fn parse_query_output(output: &str) -> QueryOutput {
         result_paths: collect_result_paths(&text),
         result_urls: collect_result_urls(&text),
         queue_info,
+        error_code: parsed.as_ref().and_then(|v| {
+            v.get("code")
+                .and_then(|c| c.as_i64())
+                .filter(|&c| c != 0 && c != 200)
+        }),
     }
 }
 
@@ -2395,6 +2684,19 @@ pub fn query_task_once(data: &mut AppData, task_id: &str) -> Result<ScheduledTas
     query_task_once_with_runner(data, task_id, |args| run_dreamina_command(args))
 }
 
+/// 同 `query_task_submit_id_once_with_runner`，但跳过 4 小时上限（用于手动查询）
+pub fn manual_query_task_submit_id_with_runner<F>(
+    data: &mut AppData,
+    task_id: &str,
+    submit_id: &str,
+    mut runner: F,
+) -> Result<ScheduledTask, SchedulerError>
+where
+    F: FnMut(&[String]) -> Result<(String, String), String>,
+{
+    query_task_submit_id_once_with_runner_inner(data, task_id, submit_id, &mut runner, true)
+}
+
 /// Download a list of remote URLs to `results_dir`, returns successfully saved local paths.
 /// Skips already-downloaded files (same URL base name already exists).
 pub fn download_result_urls(urls: &[String], results_dir: &Path) -> Vec<String> {
@@ -2507,6 +2809,19 @@ pub fn query_task_submit_id_once_with_runner<F>(
 where
     F: FnMut(&[String]) -> Result<(String, String), String>,
 {
+    query_task_submit_id_once_with_runner_inner(data, task_id, submit_id, &mut runner, false)
+}
+
+fn query_task_submit_id_once_with_runner_inner<F>(
+    data: &mut AppData,
+    task_id: &str,
+    submit_id: &str,
+    runner: &mut F,
+    is_manual: bool,
+) -> Result<ScheduledTask, SchedulerError>
+where
+    F: FnMut(&[String]) -> Result<(String, String), String>,
+{
     let task_index = data
         .tasks
         .iter()
@@ -2575,7 +2890,9 @@ where
         final_status = "succeeded".to_string();
         final_result_paths = parsed.result_paths;
         final_result_urls = parsed.result_urls;
-    } else if status_text.contains("fail") || status_text.contains("cancel") {
+    } else if status_text.contains("fail") || status_text.contains("cancel")
+        || parsed.error_code.map_or(false, |c| c >= 400)
+    {
         final_status = "failed".to_string();
         final_error_detail = parsed.fail_reason.unwrap_or_else(|| raw.trim().to_string());
     } else {
@@ -2585,8 +2902,8 @@ where
             data.tasks[task_index].submitted_at = Some(now_rfc3339());
         }
 
-        // 检查是否超过 4 小时等待上限
-        if is_current_submit && is_past_max_wait(&data.tasks[task_index], Utc::now()) {
+        // 检查是否超过 4 小时等待上限（手动查询不触发该限制）
+        if !is_manual && is_current_submit && is_past_max_wait(&data.tasks[task_index], Utc::now()) {
             final_status = "submitted".to_string();
             final_error_detail = format!(
                 "自动查询已停止（已等待超过 {} 小时），请手动查询",
@@ -2784,6 +3101,7 @@ where
     if let Some(submit_id) = parsed.submit_id {
         data.tasks[task_index].submit_id = submit_id;
         data.tasks[task_index].submitted_at = Some(started_at.clone());
+        data.tasks[task_index].server_error_retry_count = 0;
         data.tasks[task_index].status = if parsed.gen_status.as_deref() == Some("success") {
             "succeeded".to_string()
         } else if data.settings.auto_query_enabled {
@@ -2794,6 +3112,23 @@ where
         data.tasks[task_index].last_error.clear();
     } else {
         let message = parsed.fail_reason.unwrap_or_else(|| raw.trim().to_string());
+        // 5xx 服务器错误（如 HTTP 500-599 或 Dreamina 自定义 50000-59999）：
+        // 可能是平台侧瞬时故障，自动重试最多 MAX_SERVER_ERROR_RETRIES 次
+        if parsed.error_code.map_or(false, |c| (c >= 500 && c < 600) || (c >= 50000 && c < 60000)) {
+            data.tasks[task_index].server_error_retry_count += 1;
+            error_kind = format!("{:?}", DreaminaErrorKind::Transient);
+            if data.tasks[task_index].server_error_retry_count <= MAX_SERVER_ERROR_RETRIES {
+                data.tasks[task_index].status = "retry_wait".to_string();
+                data.tasks[task_index].next_run_at = Some(
+                    (Utc::now()
+                        + Duration::seconds(data.settings.concurrency_retry_delay_seconds as i64))
+                    .to_rfc3339(),
+                );
+            } else {
+                data.tasks[task_index].status = "failed".to_string();
+            }
+            data.tasks[task_index].last_error = message;
+        } else {
         let classified = classify_dreamina_error(&message, &data.settings);
         error_kind = format!("{:?}", classified.kind);
         let mut next_status = classified.next_status.clone();
@@ -2815,6 +3150,7 @@ where
         }
         data.tasks[task_index].status = next_status;
         data.tasks[task_index].last_error = message;
+        } // end else (non-5xx)
     }
     data.tasks[task_index].updated_at = now_rfc3339();
     let final_status = data.tasks[task_index].status.clone();
@@ -3319,6 +3655,61 @@ fn truncate_log(value: &str) -> String {
     result
 }
 
+/// Field-level truncation for structured log fields (shorter limit than full log).
+fn truncate_log_field(value: &str) -> String {
+    const MAX_FIELD_CHARS: usize = 4000;
+    if value.chars().count() <= MAX_FIELD_CHARS {
+        return value.to_string();
+    }
+    let mut result: String = value.chars().take(MAX_FIELD_CHARS).collect();
+    result.push_str("...（已截断）");
+    result
+}
+
+/// Append a structured log entry, auto-filling id/timestamp and executing retention.
+fn append_log(data: &mut AppData, draft: LogEntryDraft) {
+    let entry = LogEntry {
+        id: format!("log_{}", Uuid::new_v4().simple()),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        level: draft.level,
+        source: draft.source,
+        category: draft.category,
+        event_type: draft.event_type,
+        message: draft.message,
+        detail: draft.detail,
+        task_id: draft.task_id,
+        task_title: draft.task_title,
+        submit_id: draft.submit_id,
+        execution_record_id: draft.execution_record_id,
+        error_detail: draft.error_detail,
+        raw_output: draft.raw_output,
+        stdout: draft.stdout,
+        stderr: draft.stderr,
+        module: draft.module,
+        legacy_string: None,
+    };
+    data.logs.push(entry);
+    apply_log_retention(data);
+}
+
+/// Append a task-context log entry, auto-injecting task_id/task_title/submit_id.
+/// The caller should NOT set task_id/task_title in the draft — they will be overwritten.
+fn append_task_log(data: &mut AppData, task: &ScheduledTask, mut draft: LogEntryDraft) {
+    draft.task_id = Some(task.id.clone());
+    draft.task_title = Some(task.title.clone());
+    draft.submit_id = if task.submit_id.is_empty() { None } else { Some(task.submit_id.clone()) };
+    append_log(data, draft);
+}
+
+/// Trim old log entries to respect `settings.log_retention_count`.
+fn apply_log_retention(data: &mut AppData) {
+    let max_logs = data.settings.log_retention_count as usize;
+    if max_logs > 0 && data.logs.len() > max_logs {
+        let drain = data.logs.len() - max_logs;
+        data.logs.drain(0..drain);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -3348,6 +3739,11 @@ pub fn run() {
             commands::process_queue_command,
             commands::generate_task_title_command,
             commands::test_ai_model_command,
+            commands::generate_image_command,
+            commands::query_image_task_command,
+            commands::copy_imagegen_image_command,
+            commands::delete_imagegen_history_item_command,
+            commands::clear_imagegen_history_command,
             commands::update_settings_command,
             commands::pause_task_command,
             commands::resume_task_command,
@@ -3370,6 +3766,8 @@ pub fn run() {
 pub mod commands {
     use super::*;
     use tauri::State;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 
     #[tauri::command]
     pub fn get_app_state(store: State<'_, AppStore>) -> AppData {
@@ -3412,9 +3810,20 @@ pub mod commands {
                     .ok_or_else(|| SchedulerError::MissingAsset(asset_id.clone()))?;
                 let old = asset.name.clone();
                 asset.name = new_name.trim().to_string();
-                data.logs
-                    .push(format!("重命名素材：{} -> {}", old, asset.name));
-                Ok(asset.clone())
+                let new_name_val = asset.name.clone();
+                let asset_clone = asset.clone();
+                append_log(data, LogEntryDraft {
+                    level: LogLevel::Info,
+                    source: LogSource::Asset,
+                    category: "asset".to_string(),
+                    event_type: "rename".to_string(),
+                    message: format!("重命名素材：{} -> {}", old, new_name_val),
+                    detail: String::new(),
+                    task_id: None, task_title: None, submit_id: None,
+                    execution_record_id: None, error_detail: None,
+                    raw_output: None, stdout: None, stderr: None, module: None,
+                });
+                Ok(asset_clone)
             })
             .map_err(|error| error.to_string())
     }
@@ -3433,7 +3842,17 @@ pub mod commands {
                     .map_err(|error| SchedulerError::Io(error.to_string()))?;
                 asset.tags.push("temp_image".to_string());
                 data.assets.push(asset.clone());
-                data.logs.push(format!("导入临时图片：{}", asset.name));
+                append_log(data, LogEntryDraft {
+                    level: LogLevel::Info,
+                    source: LogSource::Asset,
+                    category: "asset".to_string(),
+                    event_type: "import_temp_image".to_string(),
+                    message: format!("导入临时图片：{}", asset.name),
+                    detail: String::new(),
+                    task_id: None, task_title: None, submit_id: None,
+                    execution_record_id: None, error_detail: None,
+                    raw_output: None, stdout: None, stderr: None, module: None,
+                });
                 Ok(asset)
             })
             .map_err(|error| error.to_string())
@@ -3451,7 +3870,17 @@ pub mod commands {
         store
             .mutate(|data| {
                 data.assets.push(asset.clone());
-                data.logs.push(format!("导入素材：{}", asset.name));
+                append_log(data, LogEntryDraft {
+                    level: LogLevel::Info,
+                    source: LogSource::Asset,
+                    category: "asset".to_string(),
+                    event_type: "import".to_string(),
+                    message: format!("导入素材：{}", asset.name),
+                    detail: String::new(),
+                    task_id: None, task_title: None, submit_id: None,
+                    execution_record_id: None, error_detail: None,
+                    raw_output: None, stdout: None, stderr: None, module: None,
+                });
                 Ok(asset.clone())
             })
             .map_err(|error| error.to_string())
@@ -3466,7 +3895,17 @@ pub mod commands {
         store
             .mutate(|data| {
                 let asset = save_clipboard_image_asset(data, &assets_dir, input)?;
-                data.logs.push(format!("粘贴临时图片：{}", asset.name));
+                append_log(data, LogEntryDraft {
+                    level: LogLevel::Info,
+                    source: LogSource::Asset,
+                    category: "asset".to_string(),
+                    event_type: "paste_clipboard".to_string(),
+                    message: format!("粘贴临时图片：{}", asset.name),
+                    detail: String::new(),
+                    task_id: None, task_title: None, submit_id: None,
+                    execution_record_id: None, error_detail: None,
+                    raw_output: None, stdout: None, stderr: None, module: None,
+                });
                 Ok(asset)
             })
             .map_err(|error| error.to_string())
@@ -3478,8 +3917,17 @@ pub mod commands {
         store
             .mutate(|data| {
                 let asset = paste_system_clipboard_image_asset(data, &assets_dir)?;
-                data.logs
-                    .push(format!("粘贴系统剪贴板图片：{}", asset.name));
+                append_log(data, LogEntryDraft {
+                    level: LogLevel::Info,
+                    source: LogSource::Asset,
+                    category: "asset".to_string(),
+                    event_type: "paste_system_clipboard".to_string(),
+                    message: format!("粘贴系统剪贴板图片：{}", asset.name),
+                    detail: String::new(),
+                    task_id: None, task_title: None, submit_id: None,
+                    execution_record_id: None, error_detail: None,
+                    raw_output: None, stdout: None, stderr: None, module: None,
+                });
                 Ok(asset)
             })
             .map_err(|error| error.to_string())
@@ -3494,7 +3942,17 @@ pub mod commands {
         store
             .mutate(|data| {
                 let role = import_media_to_role(data, &role_media_dir, input)?;
-                data.logs.push(format!("导入角色媒体：{}", role.name));
+                append_log(data, LogEntryDraft {
+                    level: LogLevel::Info,
+                    source: LogSource::Role,
+                    category: "role".to_string(),
+                    event_type: "import_media".to_string(),
+                    message: format!("导入角色媒体：{}", role.name),
+                    detail: String::new(),
+                    task_id: None, task_title: None, submit_id: None,
+                    execution_record_id: None, error_detail: None,
+                    raw_output: None, stdout: None, stderr: None, module: None,
+                });
                 Ok(role)
             })
             .map_err(|error| error.to_string())
@@ -3508,7 +3966,17 @@ pub mod commands {
         store
             .mutate(|data| {
                 let role = remove_media_from_role(data, input)?;
-                data.logs.push(format!("移除角色媒体：{}", role.name));
+                append_log(data, LogEntryDraft {
+                    level: LogLevel::Info,
+                    source: LogSource::Role,
+                    category: "role".to_string(),
+                    event_type: "remove_media".to_string(),
+                    message: format!("移除角色媒体：{}", role.name),
+                    detail: String::new(),
+                    task_id: None, task_title: None, submit_id: None,
+                    execution_record_id: None, error_detail: None,
+                    raw_output: None, stdout: None, stderr: None, module: None,
+                });
                 Ok(role)
             })
             .map_err(|error| error.to_string())
@@ -3522,7 +3990,17 @@ pub mod commands {
         store
             .mutate(|data| {
                 let role = upsert_role(data, input);
-                data.logs.push(format!("新增角色：{}", role.name));
+                append_log(data, LogEntryDraft {
+                    level: LogLevel::Success,
+                    source: LogSource::Role,
+                    category: "role".to_string(),
+                    event_type: "create".to_string(),
+                    message: format!("新增角色：{}", role.name),
+                    detail: String::new(),
+                    task_id: None, task_title: None, submit_id: None,
+                    execution_record_id: None, error_detail: None,
+                    raw_output: None, stdout: None, stderr: None, module: None,
+                });
                 Ok(role.clone())
             })
             .map_err(|error| error.to_string())
@@ -3536,7 +4014,17 @@ pub mod commands {
         store
             .mutate(|data| {
                 let role = upsert_role(data, input);
-                data.logs.push(format!("更新角色：{}", role.name));
+                append_log(data, LogEntryDraft {
+                    level: LogLevel::Info,
+                    source: LogSource::Role,
+                    category: "role".to_string(),
+                    event_type: "update".to_string(),
+                    message: format!("更新角色：{}", role.name),
+                    detail: String::new(),
+                    task_id: None, task_title: None, submit_id: None,
+                    execution_record_id: None, error_detail: None,
+                    raw_output: None, stdout: None, stderr: None, module: None,
+                });
                 Ok(role)
             })
             .map_err(|error| error.to_string())
@@ -3547,7 +4035,17 @@ pub mod commands {
         store
             .mutate(|data| {
                 delete_role(data, &role_id)?;
-                data.logs.push(format!("删除角色：{}", role_id));
+                append_log(data, LogEntryDraft {
+                    level: LogLevel::Info,
+                    source: LogSource::Role,
+                    category: "role".to_string(),
+                    event_type: "delete".to_string(),
+                    message: format!("删除角色：{}", role_id),
+                    detail: String::new(),
+                    task_id: None, task_title: None, submit_id: None,
+                    execution_record_id: None, error_detail: None,
+                    raw_output: None, stdout: None, stderr: None, module: None,
+                });
                 Ok(())
             })
             .map_err(|error| error.to_string())
@@ -3574,7 +4072,17 @@ pub mod commands {
         store
             .mutate(|data| {
                 let task = create_draft_task(data, draft)?;
-                data.logs.push(format!("保存草稿：{}", task.title));
+                append_log(data, LogEntryDraft {
+                    level: LogLevel::Info,
+                    source: LogSource::Scheduler,
+                    category: "task".to_string(),
+                    event_type: "save_draft".to_string(),
+                    message: format!("保存草稿：{}", task.title),
+                    detail: String::new(),
+                    task_id: Some(task.id.clone()), task_title: Some(task.title.clone()),
+                    submit_id: None, execution_record_id: None, error_detail: None,
+                    raw_output: None, stdout: None, stderr: None, module: None,
+                });
                 data.tasks.push(task.clone());
                 Ok(task)
             })
@@ -3589,7 +4097,17 @@ pub mod commands {
         store
             .mutate(|data| {
                 let task = create_task_with_preview(data, draft)?;
-                data.logs.push(format!("创建任务：{}", task.title));
+                append_log(data, LogEntryDraft {
+                    level: LogLevel::Success,
+                    source: LogSource::Scheduler,
+                    category: "task".to_string(),
+                    event_type: "create".to_string(),
+                    message: format!("创建任务：{}", task.title),
+                    detail: String::new(),
+                    task_id: Some(task.id.clone()), task_title: Some(task.title.clone()),
+                    submit_id: None, execution_record_id: None, error_detail: None,
+                    raw_output: None, stdout: None, stderr: None, module: None,
+                });
                 data.tasks.push(task.clone());
                 Ok(task)
             })
@@ -3635,8 +4153,18 @@ pub mod commands {
             .mutate(|data| {
                 let task =
                     submit_task_once_with_runner(data, &task_id, |_args| cli_result.clone())?;
-                data.logs
-                    .push(format!("提交任务：{} -> {}", task.title, task.status));
+                append_task_log(data, &task, LogEntryDraft {
+                    level: if task.status == "failed" { LogLevel::Error } else { LogLevel::Info },
+                    source: LogSource::Worker,
+                    category: "task".to_string(),
+                    event_type: "submit".to_string(),
+                    message: format!("提交任务：{} -> {}", task.title, task.status),
+                    detail: String::new(),
+                    task_id: None, task_title: None,
+                    submit_id: if task.submit_id.is_empty() { None } else { Some(task.submit_id.clone()) },
+                    execution_record_id: None, error_detail: None,
+                    raw_output: None, stdout: None, stderr: None, module: None,
+                });
                 Ok(task)
             })
             .map_err(|e| e.to_string())?;
@@ -3710,14 +4238,24 @@ pub mod commands {
                         reset_query_backoff(t);
                     }
                 }
-                let task = query_task_submit_id_once_with_runner(
+                let task = manual_query_task_submit_id_with_runner(
                     data,
                     &task_id,
                     &submit_id,
                     |_args| cli_result.clone(),
                 )?;
-                data.logs
-                    .push(format!("查询任务：{} / {} -> {}", task.title, submit_id, task.status));
+                append_task_log(data, &task, LogEntryDraft {
+                    level: if task.status == "failed" { LogLevel::Error } else { LogLevel::Info },
+                    source: LogSource::Worker,
+                    category: "task".to_string(),
+                    event_type: "query".to_string(),
+                    message: format!("查询任务：{} / {} -> {}", task.title, submit_id, task.status),
+                    detail: String::new(),
+                    task_id: None, task_title: None,
+                    submit_id: Some(submit_id.clone()),
+                    execution_record_id: None, error_detail: None,
+                    raw_output: None, stdout: None, stderr: None, module: None,
+                });
                 Ok(task)
             })
             .map_err(|e| e.to_string())?;
@@ -3784,7 +4322,17 @@ pub mod commands {
         let (task_id, args, is_query) = match due {
             None => {
                 let _ = store.mutate(|data| {
-                    data.logs.push("队列暂无到期任务".to_string());
+                    append_log(data, LogEntryDraft {
+                        level: LogLevel::Debug,
+                        source: LogSource::Scheduler,
+                        category: "queue".to_string(),
+                        event_type: "no_due_task".to_string(),
+                        message: "队列暂无到期任务".to_string(),
+                        detail: String::new(),
+                        task_id: None, task_title: None, submit_id: None,
+                        execution_record_id: None, error_detail: None,
+                        raw_output: None, stdout: None, stderr: None, module: None,
+                    });
                     Ok(())
                 });
                 return Ok(None);
@@ -3802,16 +4350,31 @@ pub mod commands {
                 // scheduled → queued 迁移（仅 submit 路径需要）
                 if !is_query {
                     let now = Utc::now();
+                    // Collect log drafts first to avoid borrow conflict
+                    let mut log_drafts: Vec<LogEntryDraft> = Vec::new();
                     for t in &mut data.tasks {
                         if t.status == "scheduled" && is_due(t.next_run_at.as_deref(), now) {
-                            data.logs.push(format!(
-                                "预定已到期，恢复后补偿处理：{}（原计划 {}）",
-                                t.title,
-                                t.scheduled_at.as_deref().unwrap_or("-")
-                            ));
+                            log_drafts.push(LogEntryDraft {
+                                level: LogLevel::Warn,
+                                source: LogSource::Scheduler,
+                                category: "queue".to_string(),
+                                event_type: "expired_compensation".to_string(),
+                                message: format!(
+                                    "预定已到期，恢复后补偿处理：{}（原计划 {}）",
+                                    t.title,
+                                    t.scheduled_at.as_deref().unwrap_or("-")
+                                ),
+                                detail: String::new(),
+                                task_id: Some(t.id.clone()), task_title: Some(t.title.clone()),
+                                submit_id: None, execution_record_id: None, error_detail: None,
+                                raw_output: None, stdout: None, stderr: None, module: None,
+                            });
                             t.status = "queued".to_string();
                             t.updated_at = now_rfc3339();
                         }
+                    }
+                    for draft in log_drafts {
+                        append_log(data, draft);
                     }
                 }
                 let task = if is_query {
@@ -3819,8 +4382,20 @@ pub mod commands {
                 } else {
                     submit_task_once_with_runner(data, &task_id, |_| cli_result.clone())?
                 };
-                data.logs
-                    .push(format!("队列执行：{} -> {}", task.title, task.status));
+                append_task_log(data, &task, LogEntryDraft {
+                    level: if task.status == "succeeded" { LogLevel::Success }
+                           else if task.status == "failed" { LogLevel::Error }
+                           else { LogLevel::Info },
+                    source: LogSource::Scheduler,
+                    category: "queue".to_string(),
+                    event_type: "execute".to_string(),
+                    message: format!("队列执行：{} -> {}", task.title, task.status),
+                    detail: String::new(),
+                    task_id: None, task_title: None,
+                    submit_id: if task.submit_id.is_empty() { None } else { Some(task.submit_id.clone()) },
+                    execution_record_id: None, error_detail: None,
+                    raw_output: None, stdout: None, stderr: None, module: None,
+                });
                 Ok(task)
             })
             .map_err(|e| e.to_string())?;
@@ -3944,7 +4519,18 @@ pub mod commands {
                     Some(&error),
                 );
                 let _ = store.mutate(|data| {
-                    data.logs.push(log);
+                    append_log(data, LogEntryDraft {
+                        level: LogLevel::Error,
+                        source: LogSource::AI,
+                        category: "ai_model_test".to_string(),
+                        event_type: "test_error".to_string(),
+                        message: format!("AI 模型测试失败：{}", error),
+                        detail: log,
+                        task_id: None, task_title: None, submit_id: None,
+                        execution_record_id: None, error_detail: Some(error.clone()),
+                        raw_output: None, stdout: None, stderr: None,
+                        module: Some(format!("{}:{}", log_mode, log_model)),
+                    });
                     Ok(())
                 });
                 return Err(error);
@@ -3963,7 +4549,19 @@ pub mod commands {
                     Some(&message),
                 );
                 let _ = store.mutate(|data| {
-                    data.logs.push(log);
+                    append_log(data, LogEntryDraft {
+                        level: LogLevel::Error,
+                        source: LogSource::AI,
+                        category: "ai_model_test".to_string(),
+                        event_type: "parse_error".to_string(),
+                        message: message.clone(),
+                        detail: log,
+                        task_id: None, task_title: None, submit_id: None,
+                        execution_record_id: None, error_detail: Some(message.clone()),
+                        raw_output: Some(truncate_log_field(&response_text)),
+                        stdout: None, stderr: None,
+                        module: Some(format!("{}:{}", log_mode, log_model)),
+                    });
                     Ok(())
                 });
                 return Err(message);
@@ -3984,10 +4582,431 @@ pub mod commands {
             error,
         );
         let _ = store.mutate(|data| {
-            data.logs.push(log);
+            append_log(data, LogEntryDraft {
+                level: if error.is_some() { LogLevel::Warn } else { LogLevel::Success },
+                source: LogSource::AI,
+                category: "ai_model_test".to_string(),
+                event_type: "test_complete".to_string(),
+                message: format!("AI 模型测试完成：{}", parsed.as_deref().unwrap_or("无文本输出")),
+                detail: log,
+                task_id: None, task_title: None, submit_id: None,
+                execution_record_id: None,
+                error_detail: error.map(|e| e.to_string()),
+                raw_output: Some(truncate_log_field(&response_text)),
+                stdout: None, stderr: None,
+                module: Some(format!("{}:{}", log_mode, log_model)),
+            });
             Ok(())
         });
         parsed.ok_or_else(|| format!("模型已响应但未返回文本，原始响应：{response_text}"))
+    }
+
+    const IMAGEGEN_HISTORY_MAX: usize = 50;
+
+    #[tauri::command]
+    pub async fn generate_image_command(
+        store: State<'_, AppStore>,
+        prompt: String,
+        size: String,
+        reference_asset_ids: Option<Vec<String>>,
+    ) -> Result<ImageGenHistoryItem, String> {
+        let config = store
+            .snapshot()
+            .settings
+            .image_model_config
+            .ok_or_else(|| "未配置图片生成模型，请先在设置中填写".to_string())?;
+        if config.api_key.trim().is_empty() {
+            return Err("图片模型 API Key 为空".to_string());
+        }
+        if config.model.trim().is_empty() {
+            return Err("图片模型名称为空".to_string());
+        }
+        let ref_ids = reference_asset_ids.unwrap_or_default();
+        println!("[generate_image] ref_ids={ref_ids:?}");
+        let base_url = config.base_url.trim().trim_end_matches('/').to_string();
+        let api_key = config.api_key.trim().to_string();
+        let model = config.model.trim().to_string();
+        let prompt_trimmed = prompt.trim().to_string();
+
+        // 构建参考图 base64 data URI 数组
+        let ref_data_uris: Vec<String> = if ref_ids.is_empty() {
+            Vec::new()
+        } else {
+            let data = store.snapshot();
+            ref_ids
+                .iter()
+                .map(|id| {
+                    let asset = data.assets.iter().find(|a| &a.id == id)
+                        .ok_or_else(|| format!("素材 {id} 不存在"))?;
+                    println!("[generate_image]   ref id={id} path={}", asset.stored_path);
+                    let bytes = std::fs::read(&asset.stored_path)
+                        .map_err(|e| format!("读取参考图失败 {}：{}", asset.stored_path, e))?;
+                    let _ = asset.mime.as_str();
+                    // geekai.co 图生图接口接受纯 base64 字符串（不带 data: 前缀）
+                    Ok::<String, String>(BASE64_STANDARD.encode(&bytes))
+                })
+                .collect::<Result<_, _>>()?
+        };
+
+        for (i, uri) in ref_data_uris.iter().enumerate() {
+            println!("[generate_image]   ref[{}] base64_len={}", i, uri.len());
+        }
+        let url = format!("{base_url}/images/generations");
+        println!("[generate_image] mode=generations url={url} ref_count={}", ref_data_uris.len());
+        let mut body_value = serde_json::json!({
+            "model": model.clone(),
+            "prompt": prompt_trimmed.clone(),
+            "n": 1,
+            "size": size.clone(),
+            "response_format": "url",
+            "async": true,
+        });
+        if ref_data_uris.len() == 1 {
+            body_value["image"] = serde_json::Value::String(ref_data_uris.into_iter().next().unwrap());
+        } else if !ref_data_uris.is_empty() {
+            // 多图必须用 images（复数）字段
+            body_value["images"] = serde_json::Value::Array(
+                ref_data_uris.into_iter().map(serde_json::Value::String).collect(),
+            );
+        }
+        let body = body_value.to_string();
+        println!("[generate_image] request body size={} bytes", body.len());
+        let ak = api_key.clone();
+        let response_text: String = tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .connect_timeout(std::time::Duration::from_secs(15))
+                .build()
+                .map_err(|e| format!("创建 HTTP 客户端失败：{}", describe_error(&e)))?;
+            let response = client
+                .post(&url)
+                .bearer_auth(&ak)
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+                .map_err(|e| format!("图片生成请求失败：{}", describe_error(&e)))?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().unwrap_or_default();
+                let snippet = if body.len() > 500 { format!("{}…", &body[..500]) } else { body };
+                return Err(format!("图片生成失败 HTTP {status}：{snippet}"));
+            }
+            response.text().map_err(|e| format!("读取响应失败：{}", describe_error(&e)))
+        })
+        .await
+        .map_err(|e| format!("任务错误：{e}"))??;
+        println!("[generate_image] async submit response: {}", truncate(&response_text, 500));
+        let payload = serde_json::from_str::<serde_json::Value>(&response_text)
+            .map_err(|e| format!("解析响应失败：{e}；原始内容：{}", truncate(&response_text, 300)))?;
+        // 任务 ID：兼容多种字段名
+        let task_id = extract_task_id(&payload).ok_or_else(|| {
+            format!("提交成功但未找到任务 ID：{}", truncate(&response_text, 300))
+        })?;
+        println!("[generate_image] async task_id={task_id}");
+
+        let item = ImageGenHistoryItem {
+            id: format!("img_{}", Uuid::new_v4().simple()),
+            prompt: prompt_trimmed.clone(),
+            size: size.clone(),
+            stored_path: String::new(),
+            size_bytes: 0,
+            mime: String::new(),
+            reference_asset_ids: ref_ids.clone(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            status: "pending".to_string(),
+            task_id: Some(task_id),
+            error: None,
+        };
+        let item_for_store = item.clone();
+        store
+            .mutate(|data| {
+                data.imagegen_history.insert(0, item_for_store);
+                if data.imagegen_history.len() > IMAGEGEN_HISTORY_MAX {
+                    data.imagegen_history.truncate(IMAGEGEN_HISTORY_MAX);
+                }
+                Ok(())
+            })
+            .map_err(|e| format!("写入历史失败：{e}"))?;
+        Ok(item)
+    }
+
+    /// 从异步生成响应中提取任务 ID。
+    fn extract_task_id(v: &serde_json::Value) -> Option<String> {
+        // 顶层 task_id / id
+        for key in ["task_id", "taskId", "id"] {
+            if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+                if !s.is_empty() { return Some(s.to_string()); }
+            }
+        }
+        // data.task_id / data.id
+        if let Some(d) = v.get("data") {
+            for key in ["task_id", "taskId", "id"] {
+                if let Some(s) = d.get(key).and_then(|x| x.as_str()) {
+                    if !s.is_empty() { return Some(s.to_string()); }
+                }
+            }
+            // data 是数组，第一个元素
+            if let Some(arr) = d.as_array() {
+                if let Some(first) = arr.first() {
+                    for key in ["task_id", "taskId", "id"] {
+                        if let Some(s) = first.get(key).and_then(|x| x.as_str()) {
+                            if !s.is_empty() { return Some(s.to_string()); }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// 查询异步图片任务状态：若已完成则下载图片并更新历史项。
+    /// 返回更新后的 ImageGenHistoryItem。
+    #[tauri::command]
+    pub async fn query_image_task_command(
+        store: State<'_, AppStore>,
+        history_id: String,
+    ) -> Result<ImageGenHistoryItem, String> {
+        // 取出当前历史项
+        let snapshot = store.snapshot();
+        let item = snapshot
+            .imagegen_history
+            .iter()
+            .find(|i| i.id == history_id)
+            .cloned()
+            .ok_or_else(|| format!("历史记录 {history_id} 不存在"))?;
+        if item.status != "pending" {
+            return Ok(item);
+        }
+        let task_id = item
+            .task_id
+            .clone()
+            .ok_or_else(|| "历史项缺少 task_id".to_string())?;
+        let config = snapshot
+            .settings
+            .image_model_config
+            .clone()
+            .ok_or_else(|| "未配置图片生成模型".to_string())?;
+        let base_url = config.base_url.trim().trim_end_matches('/').to_string();
+        let api_key = config.api_key.trim().to_string();
+        let url = format!("{base_url}/images/{task_id}");
+        let ak = api_key.clone();
+        let response_text: String = tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .connect_timeout(std::time::Duration::from_secs(15))
+                .build()
+                .map_err(|e| format!("创建 HTTP 客户端失败：{}", describe_error(&e)))?;
+            let response = client
+                .get(&url)
+                .bearer_auth(&ak)
+                .send()
+                .map_err(|e| format!("查询任务请求失败：{}", describe_error(&e)))?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().unwrap_or_default();
+                let snippet = if body.len() > 500 { format!("{}…", &body[..500]) } else { body };
+                return Err(format!("查询任务失败 HTTP {status}：{snippet}"));
+            }
+            response.text().map_err(|e| format!("读取响应失败：{}", describe_error(&e)))
+        })
+        .await
+        .map_err(|e| format!("任务错误：{e}"))??;
+        println!("[query_image_task] {history_id} -> {}", truncate(&response_text, 400));
+        let payload = serde_json::from_str::<serde_json::Value>(&response_text)
+            .map_err(|e| format!("解析响应失败：{e}；原始内容：{}", truncate(&response_text, 300)))?;
+
+        // 解析状态（兼容 status / task_status 字段名）
+        let status_raw = payload.get("status")
+            .or_else(|| payload.get("task_status"))
+            .or_else(|| payload.get("data").and_then(|d| d.get("status")))
+            .or_else(|| payload.get("data").and_then(|d| d.get("task_status")))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let is_completed = matches!(
+            status_raw.as_str(),
+            "completed" | "succeeded" | "succeed" | "success" | "finished" | "done"
+        );
+        let is_failed = matches!(status_raw.as_str(), "failed" | "error" | "canceled" | "cancelled");
+
+        if is_failed {
+            let err_msg = payload
+                .get("error")
+                .or_else(|| payload.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("生成失败")
+                .to_string();
+            let updated = update_history_item(&store, &history_id, |it| {
+                it.status = "failed".to_string();
+                it.error = Some(err_msg.clone());
+            })?;
+            return Ok(updated);
+        }
+
+        if !is_completed {
+            // 仍在 pending — 直接返回当前 item（不更新）
+            return Ok(item);
+        }
+
+        // 已完成：找图片 URL 或 b64
+        let first_data = payload
+            .get("data")
+            .and_then(|d| d.as_array())
+            .and_then(|arr| arr.first())
+            .or_else(|| payload.get("data"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let bytes: Vec<u8> = if let Some(b64) = first_data.get("b64_json").and_then(|v| v.as_str()) {
+            BASE64_STANDARD
+                .decode(b64.as_bytes())
+                .map_err(|e| format!("base64 解码失败：{e}"))?
+        } else if let Some(image_url) = first_data
+            .get("url")
+            .or_else(|| payload.get("url"))
+            .and_then(|v| v.as_str())
+        {
+            let image_url = image_url.to_string();
+            println!("[query_image_task] downloading image: {image_url}");
+            tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(60))
+                    .build()
+                    .map_err(|e| format!("创建下载客户端失败：{}", describe_error(&e)))?;
+                let r = client
+                    .get(&image_url)
+                    .send()
+                    .map_err(|e| format!("下载图片失败：{}", describe_error(&e)))?;
+                if !r.status().is_success() {
+                    return Err(format!("下载图片失败 HTTP {}", r.status()));
+                }
+                let bytes = r.bytes()
+                    .map(|b| b.to_vec())
+                    .map_err(|e| format!("读取图片失败：{}", describe_error(&e)))?;
+                println!("[query_image_task] download ok, {} bytes", bytes.len());
+                Ok(bytes)
+            })
+            .await
+            .map_err(|e| format!("任务错误：{e}"))??
+        } else {
+            return Err(format!("响应中未找到图片数据：{}", truncate(&response_text, 300)));
+        };
+
+        // 落盘
+        let dir = store.imagegen_dir();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("创建图片缓存目录失败：{}", describe_error(&e)))?;
+        let file_name = format!("img_{}.png", Uuid::new_v4().simple());
+        let stored_path = dir.join(&file_name);
+        std::fs::write(&stored_path, &bytes)
+            .map_err(|e| format!("写入图片文件失败：{}", describe_error(&e)))?;
+        let stored_path_str = stored_path.to_string_lossy().to_string();
+        let size_bytes = bytes.len() as u64;
+        let updated = update_history_item(&store, &history_id, |it| {
+            it.status = "completed".to_string();
+            it.stored_path = stored_path_str.clone();
+            it.size_bytes = size_bytes;
+            it.mime = "image/png".to_string();
+            it.error = None;
+        })?;
+        Ok(updated)
+    }
+
+    fn update_history_item<F: FnOnce(&mut ImageGenHistoryItem)>(
+        store: &State<'_, AppStore>,
+        id: &str,
+        f: F,
+    ) -> Result<ImageGenHistoryItem, String> {
+        let mut updated: Option<ImageGenHistoryItem> = None;
+        store
+            .mutate(|data| {
+                if let Some(it) = data.imagegen_history.iter_mut().find(|i| i.id == id) {
+                    f(it);
+                    updated = Some(it.clone());
+                }
+                Ok(())
+            })
+            .map_err(|e| format!("更新历史失败：{e}"))?;
+        updated.ok_or_else(|| format!("历史记录 {id} 不存在"))
+    }
+
+    #[tauri::command]
+    pub fn copy_imagegen_image_command(
+        store: State<'_, AppStore>,
+        history_id: String,
+    ) -> Result<(), String> {
+        let item = store
+            .snapshot()
+            .imagegen_history
+            .iter()
+            .find(|item| item.id == history_id)
+            .cloned()
+            .ok_or_else(|| "历史记录不存在".to_string())?;
+        if item.status != "completed" {
+            return Err("图片尚未生成完成，无法复制".to_string());
+        }
+        if item.stored_path.is_empty() {
+            return Err("图片本地路径为空，无法复制".to_string());
+        }
+        let bytes = fs::read(&item.stored_path)
+            .map_err(|error| format!("读取图片失败：{}", describe_error(&error)))?;
+        let (width, height, rgba) = decode_png_rgba(&bytes)
+            .map_err(|error| format!("解析图片失败：{}", describe_error(&error)))?;
+        let mut clipboard = arboard::Clipboard::new()
+            .map_err(|error| format!("无法访问系统剪贴板：{error}"))?;
+        clipboard
+            .set_image(arboard::ImageData {
+                width,
+                height,
+                bytes: Cow::Owned(rgba),
+            })
+            .map_err(|error| format!("写入系统剪贴板失败：{error}"))?;
+        Ok(())
+    }
+
+    #[tauri::command]
+    pub fn delete_imagegen_history_item_command(
+        store: State<'_, AppStore>,
+        id: String,
+    ) -> Result<(), String> {
+        store
+            .mutate(|data| {
+                if let Some(pos) = data.imagegen_history.iter().position(|i| i.id == id) {
+                    let removed = data.imagegen_history.remove(pos);
+                    if !removed.stored_path.is_empty() {
+                        let _ = std::fs::remove_file(&removed.stored_path);
+                    }
+                }
+                Ok(())
+            })
+            .map_err(|e| format!("删除历史失败：{e}"))
+    }
+
+    #[tauri::command]
+    pub fn clear_imagegen_history_command(store: State<'_, AppStore>) -> Result<(), String> {
+        store
+            .mutate(|data| {
+                for item in data.imagegen_history.drain(..) {
+                    if !item.stored_path.is_empty() {
+                        let _ = std::fs::remove_file(&item.stored_path);
+                    }
+                }
+                Ok(())
+            })
+            .map_err(|e| format!("清空历史失败：{e}"))
+    }
+
+    fn describe_error<E: std::error::Error>(err: &E) -> String {
+        let mut parts = vec![err.to_string()];
+        let mut source = err.source();
+        while let Some(e) = source {
+            parts.push(e.to_string());
+            source = e.source();
+        }
+        parts.join(" -> ")
+    }
+
+    fn truncate(s: &str, max: usize) -> String {
+        if s.len() <= max { s.to_string() } else { format!("{}…", &s[..max]) }
     }
 
     #[tauri::command]
@@ -4009,8 +5028,19 @@ pub mod commands {
                     ai_model_configs: input.ai_model_configs,
                     active_ai_model_id: input.active_ai_model_id,
                     prevent_sleep: input.prevent_sleep,
+                    image_model_config: input.image_model_config,
                 };
-                data.logs.push("更新设置".to_string());
+                append_log(data, LogEntryDraft {
+                    level: LogLevel::Info,
+                    source: LogSource::Settings,
+                    category: "settings".to_string(),
+                    event_type: "update".to_string(),
+                    message: "更新设置".to_string(),
+                    detail: String::new(),
+                    task_id: None, task_title: None, submit_id: None,
+                    execution_record_id: None, error_detail: None,
+                    raw_output: None, stdout: None, stderr: None, module: None,
+                });
                 Ok(data.settings.clone())
             })
             .map_err(|error| error.to_string())
@@ -4024,7 +5054,17 @@ pub mod commands {
         store
             .mutate(|data| {
                 let task = pause_task(data, &task_id)?;
-                data.logs.push(format!("暂停任务：{}", task.title));
+                append_task_log(data, &task, LogEntryDraft {
+                    level: LogLevel::Info,
+                    source: LogSource::Scheduler,
+                    category: "task".to_string(),
+                    event_type: "pause".to_string(),
+                    message: format!("暂停任务：{}", task.title),
+                    detail: String::new(),
+                    task_id: None, task_title: None, submit_id: None,
+                    execution_record_id: None, error_detail: None,
+                    raw_output: None, stdout: None, stderr: None, module: None,
+                });
                 Ok(task)
             })
             .map_err(|error| error.to_string())
@@ -4039,8 +5079,17 @@ pub mod commands {
         store
             .mutate(|data| {
                 let task = resume_task(data, &task_id, &mode)?;
-                data.logs
-                    .push(format!("恢复任务：{} -> {}", task.title, task.status));
+                append_task_log(data, &task, LogEntryDraft {
+                    level: LogLevel::Info,
+                    source: LogSource::Scheduler,
+                    category: "task".to_string(),
+                    event_type: "resume".to_string(),
+                    message: format!("恢复任务：{} -> {}", task.title, task.status),
+                    detail: String::new(),
+                    task_id: None, task_title: None, submit_id: None,
+                    execution_record_id: None, error_detail: None,
+                    raw_output: None, stdout: None, stderr: None, module: None,
+                });
                 Ok(task)
             })
             .map_err(|error| error.to_string())
@@ -4055,8 +5104,17 @@ pub mod commands {
         store
             .mutate(|data| {
                 let task = reschedule_task(data, &task_id, &new_scheduled_at)?;
-                data.logs
-                    .push(format!("重新排期：{} -> {}", task.title, new_scheduled_at));
+                append_task_log(data, &task, LogEntryDraft {
+                    level: LogLevel::Info,
+                    source: LogSource::Scheduler,
+                    category: "task".to_string(),
+                    event_type: "reschedule".to_string(),
+                    message: format!("重新排期：{} -> {}", task.title, new_scheduled_at),
+                    detail: String::new(),
+                    task_id: None, task_title: None, submit_id: None,
+                    execution_record_id: None, error_detail: None,
+                    raw_output: None, stdout: None, stderr: None, module: None,
+                });
                 Ok(task)
             })
             .map_err(|error| error.to_string())
@@ -4165,12 +5223,20 @@ pub mod commands {
             .await
             .map_err(|e| format!("任务错误：{e}"))??;
         let _ = store.mutate(|data| {
-            data.logs.push(format!(
-                "CLI 安装：{}；stdout={}；stderr={}",
-                msg,
-                truncate_log(&stdout_log),
-                truncate_log(&stderr_log)
-            ));
+            append_log(data, LogEntryDraft {
+                level: LogLevel::Success,
+                source: LogSource::CLI,
+                category: "cli".to_string(),
+                event_type: "install".to_string(),
+                message: format!("CLI 安装：{}", msg),
+                detail: String::new(),
+                task_id: None, task_title: None, submit_id: None,
+                execution_record_id: None, error_detail: None,
+                raw_output: None,
+                stdout: Some(truncate_log_field(&stdout_log)),
+                stderr: Some(truncate_log_field(&stderr_log)),
+                module: None,
+            });
             Ok(())
         });
         Ok(msg)
@@ -4206,12 +5272,20 @@ pub mod commands {
             .await
             .map_err(|e| format!("任务错误：{e}"))??;
         let _ = store.mutate(|data| {
-            data.logs.push(format!(
-                "CLI 登录：{}；stdout={}；stderr={}",
-                msg,
-                truncate_log(&stdout_log),
-                truncate_log(&stderr_log)
-            ));
+            append_log(data, LogEntryDraft {
+                level: LogLevel::Success,
+                source: LogSource::CLI,
+                category: "cli".to_string(),
+                event_type: "login".to_string(),
+                message: format!("CLI 登录：{}", msg),
+                detail: String::new(),
+                task_id: None, task_title: None, submit_id: None,
+                execution_record_id: None, error_detail: None,
+                raw_output: None,
+                stdout: Some(truncate_log_field(&stdout_log)),
+                stderr: Some(truncate_log_field(&stderr_log)),
+                module: None,
+            });
             Ok(())
         });
         Ok(msg)
@@ -4226,10 +5300,20 @@ pub mod commands {
                 if data.tasks.len() == before {
                     return Err(SchedulerError::Io(format!("找不到任务：{task_id}")));
                 }
-                data.logs.push(format!("删除任务：{task_id}"));
+                append_log(data, LogEntryDraft {
+                    level: LogLevel::Info,
+                    source: LogSource::Scheduler,
+                    category: "task".to_string(),
+                    event_type: "delete".to_string(),
+                    message: format!("删除任务：{task_id}"),
+                    detail: String::new(),
+                    task_id: Some(task_id.clone()), task_title: None, submit_id: None,
+                    execution_record_id: None, error_detail: None,
+                    raw_output: None, stdout: None, stderr: None, module: None,
+                });
                 Ok(())
             })
-            .map_err(|error| error.to_string())
+            .map_err(|e| e.to_string())
     }
 
     #[tauri::command]
@@ -4252,7 +5336,17 @@ pub mod commands {
         store
             .mutate(|data| {
                 let task = update_task_from_data(data, &task_id, draft, "task")?;
-                data.logs.push(format!("更新任务：{}", task.title));
+                append_task_log(data, &task, LogEntryDraft {
+                    level: LogLevel::Info,
+                    source: LogSource::Scheduler,
+                    category: "task".to_string(),
+                    event_type: "update".to_string(),
+                    message: format!("更新任务：{}", task.title),
+                    detail: String::new(),
+                    task_id: None, task_title: None, submit_id: None,
+                    execution_record_id: None, error_detail: None,
+                    raw_output: None, stdout: None, stderr: None, module: None,
+                });
                 Ok(task)
             })
             .map_err(|error| error.to_string())
@@ -4267,7 +5361,17 @@ pub mod commands {
         store
             .mutate(|data| {
                 let task = update_task_from_data(data, &task_id, draft, "draft")?;
-                data.logs.push(format!("更新草稿：{}", task.title));
+                append_task_log(data, &task, LogEntryDraft {
+                    level: LogLevel::Info,
+                    source: LogSource::Scheduler,
+                    category: "task".to_string(),
+                    event_type: "update_draft".to_string(),
+                    message: format!("更新草稿：{}", task.title),
+                    detail: String::new(),
+                    task_id: None, task_title: None, submit_id: None,
+                    execution_record_id: None, error_detail: None,
+                    raw_output: None, stdout: None, stderr: None, module: None,
+                });
                 Ok(task)
             })
             .map_err(|error| error.to_string())
@@ -4455,6 +5559,7 @@ mod tests {
             last_auto_query_at: None,
             auto_query_stopped: false,
             consecutive_no_result_queries: 0,
+            server_error_retry_count: 0,
         }
     }
 
@@ -4565,6 +5670,7 @@ mod tests {
             last_auto_query_at: last_query.map(|s| s.to_string()),
             auto_query_stopped: stopped,
             consecutive_no_result_queries: consecutive,
+            server_error_retry_count: 0,
         }
     }
 
@@ -4676,6 +5782,288 @@ mod tests {
         assert!(!is_past_max_wait(&make_past_max_task(Some("invalid-date")), Utc::now()));
     }
 
+    // ── manual query bypasses 4-hour cap ───────────────────────────────────
+
+    fn make_long_pending_task() -> ScheduledTask {
+        let submitted = (Utc::now() - Duration::hours(6)).to_rfc3339();
+        let mut task = make_backoff_task(0, None, true);
+        task.id = "task-stale".to_string();
+        task.title = "Stale".to_string();
+        task.submit_id = "sub-stale".to_string();
+        task.status = "submitted".to_string();
+        task.submitted_at = Some(submitted);
+        task.last_error = "自动查询已停止".to_string();
+        task
+    }
+
+    #[test]
+    fn auto_query_past_4_hours_keeps_task_stopped() {
+        let mut data = AppData {
+            tasks: vec![make_long_pending_task()],
+            ..AppData::default()
+        };
+        // No-result CLI output (no gen_status, no urls)
+        let task = query_task_submit_id_once_with_runner(
+            &mut data,
+            "task-stale",
+            "sub-stale",
+            |_args| Ok((String::from("{}"), String::new())),
+        )
+        .expect("auto query should succeed");
+        assert_eq!(task.status, "submitted");
+        assert!(task.auto_query_stopped);
+        assert!(task.last_error.contains("已等待超过"));
+    }
+
+    #[test]
+    fn manual_query_past_4_hours_bypasses_cap() {
+        let mut data = AppData {
+            tasks: vec![make_long_pending_task()],
+            ..AppData::default()
+        };
+        // 模拟手动查询前的 reset
+        if let Some(t) = data.tasks.iter_mut().find(|t| t.id == "task-stale") {
+            reset_query_backoff(t);
+        }
+        // No-result CLI output: should NOT re-trigger 4 小时上限
+        let task = manual_query_task_submit_id_with_runner(
+            &mut data,
+            "task-stale",
+            "sub-stale",
+            |_args| Ok((String::from("{}"), String::new())),
+        )
+        .expect("manual query should succeed");
+        assert_eq!(task.status, "querying");
+        assert!(!task.auto_query_stopped);
+        assert!(
+            !task.last_error.contains("已等待超过"),
+            "manual query should not surface the 4-hour stop message: {}",
+            task.last_error
+        );
+    }
+
+    // ── 5xx submit retry ──────────────────────────────────────────────────
+
+    fn make_test_image_asset() -> Asset {
+        Asset {
+            id: "img-test-01".to_string(),
+            kind: AssetKind::Image,
+            name: "test.png".to_string(),
+            aliases: vec![],
+            tags: vec![],
+            stored_path: "/tmp/test.png".to_string(),
+            source_path: "/tmp/test.png".to_string(),
+            mime: "image/png".to_string(),
+            size_bytes: 1024,
+            duration_seconds: None,
+            created_at: "2026-05-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn make_queued_task_for_submit(id: &str) -> ScheduledTask {
+        ScheduledTask {
+            id: id.to_string(),
+            title: "重试测试".to_string(),
+            prompt: "test".to_string(),
+            image_asset_ids: vec!["img-test-01".to_string()],
+            audio_asset_ids: vec![],
+            role_ids: vec![],
+            manual_mention_ids: vec![],
+            auto_match_roles: false,
+            params: VideoParams::default(),
+            status: "queued".to_string(),
+            scheduled_at: None,
+            next_run_at: None,
+            submit_id: String::new(),
+            attempt_count: 0,
+            concurrency_retry_count: 0,
+            server_error_retry_count: 0,
+            last_error: String::new(),
+            command_preview: vec![],
+            attempts: vec![],
+            result_paths: vec![],
+            result_urls: vec![],
+            created_at: "2026-05-01T00:00:00Z".to_string(),
+            updated_at: "2026-05-01T00:00:00Z".to_string(),
+            finished_at: String::new(),
+            submitted_at: None,
+            queue_info: None,
+            temp_image_asset_ids: vec![],
+            temp_image_paths: vec![],
+            execution_records: vec![],
+            last_auto_query_at: None,
+            auto_query_stopped: false,
+            consecutive_no_result_queries: 0,
+        }
+    }
+
+    #[test]
+    fn submit_5xx_first_time_goes_to_retry_wait() {
+        let mut data = AppData {
+            tasks: vec![make_queued_task_for_submit("t5xx")],
+            assets: vec![make_test_image_asset()],
+            ..AppData::default()
+        };
+        let task = submit_task_once_with_runner(
+            &mut data,
+            "t5xx",
+            |_args| Ok((r#"{"code": 50001, "message": "服务器内部错误"}"#.to_string(), String::new())),
+        )
+        .expect("should not Err");
+        assert_eq!(task.status, "retry_wait", "第 1 次 5xx 应进入 retry_wait");
+        assert_eq!(task.server_error_retry_count, 1);
+    }
+
+    #[test]
+    fn submit_5xx_second_time_still_retry_wait() {
+        let mut data = AppData {
+            tasks: vec![make_queued_task_for_submit("t5xx2")],
+            assets: vec![make_test_image_asset()],
+            ..AppData::default()
+        };
+        // 模拟已重试 1 次
+        data.tasks[0].server_error_retry_count = 1;
+        data.tasks[0].status = "queued".to_string();
+        let task = submit_task_once_with_runner(
+            &mut data,
+            "t5xx2",
+            |_args| Ok((r#"{"code": 50001, "message": "服务器内部错误"}"#.to_string(), String::new())),
+        )
+        .expect("should not Err");
+        assert_eq!(task.status, "retry_wait", "第 2 次 5xx 仍应 retry_wait");
+        assert_eq!(task.server_error_retry_count, 2);
+    }
+
+    #[test]
+    fn submit_5xx_third_time_marks_failed() {
+        let mut data = AppData {
+            tasks: vec![make_queued_task_for_submit("t5xx3")],
+            assets: vec![make_test_image_asset()],
+            ..AppData::default()
+        };
+        // 模拟已重试 2 次（达上限）
+        data.tasks[0].server_error_retry_count = 2;
+        data.tasks[0].status = "queued".to_string();
+        let task = submit_task_once_with_runner(
+            &mut data,
+            "t5xx3",
+            |_args| Ok((r#"{"code": 50001, "message": "服务器内部错误"}"#.to_string(), String::new())),
+        )
+        .expect("should not Err");
+        assert_eq!(task.status, "failed", "第 3 次 5xx 超过上限应标 failed");
+        assert_eq!(task.server_error_retry_count, 3);
+    }
+
+    #[test]
+    fn submit_success_resets_server_error_retry_count() {
+        let mut data = AppData {
+            tasks: vec![make_queued_task_for_submit("t5xx-ok")],
+            assets: vec![make_test_image_asset()],
+            ..AppData::default()
+        };
+        data.tasks[0].server_error_retry_count = 1;
+        data.tasks[0].status = "queued".to_string();
+        let task = submit_task_once_with_runner(
+            &mut data,
+            "t5xx-ok",
+            |_args| Ok((r#"{"submit_id": "ok-id-123"}"#.to_string(), String::new())),
+        )
+        .expect("should not Err");
+        assert_eq!(task.server_error_retry_count, 0, "成功提交后计数应重置为 0");
+        assert_eq!(task.submit_id, "ok-id-123");
+    }
+
+    // ── parse_submit_output: error_code suppresses submit_id ──────────────
+
+    #[test]
+    fn parse_submit_output_error_code_suppresses_submit_id() {
+        // API 返回错误码时，即使响应里含 submit_id 也应被忽略
+        let out = parse_submit_output(
+            r#"{"code": 50001, "message": "服务器内部错误", "data": {"submit_id": "fake-id-abc"}}"#,
+        );
+        assert_eq!(out.submit_id, None, "submit_id in error response must be suppressed");
+        assert_eq!(out.error_code, Some(50001));
+        assert!(out.fail_reason.is_some());
+    }
+
+    #[test]
+    fn parse_submit_output_success_extracts_submit_id_normally() {
+        let out = parse_submit_output(r#"{"submit_id": "real-sub-123"}"#);
+        assert_eq!(out.submit_id.as_deref(), Some("real-sub-123"));
+        assert_eq!(out.error_code, None);
+    }
+
+    #[test]
+    fn parse_submit_output_code_200_does_not_suppress_submit_id() {
+        let out = parse_submit_output(r#"{"code": 200, "submit_id": "ok-sub-456"}"#);
+        assert_eq!(out.submit_id.as_deref(), Some("ok-sub-456"));
+        assert_eq!(out.error_code, None);
+    }
+
+    // ── error_code extraction and failed classification ────────────────────
+
+    #[test]
+    fn parse_query_output_extracts_error_code() {
+        let out = parse_query_output(r#"{"code": 40004, "message": "任务不存在或已过期"}"#);
+        assert_eq!(out.error_code, Some(40004));
+        assert_eq!(out.fail_reason.as_deref(), Some("任务不存在或已过期"));
+        assert!(out.gen_status.is_none());
+    }
+
+    #[test]
+    fn parse_query_output_filters_code_zero_and_200() {
+        let out0 = parse_query_output(r#"{"code": 0, "gen_status": "processing"}"#);
+        assert_eq!(out0.error_code, None);
+        let out200 = parse_query_output(r#"{"code": 200, "gen_status": "processing"}"#);
+        assert_eq!(out200.error_code, None);
+    }
+
+    #[test]
+    fn query_with_api_error_code_marks_task_failed_immediately() {
+        let mut task = make_task_with_execution_records();
+        task.id = "task-err".to_string();
+        task.submit_id = "sub-err".to_string();
+        task.status = "querying".to_string();
+        task.submitted_at = Some((Utc::now() - Duration::minutes(5)).to_rfc3339());
+        task.execution_records.push(TaskExecutionRecord {
+            id: "rec-err".to_string(),
+            submit_id: "sub-err".to_string(),
+            status: "querying".to_string(),
+            started_at: now_rfc3339(),
+            finished_at: String::new(),
+            input_snapshot: TaskExecutionInputSnapshot::default(),
+            command_preview: vec![],
+            query_records: vec![],
+            result_paths: vec![],
+            result_urls: vec![],
+            error_kind: String::new(),
+            error_detail: String::new(),
+        });
+        let mut data = AppData {
+            tasks: vec![task],
+            ..AppData::default()
+        };
+        // Dreamina returns error code 40004 (task not found)
+        let result = query_task_submit_id_once_with_runner(
+            &mut data,
+            "task-err",
+            "sub-err",
+            |_args| {
+                Ok((
+                    r#"{"code": 40004, "message": "任务不存在或已过期"}"#.to_string(),
+                    String::new(),
+                ))
+            },
+        )
+        .expect("query should complete without Rust error");
+        assert_eq!(result.status, "failed", "error code >= 400 should mark task as failed");
+        assert!(
+            result.last_error.contains("任务不存在"),
+            "error message should be stored in last_error: {}",
+            result.last_error
+        );
+    }
+
     // ── update_query_backoff ───────────────────────────────────────────────
 
     #[test]
@@ -4735,6 +6123,7 @@ mod tests {
             last_auto_query_at: None,
             auto_query_stopped: false,
             consecutive_no_result_queries: 0,
+            server_error_retry_count: 0,
         }
     }
 
@@ -4800,6 +6189,7 @@ mod tests {
                 last_auto_query_at: None,
                 auto_query_stopped: false,
                 consecutive_no_result_queries: 0,
+                server_error_retry_count: 0,
             }],
             ..AppData::default()
         };

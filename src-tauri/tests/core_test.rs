@@ -456,6 +456,7 @@ fn classifies_concurrency_limit_for_silent_retry_policy() {
         ai_model_configs: SchedulerSettings::default().ai_model_configs,
         active_ai_model_id: SchedulerSettings::default().active_ai_model_id,
         prevent_sleep: true,
+        image_model_config: SchedulerSettings::default().image_model_config,
     };
 
     let classified = classify_dreamina_error(

@@ -9,6 +9,7 @@ import {
   getPromptTextFromTiptapEditor,
   promptTextToTiptapDoc,
   shouldBlockPromptTextInput,
+  getAllowedPromptPasteText,
   shouldSyncExternalPromptValue,
 } from '../prompt-editor-utils.js';
 import { collectPromptMentions } from '../mention-utils.js';
@@ -64,7 +65,16 @@ export default function PromptMentionEditor({
         horizontalRule: false,
         listItem: false,
       }),
-      Mention.configure({
+      Mention.extend({
+        addAttributes() {
+          return {
+            ...this.parent?.(),
+            type: { default: null },
+            roleId: { default: '' },
+            assetId: { default: '' },
+          };
+        },
+      }).configure({
         HTMLAttributes: { class: 'prompt-mention-node' },
         renderText({ node }) {
           return `@${node.attrs.label}`;
@@ -204,11 +214,12 @@ export default function PromptMentionEditor({
         const selectedLength = from === to ? 0 : doc.textBetween(from, to, '\n', '\n').length;
         return shouldBlockPromptTextInput({ maxLength, currentLength, selectedLength, from, to, text });
       },
-      handlePaste: (_view, event) => {
+      handlePaste: (view, event) => {
         const items = Array.from(event.clipboardData?.items || []);
         const imageItem = items.find(
           (item) => item.kind === 'file' && item.type.startsWith('image/')
         );
+        const pastedText = event.clipboardData?.getData('text') || '';
 
         if (imageItem && onPasteImage) {
           const file = imageItem.getAsFile();
@@ -224,6 +235,26 @@ export default function PromptMentionEditor({
           if (!hasText) {
             event.preventDefault();
             handleSystemImagePaste();
+            return true;
+          }
+        }
+
+        if (pastedText) {
+          const { from, to } = view.state.selection;
+          const doc = view.state.doc;
+          const currentLength = doc.textBetween(0, doc.content.size, '\n', '\n').length;
+          const selectedLength = from === to ? 0 : doc.textBetween(from, to, '\n', '\n').length;
+          const allowedText = getAllowedPromptPasteText({
+            maxLength,
+            currentLength,
+            selectedLength,
+            text: pastedText,
+          });
+          if (allowedText !== pastedText) {
+            event.preventDefault();
+            if (allowedText) {
+              view.dispatch(view.state.tr.insertText(allowedText, from, to));
+            }
             return true;
           }
         }

@@ -1,0 +1,157 @@
+{
+  "version": 1,
+  "task_name": "imagegen-mentions-and-refs",
+  "spec_path": "docs/specs/2026-05-06-imagegen-mentions-and-refs/spec.md",
+  "updated_at": "2026-05-06",
+  "tasks": [
+    {
+      "id": "T001",
+      "title": "重构 App 层 addTempImage / paste 为返回 asset 的纯 IO 函数",
+      "status": "pending",
+      "scope": "解耦 taskForm，使生图与新建任务可分别消费同一组 IPC 包装",
+      "files": {
+        "create": [],
+        "modify": ["src/main.jsx"],
+        "read": []
+      },
+      "steps": [
+        "在 App 内拆出 importTempImageAssets(paths: string[]): Promise<Asset[]>（不接 setTaskForm）",
+        "拆出 pasteClipboardImageAsset(file): Promise<Asset>（不接 setTaskForm）",
+        "拆出 pasteSystemClipboardImageAsset(): Promise<Asset>（不接 setTaskForm）",
+        "保留旧的 addTempImage / pasteClipboardImage / pasteSystemClipboardImage 作为向 CreateTaskView 透传的薄包装（内部组合纯 IO + setTaskForm）",
+        "把新的纯 IO 三函数透传到 ImageGenView"
+      ],
+      "verify": [
+        "CreateTaskView 行为不回归（可手测：粘贴图、点击添加临时图依旧正常）",
+        "新函数的实现里没有出现 setTaskForm"
+      ],
+      "dependencies": [],
+      "notes": ""
+    },
+    {
+      "id": "T002",
+      "title": "新增 src/imagegen-utils.js 工具模块",
+      "status": "pending",
+      "scope": "生图表单初值、mention items 过滤、参考图增删辅助",
+      "files": {
+        "create": ["src/imagegen-utils.js"],
+        "modify": [],
+        "read": ["src/mention-utils.js"]
+      },
+      "steps": [
+        "导出 createEmptyImageGenForm()：{ prompt: '', size: '1024x1024', temp_image_paths: [], temp_image_asset_ids: [], image_asset_ids: [] }",
+        "导出 filterMentionItemsForImageGen(items)：保留 type === 'role' / 'image' / 'temp_image'，去掉 'audio'",
+        "导出 addReferenceAsset(form, asset)：往 form 中追加 asset.id 与 asset.stored_path（去重，最多 9 张）",
+        "导出 removeReferenceAsset(form, assetId)：移除 image_asset_ids / temp_image_paths / temp_image_asset_ids 中对应项",
+        "导出 applyMentionRefsToImageGenForm(form, refs)：与 prompt-editor-utils.applyMentionRefsToTaskForm 对齐，但只处理 image_asset_ids（无 role_ids / audio）"
+      ],
+      "verify": [
+        "模块可被 import 且不报错",
+        "addReferenceAsset 上限测试（第 10 张被拒）"
+      ],
+      "dependencies": [],
+      "notes": ""
+    },
+    {
+      "id": "T003",
+      "title": "重写 ImageGenView 集成 PromptMentionEditor",
+      "status": "pending",
+      "scope": "前端主功能：mention 编辑器、参考图缩略图、添加素材图按钮、粘贴行为",
+      "files": {
+        "create": [],
+        "modify": ["src/main.jsx", "src/styles.css"],
+        "read": ["src/components/PromptMentionEditor.jsx", "src/imagegen-utils.js"]
+      },
+      "steps": [
+        "ImageGenView props 增加 state、assetById、importTempImageAssets、pasteClipboardImageAsset、pasteSystemClipboardImageAsset",
+        "用 useState 初始化 imagegenForm（来自 createEmptyImageGenForm）",
+        "用 useMemo 构造 mentionItems = filterMentionItemsForImageGen(buildMentionItems({...}))",
+        "用 PromptMentionEditor 替换 textarea；onUpdate(plainText, refs) 中调用 applyMentionRefsToImageGenForm",
+        "onPasteImage / onPasteSystemImage 包装 App 层纯 IO 函数：拿到 asset 后调用 addReferenceAsset 写入 form",
+        "新增『添加素材图』按钮：调用 importTempImageAssets，逐个 addReferenceAsset",
+        "渲染参考图缩略图栅格（img + 删除按钮）；点 X 调 removeReferenceAsset",
+        "调用 generate_image_command 时把 imagegenForm.image_asset_ids 作为 reference_asset_ids 传入",
+        "样式：在 styles.css 添加 .imagegen-references 缩略图栅格、删除按钮的紧凑样式（跟随既有 design tokens）"
+      ],
+      "verify": [
+        "VERIFY 1 / 2 / 3 / 4 / 5 / 7 / 8（手动）",
+        "build 通过"
+      ],
+      "dependencies": ["T001", "T002", "T004"],
+      "notes": "依赖 T004 是因为前端调用 generate_image_command 必须先把 reference_asset_ids 入参打通"
+    },
+    {
+      "id": "T004",
+      "title": "后端 generate_image_command 增加 reference_asset_ids + multipart 分支",
+      "status": "pending",
+      "scope": "Rust 端：新参数、依据有无参考图选择 generations / edits 端点",
+      "files": {
+        "create": [],
+        "modify": ["src-tauri/src/lib.rs", "src-tauri/Cargo.toml"],
+        "read": []
+      },
+      "steps": [
+        "Cargo.toml 把 reqwest features 加上 'multipart'（保留 'blocking'）",
+        "命令签名加 reference_asset_ids: Vec<String>（serde rename_all 兼容前端 snake_case）",
+        "为空时走原 images/generations JSON 分支不变",
+        "非空时：从 store.snapshot().assets 中按 id 解析出 stored_path 列表（缺失任一即 Err 明确文案）",
+        "构造 reqwest::blocking::multipart::Form：text 字段 model/prompt/size/n/response_format=b64_json，文件字段 'image[]' 重复 push（用 fs::read 读字节 + Part::bytes(...).file_name(...).mime_str(asset.mime)）",
+        "POST 到 {base_url}/images/edits，复用 timeout / connect_timeout",
+        "响应解析与 generations 分支共享：先尝试 b64_json，再回退 url（complete with describe_error / truncate）"
+      ],
+      "verify": [
+        "cargo check 通过",
+        "VERIFY 静态 4 / 5",
+        "VERIFY 集中测试 6（multipart 字段确实带了多份 image[]）"
+      ],
+      "dependencies": [],
+      "notes": "若用户 base URL 不支持 edits，会落到 Q1 决策点"
+    },
+    {
+      "id": "T005",
+      "title": "扩展生图历史记录字段",
+      "status": "pending",
+      "scope": "history item 新增可选 reference_asset_ids / reference_thumb_paths；列表 / 预览渲染",
+      "files": {
+        "create": [],
+        "modify": ["src/main.jsx", "src/styles.css"],
+        "read": []
+      },
+      "steps": [
+        "构造 item 时把 imagegenForm.image_asset_ids 复制到 item.reference_asset_ids",
+        "由 assetById 解析出对应 stored_path 数组放到 item.reference_thumb_paths",
+        "历史列表渲染：当 reference_asset_ids 非空时角标 '参考图 ×N'",
+        "预览面板下方加参考图小图条（点击不跳转，仅展示）",
+        "loadImageGenHistory 容错：旧版本无字段时按空数组兜底"
+      ],
+      "verify": [
+        "VERIFY 集中测试 1（无参考图历史项不显示角标）",
+        "VERIFY 集中测试 2（有参考图历史项显示角标 + 缩略图）"
+      ],
+      "dependencies": ["T003"],
+      "notes": "schema 仅追加字段，不引入新 storage key"
+    },
+    {
+      "id": "T006",
+      "title": "完整手测并填写 Decision Log",
+      "status": "pending",
+      "scope": "走完 VERIFY 集中测试列表，记录任何协议偏差或决策更新",
+      "files": {
+        "create": [],
+        "modify": ["docs/specs/2026-05-06-imagegen-mentions-and-refs/spec.md"],
+        "read": []
+      },
+      "steps": [
+        "依次执行 VERIFY 集中测试 1-8",
+        "若 Q1（geekai.co 兼容性）出现失败，停下来与用户确认",
+        "把执行结果与发现的偏差写入 Decision Log"
+      ],
+      "verify": [
+        "VERIFY 集中测试 1-8 全部 ✅ 或有明确 deferred / blocked 记录",
+        "Decision Log 至少新增一条 2026-05-06 实测记录"
+      ],
+      "dependencies": ["T003", "T004", "T005"],
+      "notes": ""
+    }
+  ]
+}

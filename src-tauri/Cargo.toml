@@ -1,6 +1,6 @@
 [package]
 name = "dreamina-scheduler"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
@@ -17,7 +17,8 @@ chrono = { version = "0.4", features = ["serde", "clock"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 arboard = "3.6.1"
 png = "0.17.16"
-reqwest = { version = "0.12", features = ["blocking"] }
+reqwest = { version = "0.12", features = ["blocking", "multipart"] }
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"

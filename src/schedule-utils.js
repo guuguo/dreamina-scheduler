@@ -33,6 +33,7 @@ export function buildBatchSchedulePlan(taskIds = [], { startAt, intervalMinutes 
 }
 
 export function canScheduleTask(task) {
+  if (task?.status === 'submitted' && task?.auto_query_stopped) return true;
   return [
     'draft',
     'queued',

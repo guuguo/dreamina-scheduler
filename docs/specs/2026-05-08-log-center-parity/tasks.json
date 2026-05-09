@@ -1,0 +1,270 @@
+{
+  "version": 1,
+  "task_name": "log-center-parity",
+  "spec_path": "docs/specs/2026-05-08-log-center-parity/spec.md",
+  "updated_at": "2026-05-08",
+  "tasks": [
+    {
+      "id": "T001",
+      "title": "新增结构化 LogEntry 数据模型并兼容旧字符串日志",
+      "status": "done",
+      "scope": "把 AppData.logs 从不可筛选的字符串列表升级为可展示、筛选、关联的结构化日志事件，同时保留旧数据读取能力",
+      "files": {
+        "create": [],
+        "modify": ["src-tauri/src/lib.rs"],
+        "read": []
+      },
+      "steps": [
+        "定义 LogLevel、LogSource 或字符串枚举约定，以及 LogEntry / LogEntryDraft 结构",
+        "把 AppData.logs 调整为 Vec<LogEntry>，并用 serde 兼容旧 Vec<String> 数据",
+        "旧字符串迁移为 legacy.string_log，level=info，source=System，category=system",
+        "保留 settings.log_retention_count 的按条数裁剪语义",
+        "补充 Rust 测试覆盖旧字符串日志加载与 retention 裁剪"
+      ],
+      "verify": [
+        "cargo check 或 cargo test 通过",
+        "旧 data.json 中 logs 为字符串数组时可正常加载",
+        "超过 log_retention_count 时仍只保留最新 N 条"
+      ],
+      "dependencies": [],
+      "notes": "若 serde 兼容需要自定义反序列化，优先保证旧数据不丢失"
+    },
+    {
+      "id": "T002",
+      "title": "实现统一日志写入 helper 并替换基础操作日志",
+      "status": "done",
+      "scope": "建立 append_log / append_task_log / truncate helper，先覆盖素材、角色、设置、任务 CRUD 等低风险路径",
+      "files": {
+        "create": [],
+        "modify": ["src-tauri/src/lib.rs"],
+        "read": []
+      },
+      "steps": [
+        "实现 append_log(data, draft)：补齐 id/timestamp/defaults 并执行 retention",
+        "实现 append_task_log(data, task, draft)：自动注入 task_id/task_title/submit_id 等上下文",
+        "实现字段级截断，覆盖 stdout/stderr/raw_output/detail",
+        "替换素材导入、临时图片、角色媒体、角色 CRUD、设置更新、任务创建/更新/删除/暂停/恢复的 data.logs.push 写法",
+        "保留错误向调用方返回的原有行为，不因为日志 helper 改变业务结果"
+      ],
+      "verify": [
+        "cargo check 或 cargo test 通过",
+        "代码搜索确认上述路径不再裸写字符串日志",
+        "手动触发素材/角色/设置/任务 CRUD 后日志含 level/source/category/message"
+      ],
+      "dependencies": ["T001"],
+      "notes": "这是低风险替换批次，不包含任务执行状态机"
+    },
+    {
+      "id": "T003",
+      "title": "补齐任务执行、查询、重试、CLI、AI、生图的关键日志打印",
+      "status": "done",
+      "scope": "让核心运行链路产出设计图详情面板可用的上下文字段和原始输出",
+      "files": {
+        "create": [],
+        "modify": ["src-tauri/src/lib.rs"],
+        "read": []
+      },
+      "steps": [
+        "在 process_queue_command 中记录队列空闲、预定到期补偿、执行完成事件",
+        "在 submit_task_once_with_runner / query_task_submit_id_once_with_runner_inner 相关路径记录提交、查询、成功、失败、处理中、自动查询停止事件",
+        "为并发限制和重试策略记录 warn 级 RetryPolicy 日志",
+        "把 CLI 安装/登录日志改为结构化事件，stdout/stderr 写入截断字段",
+        "把 AI 模型测试日志改为结构化事件，保留请求模式、模型、URL、解析错误或响应摘要",
+        "把 generate_image_command 成功/失败写入 ImageGen 日志"
+      ],
+      "verify": [
+        "cargo check 或 cargo test 通过",
+        "手动触发失败查询时出现 error 日志并含 submit_id/raw_output/error_detail",
+        "手动触发并发限制时出现 warn 日志并含 RetryPolicy 或 concurrency_guard 模块",
+        "CLI 安装/登录和 AI 模型测试日志能在来源筛选中被区分"
+      ],
+      "dependencies": ["T001", "T002"],
+      "notes": "不得改变任务状态机，只增加日志事件"
+    },
+    {
+      "id": "T004",
+      "title": "新增 log-view-utils 前端派生工具与单测",
+      "status": "done",
+      "scope": "把日志中心的规范化、统计、筛选、分页、关联事件等纯逻辑从 main.jsx 中拆出并测试",
+      "files": {
+        "create": ["src/log-view-utils.js", "src/log-view-utils.test.mjs"],
+        "modify": [],
+        "read": []
+      },
+      "steps": [
+        "实现 normalizeLogEntry，兼容旧字符串和新结构化对象",
+        "实现 getLogLevelMeta / getLogSourceMeta / getLogCategoryMeta 等 UI 元数据映射",
+        "实现 deriveLogStats：今日日志、错误、警告、信息/成功、保留策略展示",
+        "实现 filterLogs：分类、搜索、level、source、task、timeRange 组合筛选",
+        "实现 paginateLogs 和 deriveLogAssociations",
+        "实现 buildLogExportPayload，支持 JSON 或文本导出内容",
+        "编写 node:test 单测覆盖旧日志规范化、筛选、统计、关联事件、分页"
+      ],
+      "verify": [
+        "node --test src/log-view-utils.test.mjs 通过",
+        "npm test 通过",
+        "组合筛选测试覆盖 task title 和 submit_id 搜索"
+      ],
+      "dependencies": [],
+      "notes": "该任务可与后端任务并行"
+    },
+    {
+      "id": "T005",
+      "title": "补齐日志中心所需 UI 基建组件",
+      "status": "done",
+      "scope": "在现有 UI 系统基础上抽取/升级日志中心会复用的统计卡片、搜索框、筛选框、复制按钮和分页组件，避免日志页形成孤立样式体系",
+      "files": {
+        "create": [
+          "src/components/ui/StatCard.jsx",
+          "src/components/ui/SearchBox.jsx",
+          "src/components/ui/FilterSelect.jsx",
+          "src/components/ui/InlineCopyButton.jsx",
+          "src/components/ui/Pager.jsx"
+        ],
+        "modify": [
+          "src/components/ui/StatusPill.jsx",
+          "src/components/ui/ToggleSwitch.jsx",
+          "src/styles.css"
+        ],
+        "read": [
+          "src/components/ui/StatusPill.jsx",
+          "src/components/ui/ToggleSwitch.jsx",
+          "src/components/ui/CopyableInput.jsx",
+          "src/main.jsx"
+        ]
+      },
+      "steps": [
+        "梳理现有 StatusPill、ToggleSwitch、CopyableInput、Metric、pagination 样式可复用点",
+        "新增 StatCard：图标、标题、数值、sub、tone，尺寸对齐设计图统计卡片",
+        "新增 SearchBox：左侧图标、compact 高度、placeholder，与角色库搜索框视觉统一",
+        "新增 FilterSelect：紧凑宽度和统一 select 外观，用于日志级别/来源/任务/时间过滤",
+        "新增 InlineCopyButton：复用复制反馈逻辑，用于 submit_id、原始输出、日志详情复制",
+        "新增 Pager：复用现有 pagination 样式，统一页码、总数、每页条数",
+        "必要时扩展 StatusPill tone 映射，支持 error/warn/info/success/debug 语义",
+        "必要时为 ToggleSwitch 增加 compact 样式，不复制一套开关实现"
+      ],
+      "verify": [
+        "npm run build 通过",
+        "日志 level badge 复用 StatusPill 或其扩展",
+        "自动刷新复用 ToggleSwitch 或 compact 扩展",
+        "分页复用 Pager 或 pagination-* 样式",
+        "新增 CSS 使用 ui-* 前缀，未污染现有页面 class"
+      ],
+      "dependencies": ["T004"],
+      "notes": "若实现时判断某个组件短期只服务日志页，可在 Decision Log 记录并改用 Log* 局部组件"
+    },
+    {
+      "id": "T006",
+      "title": "按设计图重构 LogsView 布局与视觉样式",
+      "status": "done",
+      "scope": "把当前简单文本列表升级为日志中心四区布局：统计卡片、左侧分类、中间表格、右侧详情",
+      "files": {
+        "create": [],
+        "modify": ["src/main.jsx", "src/styles.css"],
+        "read": ["src/log-view-utils.js", "src/components/ui/StatCard.jsx", "src/components/ui/SearchBox.jsx", "src/components/ui/FilterSelect.jsx", "src/components/ui/Pager.jsx"]
+      },
+      "steps": [
+        "更新 LogsView props：接收 logs、tasks、settings、clearLogs、定位任务回调",
+        "添加本地 UI state：search、levelFilter、sourceFilter、taskFilter、timeRange、category、selectedLogId、autoRefresh、page、pageSize",
+        "用 StatCard 渲染一行 5 张统计卡片，高度约 74-82px、间距约 12px",
+        "用 SearchBox、FilterSelect、ToggleSwitch compact 渲染筛选工具栏，控件高度对齐 --control-h",
+        "渲染左侧分类和快速定位，宽度约 130-150px，激活态使用淡紫背景和主色文字",
+        "渲染中间日志表格：sticky 表头、44-48px 行高、level badge、两行任务/submission 信息、摘要截断",
+        "渲染右侧详情面板：300-340px 宽、字段 label/value、原始输出代码块、关联事件、底部操作按钮",
+        "用 Pager 添加底部分页与每页条数选择",
+        "在 styles.css 添加 log-* 页面样式，跟随现有 design token、12px 字体体系、按钮/卡片圆角"
+      ],
+      "verify": [
+        "npm run build 通过",
+        "手动打开日志页，布局包含统计卡片、左侧分类、表格、详情面板",
+        "点击日志行后右侧详情同步变化",
+        "空日志状态可读且不报错",
+        "使用设计图逐区对照：统计卡片高度/间距、筛选栏控件高度、三栏宽度、表格行高、详情字段密度、分页位置均接近设计图",
+        "与现有 app 视觉系统对照：字体大小、按钮样式、卡片圆角、边框颜色、主色激活态不突兀"
+      ],
+      "dependencies": ["T004", "T005"],
+      "notes": "UI 尽量一比一还原设计图，但使用项目现有字体、按钮和颜色 token"
+    },
+    {
+      "id": "T007",
+      "title": "实现日志筛选、导出、复制、定位任务和查看上下文交互",
+      "status": "done",
+      "scope": "补齐设计图中日志中心主要交互能力，保证筛选结果、详情和操作按钮联动",
+      "files": {
+        "create": [],
+        "modify": ["src/main.jsx", "src/styles.css", "src/log-view-utils.js", "src/log-view-utils.test.mjs"],
+        "read": []
+      },
+      "steps": [
+        "搜索和所有筛选项变化时重置分页并保持 selectedLogId 有效",
+        "实现清空筛选：恢复默认筛选和第一页",
+        "实现导出日志：导出当前筛选结果为 JSON 或文本下载",
+        "实现复制日志：复制详情面板中的结构化日志内容到剪贴板",
+        "实现定位任务：根据 task_id 切换到任务中心并选中任务，失败时给出反馈",
+        "实现查看上下文：按 task_id/submit_id 临时筛选或滚动聚焦关联事件",
+        "完善关联事件展示：同 task_id 或 submit_id 的前后事件，最多 3 条"
+      ],
+      "verify": [
+        "npm test 通过",
+        "npm run build 通过",
+        "搜索任务名或 submit_id 能命中日志",
+        "导出内容只包含当前筛选结果",
+        "定位任务可从日志页跳到任务中心并选中关联任务"
+      ],
+      "dependencies": ["T004", "T006"],
+      "notes": "如果浏览器下载在 Tauri WebView 有限制，需记录 Decision Log 并确认是否改用后端保存"
+    },
+    {
+      "id": "T008",
+      "title": "完善后端 clear/export/retention 行为和前端状态接入",
+      "status": "done",
+      "scope": "确保结构化日志与现有 clearLogs、settings.log_retention_count、refreshState 集成稳定",
+      "files": {
+        "create": [],
+        "modify": ["src-tauri/src/lib.rs", "src/main.jsx", "src/styles.css"],
+        "read": []
+      },
+      "steps": [
+        "确认 clear_logs_command 清空结构化 Vec<LogEntry> 后前端空状态正常",
+        "确认 App emptyState.logs 与前端 normalizeLogEntry 兼容",
+        "在设置页现有日志保留条数说明中保持语义为条数，不误写为天数",
+        "如果统计卡片需要显示保留策略，则显示 保留 X 条 而不是 30 天，除非未来新增天数设置",
+        "补充测试或手动验证：清空日志后不会立刻因为清空动作自身产生新日志"
+      ],
+      "verify": [
+        "npm test 通过",
+        "cargo check 或 cargo test 通过",
+        "手动清空日志后页面显示空状态",
+        "设置 log_retention_count 后超过上限会裁剪旧日志"
+      ],
+      "dependencies": ["T001", "T006"],
+      "notes": "设计图显示 30 天，但当前规格保留条数，避免无确认地改变产品语义"
+    },
+    {
+      "id": "T009",
+      "title": "执行端到端验收并同步版本文档",
+      "status": "done",
+      "scope": "按 spec VERIFY 完成自动化与手动验收，记录偏差并更新 v0.2.0 版本文档",
+      "files": {
+        "create": [],
+        "modify": ["docs/specs/2026-05-08-log-center-parity/spec.md", "docs/更新文档/v0.2.0.md"],
+        "read": []
+      },
+      "steps": [
+        "运行 npm test、npm run build、cargo check 或 cargo test",
+        "逐项执行 VERIFY 手动验收 1-13",
+        "把任何设计图无法一比一实现的偏差写入 Decision Log",
+        "把日志中心结构化日志与 UI 重构写入 docs/更新文档/v0.2.0.md",
+        "确认 tasks.json 中已完成任务状态更新为 done，无法完成项为 blocked/deferred 并带 notes"
+      ],
+      "verify": [
+        "spec VERIFY 自动化检查全部通过或有明确阻塞记录",
+        "手动验收 1-13 全部通过或有用户认可的 deferred/blocked 记录",
+        "docs/更新文档/v0.2.0.md 包含日志中心更新摘要",
+        "tasks.json JSON 格式有效且状态只使用 pending/in_progress/blocked/done/deferred"
+      ],
+      "dependencies": ["T001", "T002", "T003", "T004", "T005", "T006", "T007", "T008"],
+      "notes": "这是收尾任务，不应在核心功能未完成时提前标记 done"
+    }
+  ]
+}

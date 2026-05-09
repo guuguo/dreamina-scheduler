@@ -67,7 +67,16 @@ function collectMentionRefs(content, refs) {
   if (!content) return;
   for (const node of content) {
     if (node.type === 'mention') {
-      const { type, roleId, assetId } = node.attrs || {};
+      const attrs = node.attrs || {};
+      let { type, roleId, assetId } = attrs;
+      const id = attrs.id || '';
+      // Fallback: decode type+ids from key prefix if custom attrs were not persisted
+      if (!type && id) {
+        if (id.startsWith('img:')) { type = 'image'; assetId = assetId || id.slice(4); }
+        else if (id.startsWith('temp:')) { type = 'temp_image'; assetId = assetId || id.slice(5); }
+        else if (id.startsWith('role:')) { type = 'role'; roleId = roleId || id.slice(5); }
+        else if (id.startsWith('audio:')) { type = 'audio'; assetId = assetId || id.slice(6); }
+      }
       if (type === 'role' && roleId) {
         refs.roleIds.push(roleId);
       } else if ((type === 'image' || type === 'temp_image') && assetId) {
@@ -129,6 +138,13 @@ export function shouldBlockPromptTextInput({ maxLength, currentLength, selectedL
     return nextLength > maxLength && insertedLength > replacedLength;
   }
   return currentLength + insertedLength > maxLength;
+}
+
+export function getAllowedPromptPasteText({ maxLength, currentLength, selectedLength = 0, text }) {
+  const pasteText = String(text || '');
+  if (!maxLength) return pasteText;
+  const capacity = Math.max(0, Number(maxLength) - Math.max(0, Number(currentLength) - Number(selectedLength || 0)));
+  return pasteText.slice(0, capacity);
 }
 
 export function shouldSyncExternalPromptValue({
