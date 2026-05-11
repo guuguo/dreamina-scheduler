@@ -31,6 +31,82 @@ export function buildQueueStats(tasks) {
   };
 }
 
+const DEFAULT_IMAGE_MODEL_CONFIG = {
+  id: 'default-image-openai',
+  name: 'OpenAI 图片默认',
+  api_key: '',
+  base_url: 'https://api.openai.com/v1',
+  model: 'gpt-image-1',
+};
+
+function normalizeImageModelConfig(config, index) {
+  return {
+    ...DEFAULT_IMAGE_MODEL_CONFIG,
+    ...config,
+    id: config?.id || (index === 0 ? DEFAULT_IMAGE_MODEL_CONFIG.id : `image-model-${index + 1}`),
+    name: config?.name ?? (index === 0 ? DEFAULT_IMAGE_MODEL_CONFIG.name : `图片模型 ${index + 1}`),
+    base_url: config?.base_url ?? DEFAULT_IMAGE_MODEL_CONFIG.base_url,
+    model: config?.model ?? DEFAULT_IMAGE_MODEL_CONFIG.model,
+    api_key: config?.api_key ?? '',
+  };
+}
+
+export function normalizeImageModelSettingsForm(settingsForm = {}) {
+  const rawConfigs = settingsForm.image_model_configs?.length
+    ? settingsForm.image_model_configs
+    : [settingsForm.image_model_config || DEFAULT_IMAGE_MODEL_CONFIG];
+  const imageModelConfigs = rawConfigs.map((config, index) => normalizeImageModelConfig(config, index));
+  const activeId = settingsForm.active_image_model_id || imageModelConfigs[0]?.id || DEFAULT_IMAGE_MODEL_CONFIG.id;
+  const selected = imageModelConfigs.find((config) => config.id === activeId)
+    || imageModelConfigs[0]
+    || DEFAULT_IMAGE_MODEL_CONFIG;
+  return {
+    ...settingsForm,
+    image_model_configs: imageModelConfigs.length ? imageModelConfigs : [DEFAULT_IMAGE_MODEL_CONFIG],
+    active_image_model_id: selected.id,
+    image_model_config: selected,
+  };
+}
+
+export function patchImageModelConfig(settingsForm, index, patch) {
+  const normalized = normalizeImageModelSettingsForm(settingsForm);
+  const nextConfigs = normalized.image_model_configs.map((config, i) => (
+    i === index ? { ...config, ...patch } : config
+  ));
+  const selected = nextConfigs.find((config) => config.id === normalized.active_image_model_id)
+    || nextConfigs[0]
+    || DEFAULT_IMAGE_MODEL_CONFIG;
+  return {
+    ...normalized,
+    image_model_configs: nextConfigs,
+    active_image_model_id: selected.id,
+    image_model_config: selected,
+  };
+}
+
+export function mergeSettingsFormOnStateRefresh({
+  activeView,
+  settingsDirty,
+  currentSettingsForm,
+  incomingSettings,
+  emptySettings,
+}) {
+  if (activeView === 'settings' && settingsDirty) {
+    return normalizeImageModelSettingsForm(currentSettingsForm || emptySettings);
+  }
+  return normalizeImageModelSettingsForm(incomingSettings || emptySettings);
+}
+
+export function shouldRefreshStateAfterSchedulerTick({ activeView, roleEditor } = {}) {
+  if (activeView === 'settings' || activeView === 'create') {
+    return false;
+  }
+  if (activeView === 'roles' && roleEditor) {
+    return false;
+  }
+  return true;
+}
+
 /**
  * 拖拽文件分发逻辑 — 这是历史高频 bug 区：
  * - 从 A 角色详情进入新建角色再拖入音频，不应修改 A 角色
@@ -115,13 +191,13 @@ export function buildTaskFormFromTaskForDuplicate(task, assetById = new Map()) {
 
 function inferTempImageAssetIds(task, assetById) {
   const prompt = task?.prompt || '';
-  const hasStoryboardMention = /@分镜图\d*/.test(prompt);
+  const hasTempImageMention = /@(图片|分镜图)\d*/.test(prompt);
   return (task?.image_asset_ids || []).filter((id) => {
     const asset = assetById.get(id);
     if (!asset || asset.kind !== 'image') return false;
     const name = asset.name || '';
     const tags = asset.tags || [];
-    return hasStoryboardMention
+    return hasTempImageMention
       || name.includes('临时图片')
       || name.includes('粘贴图片')
       || tags.includes('temporary')

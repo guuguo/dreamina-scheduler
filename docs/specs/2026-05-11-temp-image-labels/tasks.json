@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "tasks": [
+    {
+      "id": "T1",
+      "title": "定位临时图片分镜图命名来源",
+      "status": "completed",
+      "depends_on": [],
+      "verify": "已定位 PromptMentionEditor.jsx 和 mention-utils.js 中的 分镜图N 默认命名。"
+    },
+    {
+      "id": "T2",
+      "title": "统一临时图片 mention 标签为 图片N",
+      "status": "completed",
+      "depends_on": [
+        "T1"
+      ],
+      "verify": "粘贴临时图片后插入 prompt 的 mention label 为 图片1、图片2。"
+    },
+    {
+      "id": "T3",
+      "title": "统一临时图片候选项显示为 图片N",
+      "status": "completed",
+      "depends_on": [
+        "T1"
+      ],
+      "verify": "mention 候选列表中临时图片默认 label 为 图片N。"
+    },
+    {
+      "id": "T4",
+      "title": "更新回归测试",
+      "status": "completed",
+      "depends_on": [
+        "T2",
+        "T3"
+      ],
+      "verify": "测试覆盖临时图片默认 label 不再为 分镜图N。"
+    },
+    {
+      "id": "T5",
+      "title": "验证无用户/AI 可见临时图分镜图命名残留",
+      "status": "completed",
+      "depends_on": [
+        "T4"
+      ],
+      "verify": "代码搜索和前端测试通过，确认临时粘贴图片默认命名不再使用 分镜图N。"
+    }
+  ]
+}

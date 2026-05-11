@@ -19,7 +19,7 @@ const assets = new Map([
   ['aud-1', { id: 'aud-1', kind: 'audio', name: '温柔音色', stored_path: '/tmp/voice.mp3', source_path: '/tmp/voice.mp3' }],
 ]);
 
-test('buildMentionItems exposes role images, temp storyboard images, and audio assets', () => {
+test('buildMentionItems exposes role images, temp images, and audio assets', () => {
   const items = buildMentionItems({
     roles: [role],
     assetById: assets,
@@ -29,7 +29,7 @@ test('buildMentionItems exposes role images, temp storyboard images, and audio a
 
   assert.ok(items.some((item) => item.key === 'img:img-1' && item.label === '女主日常服'));
   assert.ok(items.some((item) => item.key === 'aud:aud-1' && item.label === '女主温柔音色'));
-  assert.ok(items.some((item) => item.key === 'temp:tmp-img-1' && item.label === '分镜图1'));
+  assert.ok(items.some((item) => item.key === 'temp:tmp-img-1' && item.label === '图片1'));
 });
 
 test('applyMentionSelection binds selected image and audio assets into the task form', () => {
@@ -57,16 +57,16 @@ test('applyMentionSelection binds selected image and audio assets into the task 
   assert.deepEqual(withAudio.audio_asset_ids, ['aud-1']);
 });
 
-test('matched storyboard mentions are exposed for inline highlighting', () => {
+test('matched temp image mentions are exposed for inline highlighting', () => {
   const items = buildMentionItems({
     tempImagePaths: ['/tmp/story.png'],
     tempImageAssetIds: ['tmp-img-1'],
   });
-  const mentions = collectPromptMentions('@分镜图1 慢慢推近', items);
-  const highlights = highlightPromptMentions('@分镜图1 慢慢推近', items);
+  const mentions = collectPromptMentions('@图片1 慢慢推近', items);
+  const highlights = highlightPromptMentions('@图片1 慢慢推近', items);
 
-  assert.deepEqual(mentions, [{ text: '@分镜图1', name: '分镜图1', matched: true, type: 'temp_image' }]);
-  assert.ok(highlights.some((part) => part.type === 'mention' && part.text === '@分镜图1' && part.matched));
+  assert.deepEqual(mentions, [{ text: '@图片1', name: '图片1', matched: true, type: 'temp_image' }]);
+  assert.ok(highlights.some((part) => part.type === 'mention' && part.text === '@图片1' && part.matched));
 });
 
 test('@role mention writes to manual_mention_ids and role_ids', () => {
@@ -139,11 +139,11 @@ test('mixed @role, @image, @audio mentions write to respective fields', () => {
   assert.deepEqual(withAudio.audio_asset_ids, ['aud-1']);
 });
 
-test('@storyboard N only matches existing temp images', () => {
+test('@image N only matches existing temp images', () => {
   const items = buildMentionItems({ tempImagePaths: ['/tmp/a.png', '/tmp/b.png'], tempImageAssetIds: ['tmp-1', 'tmp-2'] });
-  const m1 = collectPromptMentions('@分镜图1', items);
+  const m1 = collectPromptMentions('@图片1', items);
   assert.equal(m1[0].matched, true);
-  const m3 = collectPromptMentions('@分镜图3', items);
+  const m3 = collectPromptMentions('@图片3', items);
   assert.equal(m3[0].matched, false);
 });
 
@@ -166,27 +166,27 @@ test('@mention dropdown filters by query', () => {
   assert.ok(filtered.every((item) => item.label.includes('女主')));
   const storyboard = items.filter((item) => item.type === 'temp_image');
   assert.equal(storyboard.length, 1);
-  assert.equal(storyboard[0].label, '分镜图1');
+  assert.equal(storyboard[0].label, '图片1');
 });
 
-test('removing temp image recalculates storyboard numbering', () => {
+test('removing temp image recalculates temp image numbering', () => {
   const items3 = buildMentionItems({ tempImagePaths: ['/tmp/a.png', '/tmp/b.png', '/tmp/c.png'], tempImageAssetIds: ['t1', 't2', 't3'] });
   assert.equal(items3.filter((i) => i.type === 'temp_image').length, 3);
-  assert.equal(items3.find((i) => i.assetId === 't1').label, '分镜图1');
-  assert.equal(items3.find((i) => i.assetId === 't2').label, '分镜图2');
+  assert.equal(items3.find((i) => i.assetId === 't1').label, '图片1');
+  assert.equal(items3.find((i) => i.assetId === 't2').label, '图片2');
   const afterRemove = buildMentionItems({ tempImagePaths: ['/tmp/b.png', '/tmp/c.png'], tempImageAssetIds: ['t2', 't3'] });
-  assert.equal(afterRemove.find((i) => i.assetId === 't2').label, '分镜图1');
-  assert.equal(afterRemove.find((i) => i.assetId === 't3').label, '分镜图2');
+  assert.equal(afterRemove.find((i) => i.assetId === 't2').label, '图片1');
+  assert.equal(afterRemove.find((i) => i.assetId === 't3').label, '图片2');
 });
 
-test('pasting clipboard image inserts @storyboard N', () => {
+test('pasting clipboard image inserts @image N', () => {
   const items = buildMentionItems({ tempImagePaths: ['/tmp/clip.png'], tempImageAssetIds: ['clip-1'] });
   const form = { prompt: '', image_asset_ids: [], audio_asset_ids: [], role_ids: [], manual_mention_ids: [] };
   const result = applyMentionSelection({
     form,
-    item: { label: '分镜图1', type: 'temp_image', assetId: 'clip-1' },
+    item: { label: '图片1', type: 'temp_image', assetId: 'clip-1' },
     atQuery: { start: 0, query: '' },
   });
-  assert.ok(result.prompt.includes('@分镜图1'));
+  assert.ok(result.prompt.includes('@图片1'));
   assert.deepEqual(result.image_asset_ids, ['clip-1']);
 });

@@ -19,6 +19,7 @@ const MAX_IMAGES: usize = 9;
 const MAX_AUDIO: usize = 3;
 /// 自动查询最长等待时间（4小时），超过后停止自动查询，改为手动
 const MAX_WAIT_HOURS: i64 = 4;
+const MAX_NO_REMOTE_QUEUE_INFO_MINUTES: i64 = 5;
 /// 5xx 服务器错误自动重试上限次数
 const MAX_SERVER_ERROR_RETRIES: u32 = 2;
 
@@ -793,19 +794,110 @@ pub struct CreateRoleInput {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageModelConfig {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default = "default_openai_base_url")]
     pub base_url: String,
+    #[serde(default)]
     pub api_key: String,
+    #[serde(default = "default_image_model_name")]
     pub model: String,
 }
 
 impl Default for ImageModelConfig {
     fn default() -> Self {
         Self {
-            base_url: "https://api.openai.com/v1".to_string(),
+            id: default_active_image_model_id(),
+            name: "OpenAI 图片默认".to_string(),
+            base_url: default_openai_base_url(),
             api_key: String::new(),
-            model: "gpt-image-1".to_string(),
+            model: default_image_model_name(),
         }
     }
+}
+
+fn default_image_model_name() -> String {
+    "gpt-image-1".to_string()
+}
+
+fn default_image_model_configs() -> Vec<ImageModelConfig> {
+    vec![ImageModelConfig::default()]
+}
+
+fn default_active_image_model_id() -> String {
+    "default-image-openai".to_string()
+}
+
+fn normalize_image_model_config(config: &mut ImageModelConfig, index: usize) {
+    if config.id.trim().is_empty() {
+        config.id = if index == 0 {
+            default_active_image_model_id()
+        } else {
+            format!("image-model-{}", index + 1)
+        };
+    }
+    if config.name.trim().is_empty() {
+        config.name = if index == 0 {
+            "OpenAI 图片默认".to_string()
+        } else {
+            format!("图片模型 {}", index + 1)
+        };
+    }
+    if config.base_url.trim().is_empty() {
+        config.base_url = default_openai_base_url();
+    }
+    if config.model.trim().is_empty() {
+        config.model = default_image_model_name();
+    }
+}
+
+fn normalize_image_model_settings(settings: &mut SchedulerSettings) {
+    let should_migrate_legacy = settings.image_model_config.as_ref().is_some_and(|legacy| {
+        settings.image_model_configs.is_empty()
+            || (settings.image_model_configs.len() == 1
+                && settings.image_model_configs[0].id == default_active_image_model_id()
+                && settings.image_model_configs[0].api_key.trim().is_empty()
+                && (!legacy.api_key.trim().is_empty()
+                    || legacy.base_url.trim() != default_openai_base_url()
+                    || legacy.model.trim() != default_image_model_name()))
+    });
+    if should_migrate_legacy {
+        if let Some(mut legacy) = settings.image_model_config.clone() {
+            normalize_image_model_config(&mut legacy, 0);
+            settings.image_model_configs = vec![legacy];
+            settings.active_image_model_id = settings.image_model_configs[0].id.clone();
+        }
+    }
+    if settings.image_model_configs.is_empty() {
+        settings.image_model_configs = default_image_model_configs();
+    }
+    for (index, config) in settings.image_model_configs.iter_mut().enumerate() {
+        normalize_image_model_config(config, index);
+    }
+    if settings.active_image_model_id.trim().is_empty()
+        || !settings
+            .image_model_configs
+            .iter()
+            .any(|config| config.id == settings.active_image_model_id)
+    {
+        settings.active_image_model_id = settings
+            .image_model_configs
+            .first()
+            .map(|config| config.id.clone())
+            .unwrap_or_else(default_active_image_model_id);
+    }
+    settings.image_model_config = active_image_model_config(settings).cloned();
+}
+
+fn active_image_model_config(settings: &SchedulerSettings) -> Option<&ImageModelConfig> {
+    settings
+        .image_model_configs
+        .iter()
+        .find(|config| config.id == settings.active_image_model_id)
+        .or_else(|| settings.image_model_configs.first())
+        .or(settings.image_model_config.as_ref())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -824,6 +916,10 @@ pub struct UpdateSettingsInput {
     pub active_ai_model_id: String,
     #[serde(default = "default_true")]
     pub prevent_sleep: bool,
+    #[serde(default = "default_image_model_configs")]
+    pub image_model_configs: Vec<ImageModelConfig>,
+    #[serde(default = "default_active_image_model_id")]
+    pub active_image_model_id: String,
     #[serde(default)]
     pub image_model_config: Option<ImageModelConfig>,
 }
@@ -890,6 +986,7 @@ impl AppStore {
             .ok()
             .and_then(|content| serde_json::from_str(&content).ok())
             .unwrap_or_default();
+        normalize_image_model_settings(&mut data.settings);
         backfill_execution_records_from_attempts(&mut data);
         recover_tasks_on_load(&mut data);
         backfill_draft_command_previews(&mut data);
@@ -1166,6 +1263,50 @@ pub fn format_ai_model_test_log(
     )
 }
 
+pub fn format_image_model_settings_log(settings: &SchedulerSettings) -> String {
+    let active = active_image_model_config(settings);
+    let active_label = active
+        .map(|config| format!("{} / {}", config.name, config.model))
+        .unwrap_or_else(|| "-".to_string());
+    let base_url = active
+        .map(|config| config.base_url.as_str())
+        .unwrap_or("-");
+    let key_state = active
+        .map(|config| if config.api_key.trim().is_empty() { "未填写" } else { "已填写" })
+        .unwrap_or("未填写");
+    format!(
+        "图片模型数量={}；active_image_model_id={}；当前图片模型={}；base_url={}；api_key={}",
+        settings.image_model_configs.len(),
+        settings.active_image_model_id,
+        active_label,
+        base_url,
+        key_state,
+    )
+}
+
+fn truncate_text(s: &str, max: usize) -> String {
+    if s.len() <= max { s.to_string() } else { format!("{}…", &s[..max]) }
+}
+
+pub fn parse_imagegen_json_response(
+    response_text: &str,
+    url: &str,
+) -> Result<serde_json::Value, String> {
+    let trimmed = response_text.trim_start();
+    if trimmed.starts_with("<!doctype html")
+        || trimmed.starts_with("<!DOCTYPE html")
+        || trimmed.starts_with("<html")
+    {
+        return Err(format!(
+            "图片生成接口返回 HTML 页面，请检查图片模型 Base URL 是否为 API 地址、路径前缀是否正确，以及该供应商是否支持图片生成接口。url={}；原始内容：{}",
+            url,
+            truncate_text(response_text, 300),
+        ));
+    }
+    serde_json::from_str::<serde_json::Value>(response_text)
+        .map_err(|e| format!("解析响应失败：{e}；url={}；原始内容：{}", url, truncate_text(response_text, 300)))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConcurrencyLimitPolicy {
     SilentRetry,
@@ -1193,6 +1334,10 @@ pub struct SchedulerSettings {
     pub active_ai_model_id: String,
     #[serde(default = "default_true")]
     pub prevent_sleep: bool,
+    #[serde(default = "default_image_model_configs")]
+    pub image_model_configs: Vec<ImageModelConfig>,
+    #[serde(default = "default_active_image_model_id")]
+    pub active_image_model_id: String,
     #[serde(default)]
     pub image_model_config: Option<ImageModelConfig>,
 }
@@ -1224,7 +1369,9 @@ impl Default for SchedulerSettings {
             ai_model_configs: default_ai_model_configs(),
             active_ai_model_id: default_active_ai_model_id(),
             prevent_sleep: true,
-            image_model_config: None,
+            image_model_configs: default_image_model_configs(),
+            active_image_model_id: default_active_image_model_id(),
+            image_model_config: Some(ImageModelConfig::default()),
         }
     }
 }
@@ -1276,6 +1423,40 @@ pub fn is_past_max_wait(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
     DateTime::parse_from_rfc3339(trimmed)
         .map(|t| now.signed_duration_since(t.with_timezone(&Utc)) >= Duration::hours(MAX_WAIT_HOURS))
         .unwrap_or(false)
+}
+
+fn is_past_no_remote_queue_info_wait(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
+    let Some(ref submitted_at) = task.submitted_at else {
+        return false;
+    };
+    let trimmed = submitted_at.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    DateTime::parse_from_rfc3339(trimmed)
+        .map(|t| {
+            now.signed_duration_since(t.with_timezone(&Utc))
+                >= Duration::minutes(MAX_NO_REMOTE_QUEUE_INFO_MINUTES)
+        })
+        .unwrap_or(false)
+}
+
+fn query_output_has_remote_progress_info(parsed: &QueryOutput, raw: &str) -> bool {
+    if parsed.queue_info.is_some()
+        || !parsed.result_paths.is_empty()
+        || !parsed.result_urls.is_empty()
+        || parsed.fail_reason.is_some()
+        || parsed.error_code.is_some()
+    {
+        return true;
+    }
+    let Some(value) = serde_json::from_str::<serde_json::Value>(raw).ok() else {
+        return false;
+    };
+    find_json_string_field(&value, "task_status").is_some()
+        || find_json_string_field(&value, "task_id").is_some()
+        || find_json_string_field(&value, "history_id").is_some()
+        || find_json_string_field(&value, "history_record_id").is_some()
 }
 
 /// 查询后更新退避状态
@@ -2902,8 +3083,24 @@ where
             data.tasks[task_index].submitted_at = Some(now_rfc3339());
         }
 
-        // 检查是否超过 4 小时等待上限（手动查询不触发该限制）
-        if !is_manual && is_current_submit && is_past_max_wait(&data.tasks[task_index], Utc::now()) {
+        let now = Utc::now();
+        let has_remote_progress_info = query_output_has_remote_progress_info(&parsed, &raw);
+        if !is_manual
+            && is_current_submit
+            && !has_remote_progress_info
+            && is_past_no_remote_queue_info_wait(&data.tasks[task_index], now)
+        {
+            final_status = "failed".to_string();
+            final_error_detail = format!(
+                "查询超过 {} 分钟仍未返回远端队列信息，疑似提交未真正进入生成队列",
+                MAX_NO_REMOTE_QUEUE_INFO_MINUTES
+            );
+            reset_query_backoff(&mut data.tasks[task_index]);
+        } else if !is_manual
+            && is_current_submit
+            && is_past_max_wait(&data.tasks[task_index], now)
+        {
+            // 检查是否超过 4 小时等待上限（手动查询不触发该限制）
             final_status = "submitted".to_string();
             final_error_detail = format!(
                 "自动查询已停止（已等待超过 {} 小时），请手动查询",
@@ -3741,6 +3938,9 @@ pub fn run() {
             commands::test_ai_model_command,
             commands::generate_image_command,
             commands::query_image_task_command,
+            commands::retry_query_image_task_command,
+            commands::regenerate_image_command,
+            commands::download_imagegen_image_command,
             commands::copy_imagegen_image_command,
             commands::delete_imagegen_history_item_command,
             commands::clear_imagegen_history_command,
@@ -4610,10 +4810,9 @@ pub mod commands {
         size: String,
         reference_asset_ids: Option<Vec<String>>,
     ) -> Result<ImageGenHistoryItem, String> {
-        let config = store
-            .snapshot()
-            .settings
-            .image_model_config
+        let settings = store.snapshot().settings;
+        let config = active_image_model_config(&settings)
+            .cloned()
             .ok_or_else(|| "未配置图片生成模型，请先在设置中填写".to_string())?;
         if config.api_key.trim().is_empty() {
             return Err("图片模型 API Key 为空".to_string());
@@ -4672,6 +4871,7 @@ pub mod commands {
         let body = body_value.to_string();
         println!("[generate_image] request body size={} bytes", body.len());
         let ak = api_key.clone();
+        let request_url = url.clone();
         let response_text: String = tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
             let client = reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
@@ -4679,7 +4879,7 @@ pub mod commands {
                 .build()
                 .map_err(|e| format!("创建 HTTP 客户端失败：{}", describe_error(&e)))?;
             let response = client
-                .post(&url)
+                .post(&request_url)
                 .bearer_auth(&ak)
                 .header("content-type", "application/json")
                 .body(body)
@@ -4696,8 +4896,7 @@ pub mod commands {
         .await
         .map_err(|e| format!("任务错误：{e}"))??;
         println!("[generate_image] async submit response: {}", truncate(&response_text, 500));
-        let payload = serde_json::from_str::<serde_json::Value>(&response_text)
-            .map_err(|e| format!("解析响应失败：{e}；原始内容：{}", truncate(&response_text, 300)))?;
+        let payload = parse_imagegen_json_response(&response_text, &url)?;
         // 任务 ID：兼容多种字段名
         let task_id = extract_task_id(&payload).ok_or_else(|| {
             format!("提交成功但未找到任务 ID：{}", truncate(&response_text, 300))
@@ -4781,15 +4980,14 @@ pub mod commands {
             .task_id
             .clone()
             .ok_or_else(|| "历史项缺少 task_id".to_string())?;
-        let config = snapshot
-            .settings
-            .image_model_config
-            .clone()
+        let config = active_image_model_config(&snapshot.settings)
+            .cloned()
             .ok_or_else(|| "未配置图片生成模型".to_string())?;
         let base_url = config.base_url.trim().trim_end_matches('/').to_string();
         let api_key = config.api_key.trim().to_string();
         let url = format!("{base_url}/images/{task_id}");
         let ak = api_key.clone();
+        let request_url = url.clone();
         let response_text: String = tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
             let client = reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
@@ -4797,7 +4995,7 @@ pub mod commands {
                 .build()
                 .map_err(|e| format!("创建 HTTP 客户端失败：{}", describe_error(&e)))?;
             let response = client
-                .get(&url)
+                .get(&request_url)
                 .bearer_auth(&ak)
                 .send()
                 .map_err(|e| format!("查询任务请求失败：{}", describe_error(&e)))?;
@@ -4812,8 +5010,7 @@ pub mod commands {
         .await
         .map_err(|e| format!("任务错误：{e}"))??;
         println!("[query_image_task] {history_id} -> {}", truncate(&response_text, 400));
-        let payload = serde_json::from_str::<serde_json::Value>(&response_text)
-            .map_err(|e| format!("解析响应失败：{e}；原始内容：{}", truncate(&response_text, 300)))?;
+        let payload = parse_imagegen_json_response(&response_text, &url)?;
 
         // 解析状态（兼容 status / task_status 字段名）
         let status_raw = payload.get("status")
@@ -4930,6 +5127,78 @@ pub mod commands {
     }
 
     #[tauri::command]
+    pub async fn retry_query_image_task_command(
+        store: State<'_, AppStore>,
+        history_id: String,
+    ) -> Result<ImageGenHistoryItem, String> {
+        let item = store
+            .snapshot()
+            .imagegen_history
+            .iter()
+            .find(|item| item.id == history_id)
+            .cloned()
+            .ok_or_else(|| format!("历史记录 {history_id} 不存在"))?;
+        if item.task_id.is_none() {
+            return Err("该图片历史记录没有异步任务 ID，无法重新查询".to_string());
+        }
+        let _ = update_history_item(&store, &history_id, |it| {
+            it.status = "pending".to_string();
+            it.error = None;
+        })?;
+        query_image_task_command(store, history_id).await
+    }
+
+    #[tauri::command]
+    pub async fn regenerate_image_command(
+        store: State<'_, AppStore>,
+        history_id: String,
+    ) -> Result<ImageGenHistoryItem, String> {
+        let item = store
+            .snapshot()
+            .imagegen_history
+            .iter()
+            .find(|item| item.id == history_id)
+            .cloned()
+            .ok_or_else(|| format!("历史记录 {history_id} 不存在"))?;
+        let reference_asset_ids = if item.reference_asset_ids.is_empty() {
+            None
+        } else {
+            Some(item.reference_asset_ids)
+        };
+        generate_image_command(store, item.prompt, item.size, reference_asset_ids).await
+    }
+
+    #[tauri::command]
+    pub fn download_imagegen_image_command(
+        store: State<'_, AppStore>,
+        history_id: String,
+    ) -> Result<String, String> {
+        let item = store
+            .snapshot()
+            .imagegen_history
+            .iter()
+            .find(|item| item.id == history_id)
+            .cloned()
+            .ok_or_else(|| "历史记录不存在".to_string())?;
+        if item.status != "completed" || item.stored_path.trim().is_empty() {
+            return Err("图片尚未生成完成，无法下载".to_string());
+        }
+        let source = PathBuf::from(&item.stored_path);
+        if !source.exists() {
+            return Err(format!("图片文件不存在：{}", item.stored_path));
+        }
+        let dir = store.assets_dir().join("results");
+        fs::create_dir_all(&dir).map_err(|e| format!("创建下载目录失败：{e}"))?;
+        let extension = source
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("png");
+        let target = dir.join(format!("imagegen_{}.{}", item.id, extension));
+        fs::copy(&source, &target).map_err(|e| format!("保存图片失败：{e}"))?;
+        Ok(target.to_string_lossy().to_string())
+    }
+
+    #[tauri::command]
     pub fn copy_imagegen_image_command(
         store: State<'_, AppStore>,
         history_id: String,
@@ -5016,7 +5285,7 @@ pub mod commands {
     ) -> Result<SchedulerSettings, String> {
         store
             .mutate(|data| {
-                data.settings = SchedulerSettings {
+                let mut settings = SchedulerSettings {
                     concurrency_limit_policy: input.concurrency_limit_policy,
                     concurrency_retry_delay_seconds: input.concurrency_retry_delay_seconds,
                     concurrency_retry_max_attempts: input.concurrency_retry_max_attempts,
@@ -5028,15 +5297,19 @@ pub mod commands {
                     ai_model_configs: input.ai_model_configs,
                     active_ai_model_id: input.active_ai_model_id,
                     prevent_sleep: input.prevent_sleep,
+                    image_model_configs: input.image_model_configs,
+                    active_image_model_id: input.active_image_model_id,
                     image_model_config: input.image_model_config,
                 };
+                normalize_image_model_settings(&mut settings);
+                data.settings = settings;
                 append_log(data, LogEntryDraft {
                     level: LogLevel::Info,
                     source: LogSource::Settings,
                     category: "settings".to_string(),
                     event_type: "update".to_string(),
                     message: "更新设置".to_string(),
-                    detail: String::new(),
+                    detail: format_image_model_settings_log(&data.settings),
                     task_id: None, task_title: None, submit_id: None,
                     execution_record_id: None, error_detail: None,
                     raw_output: None, stdout: None, stderr: None, module: None,
@@ -5630,6 +5903,66 @@ mod tests {
         assert_eq!(updated.next_run_at, Some(scheduled_at));
     }
 
+    #[test]
+    fn legacy_image_model_config_is_normalized_into_image_model_configs() {
+        let mut settings: SchedulerSettings = serde_json::from_value(serde_json::json!({
+            "concurrency_limit_policy": "SilentRetry",
+            "concurrency_retry_delay_seconds": 300,
+            "concurrency_retry_max_attempts": 8,
+            "auto_query_enabled": true,
+            "poll_interval_seconds": 60,
+            "log_retention_count": 500,
+            "mac_install_command": "curl -fsSL https://jimeng.jianying.com/cli | bash",
+            "windows_install_command": "",
+            "ai_model_configs": default_ai_model_configs(),
+            "active_ai_model_id": default_active_ai_model_id(),
+            "prevent_sleep": true,
+            "image_model_config": {
+                "base_url": "https://legacy.example/v1",
+                "api_key": "legacy-key",
+                "model": "legacy-image-model"
+            }
+        }))
+        .expect("legacy settings should deserialize");
+
+        normalize_image_model_settings(&mut settings);
+
+        assert_eq!(settings.image_model_configs.len(), 1);
+        assert_eq!(settings.active_image_model_id, "default-image-openai");
+        assert_eq!(settings.image_model_configs[0].id, "default-image-openai");
+        assert_eq!(settings.image_model_configs[0].name, "OpenAI 图片默认");
+        assert_eq!(settings.image_model_configs[0].base_url, "https://legacy.example/v1");
+        assert_eq!(settings.image_model_configs[0].api_key, "legacy-key");
+        assert_eq!(settings.image_model_configs[0].model, "legacy-image-model");
+    }
+
+    #[test]
+    fn active_image_model_config_prefers_selected_config() {
+        let mut settings = SchedulerSettings::default();
+        settings.image_model_configs = vec![
+            ImageModelConfig {
+                id: "image-a".to_string(),
+                name: "图片 A".to_string(),
+                base_url: "https://a.example/v1".to_string(),
+                api_key: "key-a".to_string(),
+                model: "model-a".to_string(),
+            },
+            ImageModelConfig {
+                id: "image-b".to_string(),
+                name: "图片 B".to_string(),
+                base_url: "https://b.example/v1".to_string(),
+                api_key: "key-b".to_string(),
+                model: "model-b".to_string(),
+            },
+        ];
+        settings.active_image_model_id = "image-b".to_string();
+
+        let selected = active_image_model_config(&settings).expect("selected config exists");
+
+        assert_eq!(selected.id, "image-b");
+        assert_eq!(selected.model, "model-b");
+    }
+
     // ── 退避函数辅助 ─────────────────────────────────────────────────────────
 
     /// 创建带退避字段的测试用任务
@@ -5802,12 +6135,17 @@ mod tests {
             tasks: vec![make_long_pending_task()],
             ..AppData::default()
         };
-        // No-result CLI output (no gen_status, no urls)
+        // 有远端任务状态但已超过 4 小时：停止自动查询，改为手动查询
         let task = query_task_submit_id_once_with_runner(
             &mut data,
             "task-stale",
             "sub-stale",
-            |_args| Ok((String::from("{}"), String::new())),
+            |_args| {
+                Ok((
+                    String::from(r#"{"created":1777777777,"task_status":"running","data":[]}"#),
+                    String::new(),
+                ))
+            },
         )
         .expect("auto query should succeed");
         assert_eq!(task.status, "submitted");

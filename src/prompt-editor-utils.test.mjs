@@ -17,7 +17,7 @@ const mentionItems = [
   { key: 'role:hero', label: '女主', type: 'role', roleId: 'role-hero', assetId: '' },
   { key: 'img:img-1', label: '女主日常服', type: 'image', roleId: 'role-hero', assetId: 'img-1' },
   { key: 'aud:aud-1', label: '女主温柔音色', type: 'audio', roleId: 'role-hero', assetId: 'aud-1' },
-  { key: 'temp:tmp-1', label: '分镜图1', type: 'temp_image', roleId: '', assetId: 'tmp-1' },
+  { key: 'temp:tmp-1', label: '图片1', type: 'temp_image', roleId: '', assetId: 'tmp-1' },
 ];
 
 function makeDocWithMentions(mentions) {
@@ -75,7 +75,7 @@ test('extractMentionRefsFromTiptapDoc groups role, image, audio, temp_image refs
     { key: 'role:hero', label: '女主', type: 'role', roleId: 'role-hero' },
     { key: 'img:img-1', label: '女主日常服', type: 'image', assetId: 'img-1' },
     { key: 'aud:aud-1', label: '女主温柔音色', type: 'audio', assetId: 'aud-1' },
-    { key: 'temp:tmp-1', label: '分镜图1', type: 'temp_image', assetId: 'tmp-1' },
+    { key: 'temp:tmp-1', label: '图片1', type: 'temp_image', assetId: 'tmp-1' },
   ]);
   const refs = extractMentionRefsFromTiptapDoc(doc);
   assert.deepEqual(refs.roleIds, ['role-hero']);
@@ -187,14 +187,14 @@ test('promptTextToTiptapDoc converts @label mentions to mention nodes', () => {
 
 test('promptTextToTiptapDoc converts matching preset @materials to highlightable mention nodes', () => {
   const presetItems = [
-    { key: 'temp:tmp-3', label: '分镜图3', type: 'temp_image', assetId: 'tmp-3' },
+    { key: 'temp:tmp-3', label: '图片3', type: 'temp_image', assetId: 'tmp-3' },
     { key: 'img:chef', label: '女主厨师服', type: 'image', assetId: 'img-chef' },
     { key: 'aud:hero', label: '女主女主人声音', type: 'audio', assetId: 'aud-hero' },
   ];
-  const doc = promptTextToTiptapDoc('根据分镜图 @分镜图3 女主是 @女主厨师服 声音： @女主女主人声音', presetItems);
+  const doc = promptTextToTiptapDoc('根据图片 @图片3 女主是 @女主厨师服 声音： @女主女主人声音', presetItems);
   const mentions = doc.content[0].content.filter((node) => node.type === 'mention');
 
-  assert.deepEqual(mentions.map((node) => node.attrs.label), ['分镜图3', '女主厨师服', '女主女主人声音']);
+  assert.deepEqual(mentions.map((node) => node.attrs.label), ['图片3', '女主厨师服', '女主女主人声音']);
   assert.deepEqual(mentions.map((node) => node.attrs.type), ['temp_image', 'image', 'audio']);
 });
 
@@ -224,7 +224,7 @@ test('promptTextToTiptapDoc returns empty paragraph for empty prompt', () => {
 // ── round-trip ──
 
 test('round-trip: promptText → doc → promptText preserves @label text', () => {
-  const original = '@女主 在海边漫步 @分镜图1 慢慢推近';
+  const original = '@女主 在海边漫步 @图片1 慢慢推近';
   const doc = promptTextToTiptapDoc(original, mentionItems);
   const restored = tiptapDocToPromptText(doc);
   assert.equal(restored, original);
@@ -309,7 +309,7 @@ test('getAllowedPromptPasteText allows replacement using selected text capacity'
 test('shouldSyncExternalPromptValue detects preset text pushed from outside editor', () => {
   assert.equal(shouldSyncExternalPromptValue({
     editorText: '',
-    externalValue: '根据分镜图 @分镜图1',
+    externalValue: '根据图片 @图片1',
     lastExternalValue: '',
     isInternalUpdate: false,
   }), true);
@@ -317,9 +317,9 @@ test('shouldSyncExternalPromptValue detects preset text pushed from outside edit
 
 test('shouldSyncExternalPromptValue ignores unchanged or internal updates', () => {
   assert.equal(shouldSyncExternalPromptValue({
-    editorText: '根据分镜图 @分镜图1',
-    externalValue: '根据分镜图 @分镜图1',
-    lastExternalValue: '根据分镜图 @分镜图1',
+    editorText: '根据图片 @图片1',
+    externalValue: '根据图片 @图片1',
+    lastExternalValue: '根据图片 @图片1',
     isInternalUpdate: false,
   }), false);
   assert.equal(shouldSyncExternalPromptValue({

@@ -47,7 +47,7 @@ export function buildMentionItems({ roles = [], assetById = new Map(), tempImage
   tempImagePaths.forEach((path, index) => {
     items.push({
       key: `temp:${tempImageAssetIds[index] || index}`,
-      label: `分镜图${index + 1}`,
+      label: `图片${index + 1}`,
       type: 'temp_image',
       assetId: tempImageAssetIds[index] || '',
       path,

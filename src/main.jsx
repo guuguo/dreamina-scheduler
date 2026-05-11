@@ -14,6 +14,10 @@ import {
   resolveRemoveMediaTarget,
   buildTaskFormFromTaskForDuplicate,
   buildTaskFormFromTaskForEdit,
+  normalizeImageModelSettingsForm,
+  patchImageModelConfig,
+  mergeSettingsFormOnStateRefresh,
+  shouldRefreshStateAfterSchedulerTick,
 } from './app-logic.js';
 import { buildMentionItems } from './mention-utils.js';
 import {
@@ -36,6 +40,7 @@ import {
 import { buildSecondaryPageHeaderConfig } from './page-header-utils.js';
 import {
   applyCreateTaskPreset,
+  buildSaveTaskDraftButtonState,
   canApplyCreateTaskPreset,
   canSaveTaskDraft,
   createEmptyTaskForm,
@@ -71,7 +76,6 @@ import {
   Command,
   Copy,
   Download,
-  ExternalLink,
   FileAudio,
   FolderOpen,
   Gauge,
@@ -174,6 +178,13 @@ const defaultAiModelConfig = {
   base_url: 'https://api.openai.com/v1',
   model: 'gpt-5.4',
 };
+const defaultImageModelConfig = {
+  id: 'default-image-openai',
+  name: 'OpenAI 图片默认',
+  api_key: '',
+  base_url: 'https://api.openai.com/v1',
+  model: 'gpt-image-1',
+};
 const views = [
   { id: 'dashboard', label: '仪表盘', icon: Home },
   { id: 'roles', label: '角色库', icon: User },
@@ -195,6 +206,9 @@ const emptyState = {
     windows_install_command: '',
     ai_model_configs: [defaultAiModelConfig],
     active_ai_model_id: defaultAiModelConfig.id,
+    image_model_configs: [defaultImageModelConfig],
+    active_image_model_id: defaultImageModelConfig.id,
+    image_model_config: defaultImageModelConfig,
     prevent_sleep: true,
   },
   assets: [],
@@ -206,7 +220,9 @@ const emptyState = {
 function App() {
   const [activeView, setActiveView] = useState('dashboard');
   const [state, setState] = useState(emptyState);
-  const [cli, setCli] = useState({ available: false, path: '', message: '等待检测' });
+  const [cli, setCli] = useState({ available: false, path: '', message: '等待检测', version: '', commit: '', build_time: '', version_raw: '', installed_release_version: '', installed_release_date: '', installed_release_notes: '', installed_release_path: '' });
+  const [cliUpdate, setCliUpdate] = useState(null);
+  const [cliUpdateStatus, setCliUpdateStatus] = useState('idle'); // idle | checking | success | failed
   const [hostPlatform, setHostPlatform] = useState({ label: 'Desktop' });
   const [feedback, setFeedback] = useState('');
   useEffect(() => {
@@ -214,6 +230,21 @@ function App() {
     const t = setTimeout(() => setFeedback(''), 3000);
     return () => clearTimeout(t);
   }, [feedback]);
+  useEffect(() => {
+    const blockLinkNavigation = (event) => {
+      const anchor = event.target?.closest?.('a[href]');
+      if (!anchor) return;
+      const href = anchor.getAttribute('href') || '';
+      if (!href || href.startsWith('#')) return;
+      event.preventDefault();
+      event.stopPropagation();
+      navigator.clipboard?.writeText(anchor.href)
+        .then(() => setFeedback('已复制链接，并阻止内置浏览器打开'))
+        .catch(() => setFeedback('已阻止内置浏览器打开'));
+    };
+    document.addEventListener('click', blockLinkNavigation, true);
+    return () => document.removeEventListener('click', blockLinkNavigation, true);
+  }, []);
   const [pendingTaskOps, setPendingTaskOps] = useState({});
   const [pendingExecutionOps, setPendingExecutionOps] = useState({});
   const tickLockRef = useRef(false);
@@ -232,22 +263,37 @@ function App() {
   const [creditInfo, setCreditInfo] = useState({ available: false, total: '', used: '', remaining: '', raw_text: '' });
   const [creditModalOpen, setCreditModalOpen] = useState(false);
   const [settingsForm, setSettingsForm] = useState(emptyState.settings);
+  const [settingsDirty, setSettingsDirty] = useState(false);
+  const settingsDirtyRef = useRef(false);
+  const updateSettingsForm = (next) => {
+    settingsDirtyRef.current = true;
+    setSettingsDirty(true);
+    setSettingsForm(next);
+  };
   const roleForm = roleEditor?.form || createEmptyRoleForm();
   const setRoleForm = (patch) => {
     setRoleEditor((current) => patchRoleEditorForm(current, patch));
   };
   const [taskForm, setTaskForm] = useState(() => createEmptyTaskForm());
   const [editingTaskId, setEditingTaskId] = useState(null);
+  const [savingTaskDraft, setSavingTaskDraft] = useState(false);
+  const [savingTaskDraftPhase, setSavingTaskDraftPhase] = useState('');
   // 图片生成预览项提升到 App 层，避免切 tab 后 ImageGenView 卸载导致状态丢失
   // 历史记录从 state.imagegen_history 派生（后端持久化）
   const [imageGenPreview, setImageGenPreview] = useState(null);
   const dropContextRef = useRef({ activeView, selectedRoleId, roleEditor });
 
-  async function refreshState() {
+  async function refreshState(options = {}) {
     try {
       const next = await invoke('get_app_state');
       setState(next);
-      setSettingsForm(next.settings || emptyState.settings);
+      setSettingsForm((current) => mergeSettingsFormOnStateRefresh({
+        activeView,
+        settingsDirty: options.forceSettingsSync ? false : settingsDirtyRef.current,
+        currentSettingsForm: current,
+        incomingSettings: next.settings,
+        emptySettings: emptyState.settings,
+      }));
       if (!selectedTaskId && next.tasks?.[0]) setSelectedTaskId(next.tasks[0].id);
       invoke('sync_keep_awake_command').catch(() => {});
     } catch (error) {
@@ -262,6 +308,19 @@ function App() {
     setCli(result);
     if (result.available) {
       refreshCredit().catch(() => {});
+    }
+  }
+
+  async function checkCliUpdate() {
+    setCliUpdateStatus('checking');
+    try {
+      const result = await invoke('check_dreamina_cli_update');
+      setCliUpdate(result);
+      setCliUpdateStatus('success');
+      setFeedback(result.message || 'CLI 更新检查完成');
+    } catch (error) {
+      setCliUpdateStatus('failed');
+      setFeedback(`CLI 更新检查失败：${String(error)}`);
     }
   }
 
@@ -328,7 +387,9 @@ function App() {
         await invoke('process_queue_command');
         if (!cancelled) {
           setLastTickAt(new Date());
-          await refreshStateRef.current?.();
+          if (shouldRefreshStateAfterSchedulerTick(dropContextRef.current)) {
+            await refreshStateRef.current?.();
+          }
         }
       } catch (_e) {
         // 内部调度静默处理，不干扰用户操作
@@ -352,7 +413,9 @@ function App() {
       try {
         await invoke('process_queue_command');
         setLastTickAt(new Date());
-        await refreshStateRef.current?.();
+        if (shouldRefreshStateAfterSchedulerTick(dropContextRef.current)) {
+          await refreshStateRef.current?.();
+        }
       } catch (_e) {
         // 静默处理
       } finally {
@@ -602,17 +665,22 @@ function App() {
 
   async function saveTaskDraft(event) {
     event?.preventDefault?.();
+    if (savingTaskDraft) return;
     let draft = {
       ...taskForm,
       image_asset_ids: taskForm.image_asset_ids || [],
       audio_asset_ids: taskForm.audio_asset_ids || [],
       scheduled_at: null,
     };
+    setSavingTaskDraft(true);
+    setSavingTaskDraftPhase('');
     try {
       if (!String(draft.title || '').trim()) {
+        setSavingTaskDraftPhase('title');
         const generatedTitle = await generateTaskTitle(draft.prompt);
         if (generatedTitle) draft = { ...draft, title: generatedTitle };
       }
+      setSavingTaskDraftPhase('saving');
       if (editingTaskId) {
         await invoke('update_task_draft_command', { taskId: editingTaskId, draft });
         setSelectedTaskId(editingTaskId);
@@ -626,6 +694,9 @@ function App() {
       await refreshState();
     } catch (error) {
       setFeedback(String(error));
+    } finally {
+      setSavingTaskDraft(false);
+      setSavingTaskDraftPhase('');
     }
   }
 
@@ -680,6 +751,8 @@ function App() {
       const msg = await invoke('install_dreamina_cli_command');
       setInstallCliStatus('success');
       setFeedback(msg);
+      await checkCli();
+      await checkCliUpdate();
       await refreshState();
     } catch (error) {
       setInstallCliStatus('failed');
@@ -849,7 +922,8 @@ function App() {
   async function saveSettings(event) {
     event.preventDefault();
     try {
-      await invoke('update_settings_command', {
+      const imageSettings = normalizeImageModelSettingsForm(settingsForm);
+      const savedSettings = await invoke('update_settings_command', {
         input: {
           concurrency_limit_policy: settingsForm.concurrency_limit_policy,
           concurrency_retry_delay_seconds: Number(settingsForm.concurrency_retry_delay_seconds) || 300,
@@ -866,12 +940,17 @@ function App() {
               base_url: config.base_url || 'https://api.openai.com/v1',
             })),
           active_ai_model_id: settingsForm.active_ai_model_id || (settingsForm.ai_model_configs?.[0]?.id || defaultAiModelConfig.id),
+          image_model_configs: imageSettings.image_model_configs,
+          active_image_model_id: imageSettings.active_image_model_id,
           prevent_sleep: settingsForm.prevent_sleep ?? true,
-          image_model_config: settingsForm.image_model_config || null,
+          image_model_config: imageSettings.image_model_config || null,
         },
       });
       setFeedback('设置已保存');
-      await refreshState();
+      settingsDirtyRef.current = false;
+      setSettingsDirty(false);
+      setSettingsForm(normalizeImageModelSettingsForm(savedSettings || emptyState.settings));
+      await refreshState({ forceSettingsSync: true });
     } catch (error) {
       setFeedback(String(error));
     }
@@ -918,7 +997,7 @@ function App() {
             <strong>Dreamina Scheduler</strong>
             <StatusPill variant={cli.available ? 'ok' : 'bad'}>
               <CheckCircle2 size={13} />
-              {cli.available ? 'dreamina CLI 已连接' : cli.message}
+              {cli.available ? `dreamina CLI ${cli.version || '已连接'}` : cli.message}
             </StatusPill>
             {cli.available ? (
               <StatusPill
@@ -978,6 +1057,8 @@ function App() {
             removeTempImage={removeTempImage}
             previewCommand={previewCommand}
             generateTaskTitle={generateTaskTitle}
+            savingTaskDraft={savingTaskDraft}
+            savingTaskDraftPhase={savingTaskDraftPhase}
             pasteClipboardImage={pasteClipboardImage}
             pasteSystemClipboardImage={pasteSystemClipboardImage}
           />
@@ -1052,6 +1133,7 @@ function App() {
             pasteClipboardImage={pasteClipboardImage}
             pasteSystemClipboardImage={pasteSystemClipboardImage}
             refreshState={refreshState}
+            setFeedback={setFeedback}
           />
         ) : null}
         {activeView === 'logs' ? <LogsView logs={state.logs} tasks={state.tasks} settings={state.settings} clearLogs={clearLogs} setActiveView={setActiveView} setSelectedTaskId={setSelectedTaskId} /> : null}
@@ -1059,8 +1141,11 @@ function App() {
           <SettingsView
             cli={cli}
             settingsForm={settingsForm}
-            setSettingsForm={setSettingsForm}
+            setSettingsForm={updateSettingsForm}
             checkCli={checkCli}
+            checkCliUpdate={checkCliUpdate}
+            cliUpdate={cliUpdate}
+            cliUpdateStatus={cliUpdateStatus}
             saveSettings={saveSettings}
             installCli={installCli}
             installCliStatus={installCliStatus}
@@ -1087,7 +1172,7 @@ function Dashboard({ state, cli, hostPlatform, queueStats, submitTask, queryTask
     <div className="dashboard-view">
       <section className="metric-grid">
         <Metric title="平台" value={hostPlatform?.label || 'Desktop'} />
-        <Metric title="CLI 检测" value={cli.available ? '检测正常' : '待处理'} tone={cli.available ? 'good' : 'warn'} />
+        <Metric title="CLI 检测" value={cli.available ? (cli.version || '检测正常') : '待处理'} tone={cli.available ? 'good' : 'warn'} />
         <Metric title="并发数" value="1" sub="固定并发，顺序执行" />
         <Metric title="默认模型" value="seedance2.0" />
         <div className="notice-card">
@@ -1150,7 +1235,7 @@ function Dashboard({ state, cli, hostPlatform, queueStats, submitTask, queryTask
   );
 }
 
-function CreateTaskView({ state, assetById, taskForm, setTaskForm, setActiveView, saveTaskDraft, editingTaskId, cli, addTempImage, removeTempImage, previewCommand, generateTaskTitle, pasteClipboardImage, pasteSystemClipboardImage }) {
+function CreateTaskView({ state, assetById, taskForm, setTaskForm, setActiveView, saveTaskDraft, editingTaskId, cli, addTempImage, removeTempImage, previewCommand, generateTaskTitle, savingTaskDraft, savingTaskDraftPhase, pasteClipboardImage, pasteSystemClipboardImage }) {
   const [previewSrc, setPreviewSrc] = useState(null);
   const [previewAlt, setPreviewAlt] = useState('');
   const [audioPreviewAsset, setAudioPreviewAsset] = useState(null);
@@ -1243,6 +1328,12 @@ function CreateTaskView({ state, assetById, taskForm, setTaskForm, setActiveView
   const canSaveDraft = canSaveTaskDraft(taskForm);
   const canApplyPreset = canApplyCreateTaskPreset(taskForm);
   const isEditingTask = Boolean(editingTaskId);
+  const saveButton = buildSaveTaskDraftButtonState({
+    canSaveDraft,
+    isEditingTask,
+    savingTaskDraft,
+    savingTaskDraftPhase,
+  });
   const pageHeader = buildSecondaryPageHeaderConfig('task', { mode: isEditingTask ? 'edit' : 'create', name: taskForm.title });
 
   const applyPresetTemplate = useCallback(() => {
@@ -1282,8 +1373,8 @@ function CreateTaskView({ state, assetById, taskForm, setTaskForm, setActiveView
                   <Sparkles size={14} /> 重生成标题
                 </button>
               ) : null}
-              <button type="button" className="gradient-button" disabled={!canSaveDraft} onClick={saveTaskDraft}>
-                <Plus size={14} /> {isEditingTask ? '保存修改' : '保存任务'}
+              <button type="button" className="gradient-button" disabled={saveButton.disabled} onClick={saveTaskDraft}>
+                {saveButton.icon === 'loader' ? <Loader2 size={14} className="spin" /> : <Plus size={14} />} {saveButton.label}
               </button>
             </>
           )}
@@ -1329,7 +1420,7 @@ function CreateTaskView({ state, assetById, taskForm, setTaskForm, setActiveView
                   <button type="button" className="preset-template-card" onClick={applyPresetTemplate}>
                     <Sparkles size={15} />
                     <span>一键添加预设模板</span>
-                    <em>自动匹配可用的 @分镜图、角色图片和音频素材</em>
+                    <em>自动匹配可用的 @图片、角色图片和音频素材</em>
                   </button>
                 ) : null}
                 <PromptMentionEditor
@@ -1378,7 +1469,7 @@ function CreateTaskView({ state, assetById, taskForm, setTaskForm, setActiveView
                 </div>
                 <div className="info-strip">
                   <Image size={13} />
-                  可在提示词中通过 @分镜图01 等方式引用临时图片。
+                  可在提示词中通过 @图片1 等方式引用临时图片。
                 </div>
               </div>
             </form>
@@ -2221,7 +2312,7 @@ function QueueView({
                         className="qc-command-toggle"
                         onClick={openCommandPreview}
                       >
-                        <ExternalLink size={13} />
+                        <Copy size={13} />
                         {commandPresentation.actionLabel}
                       </button>
                     </div>
@@ -2292,9 +2383,9 @@ function QueueView({
                             <FolderOpen size={12} />
                           </button>
                         ) : (
-                          <button type="button" className="icon-ghost mini" title="在浏览器打开"
-                            onClick={() => window.open(item.value, '_blank', 'noopener,noreferrer')}>
-                            <ExternalLink size={12} />
+                          <button type="button" className="icon-ghost mini" title="复制链接"
+                            onClick={() => navigator.clipboard?.writeText(item.value).then(() => setFeedback('已复制结果链接')).catch(() => setFeedback('复制失败'))}>
+                            <Copy size={12} />
                           </button>
                         )}
                       </div>
@@ -2375,9 +2466,9 @@ function QueueView({
                             {item.result_paths.length === 0 && item.result_urls.map((u) => (
                               <div key={u} className="qc-history-file-row">
                                 <span className="mono qc-result-path" title={u}>{u.split('/').pop()?.slice(0, 40) || u}</span>
-                                <button type="button" className="icon-ghost mini" title="在浏览器打开"
-                                  onClick={(event) => { event.stopPropagation(); window.open(u, '_blank', 'noopener,noreferrer'); }}>
-                                  <ExternalLink size={12} />
+                                <button type="button" className="icon-ghost mini" title="复制链接"
+                                  onClick={(event) => { event.stopPropagation(); navigator.clipboard?.writeText(u).then(() => setFeedback('已复制结果链接')).catch(() => setFeedback('复制失败')); }}>
+                                  <Copy size={12} />
                                 </button>
                               </div>
                             ))}
@@ -3028,7 +3119,7 @@ function SchedulePickerModal({ title, mode = 'single', taskCount = 1, onClose, o
   );
 }
 
-function SettingsView({ cli, settingsForm, setSettingsForm, checkCli, saveSettings, installCli, installCliStatus, loginCli, loginCliStatus }) {
+function SettingsView({ cli, settingsForm, setSettingsForm, checkCli, checkCliUpdate, cliUpdate, cliUpdateStatus, saveSettings, installCli, installCliStatus, loginCli, loginCliStatus }) {
   const aiModelConfigs = settingsForm.ai_model_configs?.length ? settingsForm.ai_model_configs : [defaultAiModelConfig];
   const activeAiModelId = settingsForm.active_ai_model_id || aiModelConfigs[0]?.id || defaultAiModelConfig.id;
   const patchAiModel = (index, patch) => {
@@ -3052,9 +3143,42 @@ function SettingsView({ cli, settingsForm, setSettingsForm, checkCli, saveSettin
       active_ai_model_id: activeAiModelId === id ? fallback.id : activeAiModelId,
     });
   };
-  const patchImageModel = (patch) => {
-    const base = settingsForm.image_model_config || { base_url: 'https://api.openai.com/v1', api_key: '', model: 'gpt-image-1' };
-    setSettingsForm({ ...settingsForm, image_model_config: { ...base, ...patch } });
+  const normalizedImageSettings = normalizeImageModelSettingsForm(settingsForm);
+  const imageModelConfigs = normalizedImageSettings.image_model_configs;
+  const activeImageModelId = normalizedImageSettings.active_image_model_id;
+  const activeImageModel = normalizedImageSettings.image_model_config;
+  const patchImageModel = (index, patch) => {
+    setSettingsForm(patchImageModelConfig(settingsForm, index, patch));
+  };
+  const addImageModel = () => {
+    const id = `image-openai-${Date.now()}`;
+    const nextConfig = { ...defaultImageModelConfig, id, name: `图片模型 ${imageModelConfigs.length + 1}` };
+    setSettingsForm(normalizeImageModelSettingsForm({
+      ...settingsForm,
+      image_model_configs: [...imageModelConfigs, nextConfig],
+      active_image_model_id: id,
+      image_model_config: nextConfig,
+    }));
+  };
+  const setActiveImageModel = (id, configs = imageModelConfigs) => {
+    const selected = configs.find((config) => config.id === id) || configs[0] || defaultImageModelConfig;
+    setSettingsForm(normalizeImageModelSettingsForm({
+      ...settingsForm,
+      image_model_configs: configs,
+      active_image_model_id: selected.id,
+      image_model_config: selected,
+    }));
+  };
+  const removeImageModel = (id) => {
+    const next = imageModelConfigs.filter((config) => config.id !== id);
+    const fallback = next[0] || defaultImageModelConfig;
+    const selected = activeImageModelId === id ? fallback : (next.find((config) => config.id === activeImageModelId) || fallback);
+    setSettingsForm(normalizeImageModelSettingsForm({
+      ...settingsForm,
+      image_model_configs: next.length ? next : [fallback],
+      active_image_model_id: selected.id,
+      image_model_config: selected,
+    }));
   };
 
   return (
@@ -3072,13 +3196,36 @@ function SettingsView({ cli, settingsForm, setSettingsForm, checkCli, saveSettin
               </StatusPill>
             </div>
           </label>
+          <label>
+            CLI 版本
+            <input value={cli.available ? (cli.version || '未返回版本信息') : '未检测到'} readOnly />
+          </label>
+          <div className="settings-hint">
+            {cli.available ? `Commit：${cli.commit || '未知'} · 构建时间：${cli.build_time || '未知'}` : '检测到 CLI 后会显示版本、Commit 和构建时间。'}
+          </div>
+          <div className="settings-hint">
+            {cli.installed_release_version
+              ? `已保存官方版本：${cli.installed_release_version}${cli.installed_release_date ? ` · ${cli.installed_release_date}` : ''}`
+              : `尚未保存官方版本号${cli.installed_release_path ? `（${cli.installed_release_path}）` : ''}`}
+          </div>
+          {cliUpdate ? (
+            <div className="settings-hint">
+              官方最新：{cliUpdate.latest_version || '未知'}
+              {cliUpdate.latest_release_date ? ` · ${cliUpdate.latest_release_date}` : ''}
+              {cliUpdate.update_available ? ' · 有新版本' : cliUpdate.comparable ? ' · 已是最新' : ' · 无法精确比较'}
+              {cliUpdate.latest_release_notes ? ` · ${cliUpdate.latest_release_notes}` : ''}
+            </div>
+          ) : null}
           <div className="button-cluster" style={{ justifyContent: 'flex-start', gap: 8 }}>
             <button className="outline-button" type="button" onClick={checkCli}><RefreshCcw size={12} /> 重新检测</button>
-            <button className="outline-button" type="button" onClick={installCli} disabled={installCliStatus === 'installing'}>
-              <Download size={12} /> {installCliStatus === 'installing' ? '安装中…' : '一键安装'}
+            <button className="outline-button" type="button" onClick={checkCliUpdate} disabled={cliUpdateStatus === 'checking'}>
+              <RefreshCcw size={12} /> {cliUpdateStatus === 'checking' ? '检查中…' : '检查更新'}
             </button>
-            {installCliStatus === 'success' && <StatusPill variant="ok">安装成功</StatusPill>}
-            {installCliStatus === 'failed' && <StatusPill variant="bad">安装失败</StatusPill>}
+            <button className="outline-button" type="button" onClick={installCli} disabled={installCliStatus === 'installing'}>
+              <Download size={12} /> {installCliStatus === 'installing' ? '安装/更新中…' : '安装/更新'}
+            </button>
+            {installCliStatus === 'success' && <StatusPill variant="ok">安装/更新成功</StatusPill>}
+            {installCliStatus === 'failed' && <StatusPill variant="bad">安装/更新失败</StatusPill>}
           </div>
           <div className="button-cluster" style={{ justifyContent: 'flex-start', gap: 8 }}>
             <button className="outline-button" type="button" onClick={() => loginCli(false)} disabled={!cli.available || loginCliStatus === 'logging'}>
@@ -3101,7 +3248,7 @@ function SettingsView({ cli, settingsForm, setSettingsForm, checkCli, saveSettin
             Windows PowerShell 安装命令
             <CopyableInput
               value={settingsForm.windows_install_command || ''}
-              placeholder="填入官方 PowerShell 安装命令后启用 Windows 一键安装"
+              placeholder="填入官方 PowerShell 安装/更新命令"
               onChange={(e) => setSettingsForm({ ...settingsForm, windows_install_command: e.target.value })}
             />
           </label>
@@ -3228,32 +3375,60 @@ function SettingsView({ cli, settingsForm, setSettingsForm, checkCli, saveSettin
         </NumberedSection>
 
         {/* 5 图片生成模型 - full width */}
-        <NumberedSection number={5} title="图片生成模型" subtitle='新增，用于"生图" Tab' className="numbered-section--full">
-          <div className="settings-img-row">
-            <label>
-              Base URL
-              <input value={settingsForm.image_model_config?.base_url ?? 'https://api.openai.com/v1'}
-                onChange={(e) => patchImageModel({ base_url: e.target.value })}
-                placeholder="https://api.openai.com/v1" />
+        <NumberedSection number={5} title="图片生成模型" subtitle='用于"生图" Tab' className="numbered-section--full">
+          <div className="setting-group-head">
+            <label style={{ flex: 1, margin: 0 }}>
+              当前使用模型
+              <select value={activeImageModel.id} onChange={(e) => setActiveImageModel(e.target.value)}>
+                {imageModelConfigs.map((config) => (
+                  <option key={config.id} value={config.id}>{config.name || config.model || config.id}</option>
+                ))}
+              </select>
             </label>
-            <label>
-              API Key
-              <PasswordInput
-                value={settingsForm.image_model_config?.api_key ?? ''}
-                onChange={(e) => patchImageModel({ api_key: e.target.value })}
-                placeholder="sk-..."
-              />
-            </label>
-            <label>
-              模型名称
-              <input value={settingsForm.image_model_config?.model ?? 'gpt-image-1'}
-                onChange={(e) => patchImageModel({ model: e.target.value })}
-                placeholder="gpt-image-1 / dall-e-3" />
-            </label>
-            <button className="gradient-button" type="submit">保存设置</button>
+            <button className="outline-button" type="button" onClick={addImageModel} style={{ alignSelf: 'flex-end' }}>
+              <Plus size={12} /> 新增模型
+            </button>
+          </div>
+          <div className="ai-model-list">
+            {imageModelConfigs.map((config, index) => {
+              const isActive = config.id === activeImageModel.id;
+              return (
+                <div className={`ai-model-card${isActive ? ' active' : ''}`} key={config.id}>
+                  <div className="ai-model-card-head">
+                    <strong>{[config.name, config.model].filter(Boolean).join(' / ') || '未命名图片模型'}</strong>
+                    <div className="ai-model-card-actions">
+                      {isActive && <StatusPill variant="info">当前使用</StatusPill>}
+                      {!isActive && (
+                        <button type="button" className="icon-ghost mini" title="设为当前模型" onClick={() => setActiveImageModel(config.id)}>
+                          <Star size={12} />
+                        </button>
+                      )}
+                      <button type="button" className="icon-ghost mini" title="删除" disabled={imageModelConfigs.length <= 1}
+                        onClick={() => removeImageModel(config.id)}>
+                        <Trash2 size={12} />
+                      </button>
+                    </div>
+                  </div>
+                  {isActive && (
+                    <div className="ai-model-grid">
+                      <label>名称<input value={config.name || ''} onChange={(e) => patchImageModel(index, { name: e.target.value })} /></label>
+                      <label>Base URL<input value={config.base_url || ''} onChange={(e) => patchImageModel(index, { base_url: e.target.value })} placeholder="https://api.openai.com/v1" /></label>
+                      <label>模型名称<input value={config.model || ''} onChange={(e) => patchImageModel(index, { model: e.target.value })} placeholder="gpt-image-1 / dall-e-3" /></label>
+                      <label className="ai-model-secret">
+                        API Key
+                        <PasswordInput value={config.api_key || ''} placeholder="sk-..." onChange={(e) => patchImageModel(index, { api_key: e.target.value })} />
+                      </label>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
         </NumberedSection>
 
+      </div>
+      <div className="settings-form-footer">
+        <button type="submit" className="gradient-button"><Save size={14} /> 保存设置</button>
       </div>
     </form>
   );
@@ -3326,7 +3501,7 @@ function TaskDetail({ task, submitTask, queryTask, pendingTaskOps = {} }) {
       {task.result_urls?.length || task.result_paths?.length ? (
         <section className="result-list">
           <h3>生成结果</h3>
-          {task.result_urls?.map((url) => <a key={url} href={url}>{url}</a>)}
+          {task.result_urls?.map((url) => <p key={url}>{url}</p>)}
           {task.result_paths?.map((path) => <p key={path}>{path}</p>)}
         </section>
       ) : null}
@@ -4396,9 +4571,18 @@ const IMAGE_SIZE_OPTIONS = [
 ];
 
 function imageGenItemSrc(item) {
-  if (!item) return '';
-  if (item.storedPath) return convertFileSrc(item.storedPath);
-  return item.dataUrl || '';
+  if (!item?.storedPath) return '';
+  return convertFileSrc(item.storedPath);
+}
+
+function imageGenQueryMetaText(item) {
+  if (!item?.lastQueryAt) return '等待首次查询…';
+  const status = item.lastQueryStatus || 'unknown';
+  return `最近查询：${new Date(item.lastQueryAt).toLocaleTimeString()} · ${status}`;
+}
+
+function normalizeMentions(list) {
+  return list.map((item) => item.dataUrl || '');
 }
 
 function ImageGenView({
@@ -4412,17 +4596,21 @@ function ImageGenView({
   pasteClipboardImage,
   pasteSystemClipboardImage,
   refreshState,
+  setFeedback,
 }) {
   const [imagegenForm, setImagegenForm] = useState(() => createEmptyImageGenForm());
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState('');
   const [copyMsg, setCopyMsg] = useState('');
+  const [queryingImageIds, setQueryingImageIds] = useState({});
+  const [regeneratingImageIds, setRegeneratingImageIds] = useState({});
   const [promptExpanded, setPromptExpanded] = useState(false);
   const [imageModalSrc, setImageModalSrc] = useState(null);
 
   useEffect(() => { setPromptExpanded(false); }, [previewItem?.id]);
 
-  const hasConfig = Boolean(settingsForm.image_model_config?.api_key?.trim());
+  const activeImageModel = normalizeImageModelSettingsForm(settingsForm).image_model_config;
+  const hasConfig = Boolean(activeImageModel?.api_key?.trim());
   const promptIsEmpty = !imagegenForm.prompt?.trim();
 
   // 预览项跟着 history 实时刷新（pending → completed 自动更新画面）
@@ -4561,11 +4749,14 @@ function ImageGenView({
     }
   }
 
-  function downloadItem(item) {
-    const a = document.createElement('a');
-    a.href = imageGenItemSrc(item);
-    a.download = `imagegen_${item.id}.png`;
-    a.click();
+  async function downloadItem(item) {
+    try {
+      const path = await invoke('download_imagegen_image_command', { historyId: item.id });
+      setError('');
+      setFeedback(`已保存图片：${path}`);
+    } catch (err) {
+      setError(`下载图片失败：${String(err)}`);
+    }
   }
 
   async function copyItem(item) {
@@ -4575,6 +4766,36 @@ function ImageGenView({
       setTimeout(() => setCopyMsg(''), 2000);
     } catch (err) {
       setError(`复制图片失败：${String(err)}`);
+    }
+  }
+
+  async function retryQueryItem(item) {
+    setQueryingImageIds((prev) => ({ ...prev, [item.id]: true }));
+    setError('');
+    try {
+      const updated = await invoke('retry_query_image_task_command', { historyId: item.id });
+      await refreshState();
+      setPreviewItem(updated);
+    } catch (err) {
+      await refreshState();
+      setError(`重新查询失败：${String(err)}`);
+    } finally {
+      setQueryingImageIds((prev) => ({ ...prev, [item.id]: false }));
+    }
+  }
+
+  async function regenerateItem(item) {
+    setRegeneratingImageIds((prev) => ({ ...prev, [item.id]: true }));
+    setError('');
+    try {
+      const updated = await invoke('regenerate_image_command', { historyId: item.id });
+      await refreshState();
+      setPreviewItem(updated);
+    } catch (err) {
+      await refreshState();
+      setError(`重新生成失败：${String(err)}`);
+    } finally {
+      setRegeneratingImageIds((prev) => ({ ...prev, [item.id]: false }));
     }
   }
 
@@ -4687,6 +4908,7 @@ function ImageGenView({
                 <div className="imagegen-preview-img imagegen-preview-pending">
                   <Loader2 size={32} className="spin" />
                   <span style={{marginTop:8, fontSize:12, color:'var(--muted)'}}>异步生成中，请稍候…</span>
+                  <span style={{marginTop:4, fontSize:12, color:'var(--muted)'}}>{imageGenQueryMetaText(livePreviewItem)}</span>
                 </div>
               ) : livePreviewItem.status === 'failed' ? (
                 <div className="imagegen-preview-img imagegen-preview-pending">
@@ -4710,6 +4932,25 @@ function ImageGenView({
                   </button>
                   <button type="button" className="outline-button" onClick={() => downloadItem(livePreviewItem)}>
                     <Download size={13} /> 下载
+                  </button>
+                  <button type="button" className="outline-button" onClick={() => regenerateItem(livePreviewItem)} disabled={regeneratingImageIds[livePreviewItem.id]}>
+                    {regeneratingImageIds[livePreviewItem.id]
+                      ? <><Loader2 size={13} className="spin" /> 生成中…</>
+                      : <><Sparkles size={13} /> 重新生成</>}
+                  </button>
+                </div>
+              )}
+              {livePreviewItem.status === 'failed' && livePreviewItem.taskId && (
+                <div className="imagegen-preview-actions">
+                  <button type="button" className="outline-button" onClick={() => retryQueryItem(livePreviewItem)} disabled={queryingImageIds[livePreviewItem.id]}>
+                    {queryingImageIds[livePreviewItem.id]
+                      ? <><Loader2 size={13} className="spin" /> 查询中…</>
+                      : <><RefreshCcw size={13} /> 重新查询</>}
+                  </button>
+                  <button type="button" className="outline-button" onClick={() => regenerateItem(livePreviewItem)} disabled={regeneratingImageIds[livePreviewItem.id]}>
+                    {regeneratingImageIds[livePreviewItem.id]
+                      ? <><Loader2 size={13} className="spin" /> 生成中…</>
+                      : <><Sparkles size={13} /> 重新生成</>}
                   </button>
                 </div>
               )}
@@ -4796,7 +5037,10 @@ function ImageGenView({
               </div>
               <div className="imagegen-history-meta imagegen-history-meta-clickable" onClick={() => setPreviewItem(item)}>
                 <span className="imagegen-history-prompt">{item.prompt.length > 60 ? item.prompt.slice(0, 60) + '…' : item.prompt}</span>
-                <span className="imagegen-history-time">{new Date(item.createdAt).toLocaleString()} · {item.size}</span>
+                <span className="imagegen-history-time">
+                  {new Date(item.createdAt).toLocaleString()} · {item.size}
+                  {item.status === 'pending' ? ` · ${imageGenQueryMetaText(item)}` : ''}
+                </span>
               </div>
               <div className="imagegen-history-actions" onClick={(e) => e.stopPropagation()}>
                 {item.status === 'completed' && (
@@ -4806,6 +5050,19 @@ function ImageGenView({
                     </button>
                     <button type="button" className="icon-ghost mini" title="下载" onClick={(e) => { e.preventDefault(); e.stopPropagation(); downloadItem(item); }}>
                       <Download size={12} />
+                    </button>
+                    <button type="button" className="icon-ghost mini" title="重新生成" disabled={regeneratingImageIds[item.id]} onClick={(e) => { e.preventDefault(); e.stopPropagation(); regenerateItem(item); }}>
+                      {regeneratingImageIds[item.id] ? <Loader2 size={12} className="spin" /> : <Sparkles size={12} />}
+                    </button>
+                  </>
+                )}
+                {item.status === 'failed' && item.taskId && (
+                  <>
+                    <button type="button" className="icon-ghost mini" title="重新查询" disabled={queryingImageIds[item.id]} onClick={(e) => { e.preventDefault(); e.stopPropagation(); retryQueryItem(item); }}>
+                      {queryingImageIds[item.id] ? <Loader2 size={12} className="spin" /> : <RefreshCcw size={12} />}
+                    </button>
+                    <button type="button" className="icon-ghost mini" title="重新生成" disabled={regeneratingImageIds[item.id]} onClick={(e) => { e.preventDefault(); e.stopPropagation(); regenerateItem(item); }}>
+                      {regeneratingImageIds[item.id] ? <Loader2 size={12} className="spin" /> : <Sparkles size={12} />}
                     </button>
                   </>
                 )}

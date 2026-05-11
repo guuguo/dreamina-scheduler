@@ -4,7 +4,7 @@ import {
   promptTextToTiptapDoc,
 } from './prompt-editor-utils.js';
 
-export const DEFAULT_CREATE_TASK_PRESET = '根据分镜图 @分镜图3    本生成写实邵氏兄弟港片风格视频，女主是 @女主厨师服 声音： @女主女主人声音  ，黑白猫猫声音 @黑白猫和灰猫奶牛猫声音     。灰猫声音 @黑白猫和灰猫英短声音  。脚本：';
+export const DEFAULT_CREATE_TASK_PRESET = '根据图片 @图片3    本生成写实邵氏兄弟港片风格视频，女主是 @女主厨师服 声音： @女主女主人声音  ，黑白猫猫声音 @黑白猫和灰猫奶牛猫声音     。灰猫声音 @黑白猫和灰猫英短声音  。脚本：';
 export const TASK_PROMPT_MAX_LENGTH = 10000;
 
 export function canSaveTaskDraft(form) {
@@ -14,6 +14,26 @@ export function canSaveTaskDraft(form) {
       || (form?.image_asset_ids || []).length
       || (form?.audio_asset_ids || []).length,
   );
+}
+
+export function buildSaveTaskDraftButtonState({
+  canSaveDraft,
+  isEditingTask,
+  savingTaskDraft,
+  savingTaskDraftPhase,
+}) {
+  if (savingTaskDraft) {
+    return {
+      disabled: true,
+      icon: 'loader',
+      label: savingTaskDraftPhase === 'title' ? '生成标题中…' : '保存中…',
+    };
+  }
+  return {
+    disabled: !canSaveDraft,
+    icon: 'plus',
+    label: isEditingTask ? '保存修改' : '保存任务',
+  };
 }
 
 export function createEmptyTaskForm() {

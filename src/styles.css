@@ -7493,6 +7493,14 @@ button:disabled {
   color: #1b2440;
   line-height: 1.4;
 }
+.settings-page label {
+  display: grid;
+  gap: 6px;
+  color: #536078;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.4;
+}
 .settings-page .outline-button {
   border-color: #9d8fff;
   color: var(--primary);

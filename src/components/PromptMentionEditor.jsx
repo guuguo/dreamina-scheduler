@@ -317,7 +317,7 @@ export default function PromptMentionEditor({
   const insertTempImageMention = useCallback((asset) => {
     if (!editor) return;
     const nextIndex = tempImagePathsRef.current.length + 1;
-    const label = `分镜图${nextIndex}`;
+    const label = `图片${nextIndex}`;
     editor.chain().focus().insertContent({
       type: 'mention',
       attrs: {

@@ -279,7 +279,7 @@ const MaterialMentionPicker = React.forwardRef(function MaterialMentionPicker(
 
         {/* 底部说明 */}
         <div className="mmp-bottom-hint">
-          支持 @具体图片、@具体音频、@分镜图；未命中 @ 引用不会自动附加素材
+          支持 @具体图片、@具体音频、@图片；未命中 @ 引用不会自动附加素材
         </div>
       </div>
 

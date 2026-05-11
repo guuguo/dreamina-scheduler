@@ -401,6 +401,8 @@ fn concurrency_limit_silent_fail_policy() {
         ai_model_configs: SchedulerSettings::default().ai_model_configs,
         active_ai_model_id: SchedulerSettings::default().active_ai_model_id,
         prevent_sleep: true,
+        image_model_configs: SchedulerSettings::default().image_model_configs,
+        active_image_model_id: SchedulerSettings::default().active_image_model_id,
         image_model_config: SchedulerSettings::default().image_model_config,
     };
     let classified = classify_dreamina_error(
@@ -1840,6 +1842,44 @@ fn restart_recovery_clears_legacy_query_interrupt_from_error_detail() {
         "旧数据中的'应用重启，查询中断'应被清理，got: {:?}",
         rec.error_detail
     );
+}
+
+#[test]
+fn automatic_query_fails_after_five_minutes_without_remote_queue_info() {
+    let mut data = default_data();
+    let mut task = make_querying_task_with_record("task-stale-local", "sub-local-only");
+    task.submitted_at = Some((Utc::now() - Duration::minutes(6)).to_rfc3339());
+    task.consecutive_no_result_queries = 3;
+    data.tasks.push(task);
+
+    let result = query_task_submit_id_once_with_runner(
+        &mut data,
+        "task-stale-local",
+        "sub-local-only",
+        |_| {
+            Ok((
+                r#"{"submit_id":"sub-local-only","prompt":"测试","logid":"log-1","gen_status":"querying"}"#
+                    .to_string(),
+                String::new(),
+            ))
+        },
+    )
+    .expect("stale local-only query should be handled");
+
+    assert_eq!(result.status, "failed");
+    assert_eq!(result.consecutive_no_result_queries, 0);
+    assert!(
+        result.last_error.contains("未返回远端队列信息"),
+        "unexpected error: {}",
+        result.last_error
+    );
+    let record = result
+        .execution_records
+        .iter()
+        .find(|r| r.submit_id == "sub-local-only")
+        .expect("record exists");
+    assert_eq!(record.status, "failed");
+    assert!(!record.finished_at.is_empty());
 }
 
 // ── T001/T003: 指定 submit_id 查询不污染其他执行记录 ─────────────────────────────

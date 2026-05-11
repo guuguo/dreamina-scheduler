@@ -5,6 +5,7 @@ import {
   TASK_PROMPT_MAX_LENGTH,
   applyCreateTaskPreset,
   applyPromptMentionsToTaskForm,
+  buildSaveTaskDraftButtonState,
   canApplyCreateTaskPreset,
   canSaveTaskDraft,
   canSubmitCreateTask,
@@ -46,7 +47,7 @@ test('canApplyCreateTaskPreset is only true for an empty new task form', () => {
 
 test('applyCreateTaskPreset writes preset prompt and concrete @material bindings', () => {
   const mentionItems = [
-    { key: 'temp:tmp-3', label: '分镜图3', type: 'temp_image', assetId: 'tmp-3' },
+    { key: 'temp:tmp-3', label: '图片3', type: 'temp_image', assetId: 'tmp-3' },
     { key: 'img:chef', label: '女主厨师服', type: 'image', roleId: 'role-hero', assetId: 'img-chef' },
     { key: 'aud:hero', label: '女主女主人声音', type: 'audio', roleId: 'role-hero', assetId: 'aud-hero' },
     { key: 'aud:cowcat', label: '黑白猫和灰猫奶牛猫声音', type: 'audio', roleId: 'role-cat', assetId: 'aud-cowcat' },
@@ -64,13 +65,13 @@ test('applyCreateTaskPreset writes preset prompt and concrete @material bindings
 
 test('applyPromptMentionsToTaskForm fills bindings from highlighted prompt mentions', () => {
   const mentionItems = [
-    { key: 'temp:tmp-1', label: '分镜图1', type: 'temp_image', assetId: 'tmp-1' },
+    { key: 'temp:tmp-1', label: '图片1', type: 'temp_image', assetId: 'tmp-1' },
     { key: 'img:chef', label: '女主厨师服', type: 'image', roleId: 'role-hero', assetId: 'img-chef' },
     { key: 'aud:hero', label: '女主女主人声音', type: 'audio', roleId: 'role-hero', assetId: 'aud-hero' },
   ];
   const form = {
     ...createEmptyTaskForm(),
-    prompt: '根据分镜图 @分镜图1 女主是 @女主厨师服 声音 @女主女主人声音',
+    prompt: '根据图片 @图片1 女主是 @女主厨师服 声音 @女主女主人声音',
     image_asset_ids: ['tmp-1'],
     temp_image_asset_ids: ['tmp-1'],
     temp_image_paths: ['/tmp/shot.png'],
@@ -88,14 +89,14 @@ test('applyPromptMentionsToTaskForm fills bindings from highlighted prompt menti
 test('applyPromptMentionsToTaskForm removes stale prompt-derived media but keeps temp images', () => {
   const form = {
     ...createEmptyTaskForm(),
-    prompt: '只保留临时图 @分镜图1',
+    prompt: '只保留临时图 @图片1',
     image_asset_ids: ['tmp-1', 'old-img'],
     audio_asset_ids: ['old-aud'],
     temp_image_asset_ids: ['tmp-1'],
     temp_image_paths: ['/tmp/shot.png'],
   };
   const mentionItems = [
-    { key: 'temp:tmp-1', label: '分镜图1', type: 'temp_image', assetId: 'tmp-1' },
+    { key: 'temp:tmp-1', label: '图片1', type: 'temp_image', assetId: 'tmp-1' },
   ];
 
   const next = applyPromptMentionsToTaskForm(form, mentionItems);
@@ -110,6 +111,36 @@ test('canSaveTaskDraft allows saving in-progress text, roles, image, or audio re
   assert.equal(canSaveTaskDraft({ prompt: '', role_ids: ['role-1'], image_asset_ids: [], audio_asset_ids: [] }), true);
   assert.equal(canSaveTaskDraft({ prompt: '', role_ids: [], image_asset_ids: ['img-1'], audio_asset_ids: [] }), true);
   assert.equal(canSaveTaskDraft({ prompt: '', role_ids: [], image_asset_ids: [], audio_asset_ids: ['aud-1'] }), true);
+});
+
+test('buildSaveTaskDraftButtonState shows title generation while saving untitled task', () => {
+  assert.deepEqual(
+    buildSaveTaskDraftButtonState({
+      canSaveDraft: true,
+      isEditingTask: false,
+      savingTaskDraft: true,
+      savingTaskDraftPhase: 'title',
+    }),
+    { disabled: true, icon: 'loader', label: '生成标题中…' },
+  );
+  assert.deepEqual(
+    buildSaveTaskDraftButtonState({
+      canSaveDraft: true,
+      isEditingTask: true,
+      savingTaskDraft: true,
+      savingTaskDraftPhase: 'saving',
+    }),
+    { disabled: true, icon: 'loader', label: '保存中…' },
+  );
+  assert.deepEqual(
+    buildSaveTaskDraftButtonState({
+      canSaveDraft: true,
+      isEditingTask: false,
+      savingTaskDraft: false,
+      savingTaskDraftPhase: '',
+    }),
+    { disabled: false, icon: 'plus', label: '保存任务' },
+  );
 });
 
 test('getRoleEditorMedia isolates create mode from the previously selected role media', () => {

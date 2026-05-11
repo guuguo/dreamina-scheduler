@@ -9,6 +9,10 @@ import {
   resolveRemoveMediaTarget,
   buildTaskFormFromTaskForDuplicate,
   buildTaskFormFromTaskForEdit,
+  normalizeImageModelSettingsForm,
+  patchImageModelConfig,
+  mergeSettingsFormOnStateRefresh,
+  shouldRefreshStateAfterSchedulerTick,
 } from './app-logic.js';
 
 // ─── getRoleMedia ───
@@ -49,6 +53,80 @@ test('getRoleMedia returns empty for null role', () => {
   const media = getRoleMedia(null, new Map());
   assert.equal(media.images.length, 0);
   assert.equal(media.audios.length, 0);
+});
+
+test('patchImageModelConfig keeps newly added image model when clearing fields', () => {
+  const legacyForm = {
+    image_model_config: {
+      base_url: 'https://api.example/v1',
+      api_key: 'legacy-key',
+      model: 'gpt-image-1',
+    },
+  };
+  const added = {
+    id: 'image-openai-new',
+    name: '图片模型 2',
+    base_url: 'https://api.openai.com/v1',
+    api_key: '',
+    model: 'gpt-image-1',
+  };
+  const normalized = normalizeImageModelSettingsForm({
+    ...legacyForm,
+    image_model_configs: [
+      ...normalizeImageModelSettingsForm(legacyForm).image_model_configs,
+      added,
+    ],
+    active_image_model_id: added.id,
+    image_model_config: added,
+  });
+
+  const afterClearingName = patchImageModelConfig(normalized, 1, { name: '' });
+  const afterClearingModel = patchImageModelConfig(afterClearingName, 1, { model: '' });
+
+  assert.equal(afterClearingModel.image_model_configs.length, 2);
+  assert.equal(afterClearingModel.active_image_model_id, added.id);
+  assert.equal(afterClearingModel.image_model_configs[1].id, added.id);
+  assert.equal(afterClearingModel.image_model_configs[1].name, '');
+  assert.equal(afterClearingModel.image_model_configs[1].model, '');
+  assert.equal(afterClearingModel.image_model_config.id, added.id);
+});
+
+test('mergeSettingsFormOnStateRefresh preserves dirty settings draft while settings page is open', () => {
+  const current = {
+    image_model_configs: [
+      { id: 'saved', name: '已保存', base_url: 'https://api.example/v1', api_key: '', model: 'gpt-image-1' },
+      { id: 'new-local', name: '', base_url: 'https://api.openai.com/v1', api_key: '', model: '' },
+    ],
+    active_image_model_id: 'new-local',
+  };
+  const incoming = {
+    image_model_configs: [
+      { id: 'saved', name: '已保存', base_url: 'https://api.example/v1', api_key: '', model: 'gpt-image-1' },
+    ],
+    active_image_model_id: 'saved',
+  };
+
+  const merged = mergeSettingsFormOnStateRefresh({
+    activeView: 'settings',
+    settingsDirty: true,
+    currentSettingsForm: current,
+    incomingSettings: incoming,
+    emptySettings: incoming,
+  });
+
+  assert.equal(merged.image_model_configs.length, 2);
+  assert.equal(merged.active_image_model_id, 'new-local');
+});
+
+test('shouldRefreshStateAfterSchedulerTick refreshes only live status pages', () => {
+  assert.equal(shouldRefreshStateAfterSchedulerTick({ activeView: 'dashboard' }), true);
+  assert.equal(shouldRefreshStateAfterSchedulerTick({ activeView: 'queue' }), true);
+  assert.equal(shouldRefreshStateAfterSchedulerTick({ activeView: 'logs' }), true);
+  assert.equal(shouldRefreshStateAfterSchedulerTick({ activeView: 'imagegen' }), true);
+  assert.equal(shouldRefreshStateAfterSchedulerTick({ activeView: 'roles', roleEditor: null }), true);
+  assert.equal(shouldRefreshStateAfterSchedulerTick({ activeView: 'roles', roleEditor: { mode: 'edit' } }), false);
+  assert.equal(shouldRefreshStateAfterSchedulerTick({ activeView: 'create' }), false);
+  assert.equal(shouldRefreshStateAfterSchedulerTick({ activeView: 'settings' }), false);
 });
 
 // ─── resolveDropTarget ─── 历史高频 bug：角色串素材
@@ -131,7 +209,7 @@ test('removing temp image with missing asset id still removes from paths', () =>
 
 test('editing a draft restores persisted temp image assets into temp preview fields', () => {
   const task = {
-    prompt: '@分镜图1 继续编辑',
+    prompt: '@图片1 继续编辑',
     image_asset_ids: ['temp-1'],
     audio_asset_ids: [],
     role_ids: [],
@@ -152,6 +230,28 @@ test('editing a draft restores persisted temp image assets into temp preview fie
   assert.deepEqual(form.image_asset_ids, ['temp-1']);
 });
 
+test('editing a draft infers temp image assets from @image mention labels', () => {
+  const task = {
+    prompt: '@图片1 继续编辑',
+    image_asset_ids: ['temp-1'],
+    audio_asset_ids: [],
+    role_ids: [],
+    manual_mention_ids: [],
+    auto_match_roles: true,
+    temp_image_asset_ids: [],
+    temp_image_paths: [],
+    params: { model_version: 'seedance2.0', ratio: '9:16', duration: 5, video_resolution: '720p' },
+  };
+  const assetById = new Map([
+    ['temp-1', { id: 'temp-1', kind: 'image', stored_path: '/cache/temp-1.png' }],
+  ]);
+
+  const form = buildTaskFormFromTaskForEdit(task, assetById);
+
+  assert.deepEqual(form.temp_image_asset_ids, ['temp-1']);
+  assert.deepEqual(form.temp_image_paths, ['/cache/temp-1.png']);
+});
+
 test('editing an older task without duration falls back to 15 seconds', () => {
   const form = buildTaskFormFromTaskForEdit({
     prompt: '旧草稿',
@@ -163,7 +263,7 @@ test('editing an older task without duration falls back to 15 seconds', () => {
 
 test('duplicating a task creates a new unscheduled draft form with copied content', () => {
   const task = {
-    prompt: '@分镜图1 生成视频',
+    prompt: '@图片1 生成视频',
     image_asset_ids: ['temp-1', 'img-1'],
     audio_asset_ids: ['aud-1'],
     role_ids: ['role-1'],

@@ -1,7 +1,8 @@
 use dreamina_scheduler_lib::{
     build_ai_title_request, build_multimodal2video_args, classify_dreamina_error,
-    extract_generated_task_title, format_ai_model_test_log, parse_credit_info, parse_submit_output,
-    resolve_task_inputs, sanitize_generated_task_title, AiModelConfig, Asset, AssetKind,
+    extract_generated_task_title, format_ai_model_test_log, format_image_model_settings_log,
+    parse_credit_info, parse_imagegen_json_response, parse_submit_output, resolve_task_inputs,
+    sanitize_generated_task_title, AiModelConfig, Asset, AssetKind, ImageModelConfig,
     ConcurrencyLimitPolicy, DreaminaErrorKind, Role, SchedulerSettings, TaskDraft, VideoParams,
 };
 
@@ -19,6 +20,53 @@ fn image_asset(id: &str, name: &str, path: &str) -> Asset {
         duration_seconds: None,
         created_at: String::new(),
     }
+}
+
+#[test]
+fn image_model_settings_log_summarizes_active_config_without_secret() {
+    let settings = SchedulerSettings {
+        image_model_configs: vec![
+            ImageModelConfig {
+                id: "old".to_string(),
+                name: "旧供应商".to_string(),
+                base_url: "https://old.example/v1".to_string(),
+                api_key: "old-secret".to_string(),
+                model: "old-image".to_string(),
+            },
+            ImageModelConfig {
+                id: "new".to_string(),
+                name: "新供应商".to_string(),
+                base_url: "https://new.example/v1".to_string(),
+                api_key: "new-secret".to_string(),
+                model: "new-image".to_string(),
+            },
+        ],
+        active_image_model_id: "new".to_string(),
+        image_model_config: None,
+        ..SchedulerSettings::default()
+    };
+
+    let log = format_image_model_settings_log(&settings);
+
+    assert!(log.contains("图片模型数量=2"));
+    assert!(log.contains("active_image_model_id=new"));
+    assert!(log.contains("当前图片模型=新供应商 / new-image"));
+    assert!(log.contains("base_url=https://new.example/v1"));
+    assert!(log.contains("api_key=已填写"));
+    assert!(!log.contains("new-secret"));
+}
+
+#[test]
+fn parse_imagegen_json_response_reports_html_admin_page() {
+    let err = parse_imagegen_json_response(
+        "<!doctype html><html lang=\"zh\"><head><title>New API</title></head></html>",
+        "https://model.indata.cc/v2/images/generations",
+    )
+    .expect_err("html response should not parse as image generation json");
+
+    assert!(err.contains("图片生成接口返回 HTML 页面"));
+    assert!(err.contains("https://model.indata.cc/v2/images/generations"));
+    assert!(err.contains("Base URL"));
 }
 
 fn audio_asset(id: &str, name: &str, path: &str) -> Asset {
@@ -456,6 +504,8 @@ fn classifies_concurrency_limit_for_silent_retry_policy() {
         ai_model_configs: SchedulerSettings::default().ai_model_configs,
         active_ai_model_id: SchedulerSettings::default().active_ai_model_id,
         prevent_sleep: true,
+        image_model_configs: SchedulerSettings::default().image_model_configs,
+        active_image_model_id: SchedulerSettings::default().active_image_model_id,
         image_model_config: SchedulerSettings::default().image_model_config,
     };
 

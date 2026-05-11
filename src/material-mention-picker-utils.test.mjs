@@ -13,7 +13,7 @@ const sampleItems = [
   { key: 'img:a1', label: '女主日常服', type: 'image', roleId: 'r1', roleName: '女主', assetId: 'a1', assetName: '日常服', storedPath: '/a/1.jpg' },
   { key: 'img:a2', label: '女主厨师服', type: 'image', roleId: 'r1', roleName: '女主', assetId: 'a2', assetName: '厨师服', storedPath: '/a/2.jpg' },
   { key: 'aud:b1', label: '女主温柔音色', type: 'audio', roleId: 'r1', roleName: '女主', assetId: 'b1', assetName: '温柔音色', storedPath: '/b/1.mp3', duration_seconds: 5 },
-  { key: 'temp:c1', label: '分镜图1', type: 'temp_image', assetId: 'c1', storedPath: '/c/1.jpg' },
+  { key: 'temp:c1', label: '图片1', type: 'temp_image', assetId: 'c1', storedPath: '/c/1.jpg' },
 ];
 
 // ── normalizeMentionItems ──────────────────────────────────────────────────
