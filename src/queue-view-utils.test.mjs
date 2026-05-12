@@ -336,6 +336,20 @@ test('getTaskHitResources: does not mark role image as temp when temp ids contai
   ]);
 });
 
+test('getTaskHitResources: marks tagged temp image as temp even when task temp ids are missing', () => {
+  const task = makeTask({
+    image_asset_ids: ['img-temp'],
+    temp_image_asset_ids: [],
+  });
+  const assets = new Map([
+    ['img-temp', { id: 'img-temp', kind: 'image', name: '粘贴图片', tags: ['temp_image'] }],
+  ]);
+
+  assert.deepEqual(getTaskHitResources(task, assets), [
+    { type: 'image', displayType: 'temp_image', label: '临时参考图', asset: assets.get('img-temp') },
+  ]);
+});
+
 test('getCommandPreviewPresentation: command preview is shown as modal entry', () => {
   assert.deepEqual(getCommandPreviewPresentation('multimodal2video'), {
     hasCommand: true,

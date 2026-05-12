@@ -30,6 +30,7 @@ import {
   IMAGEGEN_MAX_REFERENCES,
 } from './imagegen-utils.js';
 import PromptMentionEditor from './components/PromptMentionEditor.jsx';
+import { applyMentionRefsToTaskForm } from './prompt-editor-utils.js';
 import {
   deriveCurrentExecutionRecord,
   deriveCurrentQueryRecords,
@@ -1278,6 +1279,7 @@ function CreateTaskView({ state, assetById, taskForm, setTaskForm, setActiveView
         sameStringArray(current.role_ids, next.role_ids)
         && sameStringArray(current.manual_mention_ids, next.manual_mention_ids)
         && sameStringArray(current.image_asset_ids, next.image_asset_ids)
+        && sameStringArray(current.temp_image_asset_ids, next.temp_image_asset_ids)
         && sameStringArray(current.audio_asset_ids, next.audio_asset_ids)
       ) {
         return current;
@@ -1290,17 +1292,7 @@ function CreateTaskView({ state, assetById, taskForm, setTaskForm, setActiveView
   // Preserves role_ids added via role picker by only overwriting the mention-derived subset.
   const handleEditorUpdate = useCallback((plainText, refs) => {
     setTaskForm((current) => {
-      const nonMentionRoleIds = (current.role_ids || []).filter(
-        (id) => !(current.manual_mention_ids || []).includes(id)
-      );
-      return {
-        ...current,
-        prompt: plainText,
-        role_ids: uniqueValues([...nonMentionRoleIds, ...refs.roleIds]),
-        manual_mention_ids: refs.roleIds,
-        image_asset_ids: uniqueValues([...refs.imageAssetIds, ...(current.temp_image_asset_ids || [])]),
-        audio_asset_ids: refs.audioAssetIds,
-      };
+      return applyMentionRefsToTaskForm({ ...current, prompt: plainText }, refs);
     });
   }, []);
 

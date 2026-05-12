@@ -3431,6 +3431,12 @@ fn build_mention_asset_index(
         if let Some(asset) = asset_by_id.get(asset_id.as_str()) {
             insert_mention_label(
                 &mut index,
+                format!("图片{}", idx + 1),
+                asset.kind.clone(),
+                asset.id.clone(),
+            );
+            insert_mention_label(
+                &mut index,
                 format!("分镜图{}", idx + 1),
                 asset.kind.clone(),
                 asset.id.clone(),
@@ -3488,13 +3494,15 @@ fn resolve_storyboard_fallback_candidate(
     asset_by_id: &HashMap<&str, &Asset>,
     current_image_asset_ids: &[String],
 ) -> Option<MentionAssetCandidate> {
-    if !is_storyboard_mention(mention) {
-        return None;
-    }
+    let requested_index = storyboard_mention_index(mention)?;
     let storyboard_asset_ids = storyboard_asset_ids_for_mentions(task, asset_by_id);
     let asset_id = storyboard_asset_ids
-        .iter()
-        .find(|id| !current_image_asset_ids.contains(*id))
+        .get(requested_index.saturating_sub(1))
+        .or_else(|| {
+            storyboard_asset_ids
+                .iter()
+                .find(|id| !current_image_asset_ids.contains(*id))
+        })
         .or_else(|| storyboard_asset_ids.first())?;
     let asset = asset_by_id.get(asset_id.as_str())?;
     Some(MentionAssetCandidate {
@@ -3503,9 +3511,13 @@ fn resolve_storyboard_fallback_candidate(
     })
 }
 
-fn is_storyboard_mention(mention: &str) -> bool {
-    let suffix = mention.strip_prefix("分镜图");
-    matches!(suffix, Some(value) if !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit()))
+fn storyboard_mention_index(mention: &str) -> Option<usize> {
+    ["分镜图", "图片"]
+        .iter()
+        .find_map(|prefix| mention.strip_prefix(prefix))
+        .filter(|value| !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit()))
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
 }
 
 fn is_temporary_image_asset(asset: &Asset) -> bool {

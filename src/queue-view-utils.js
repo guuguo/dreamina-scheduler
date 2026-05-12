@@ -142,11 +142,10 @@ export function getTaskResultItems(task) {
 export function getTaskHitResources(task, assetById) {
   if (!task || !assetById) return [];
   const resources = [];
-  const tempImageIds = new Set(task.temp_image_asset_ids || []);
   for (const id of task.image_asset_ids || []) {
     const asset = assetById.get(id);
     if (asset) {
-      const isTempImage = tempImageIds.has(id) && isTemporaryImageAsset(asset);
+      const isTempImage = isTemporaryImageAsset(asset);
       resources.push({
         type: 'image',
         displayType: isTempImage ? 'temp_image' : 'role_image',

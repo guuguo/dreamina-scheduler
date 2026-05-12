@@ -2,8 +2,8 @@ use dreamina_scheduler_lib::{
     build_ai_title_request, build_multimodal2video_args, classify_dreamina_error,
     extract_generated_task_title, format_ai_model_test_log, format_image_model_settings_log,
     parse_credit_info, parse_imagegen_json_response, parse_submit_output, resolve_task_inputs,
-    sanitize_generated_task_title, AiModelConfig, Asset, AssetKind, ImageModelConfig,
-    ConcurrencyLimitPolicy, DreaminaErrorKind, Role, SchedulerSettings, TaskDraft, VideoParams,
+    sanitize_generated_task_title, AiModelConfig, Asset, AssetKind, ConcurrencyLimitPolicy,
+    DreaminaErrorKind, ImageModelConfig, Role, SchedulerSettings, TaskDraft, VideoParams,
 };
 
 fn image_asset(id: &str, name: &str, path: &str) -> Asset {
@@ -389,6 +389,39 @@ fn storyboard_mentions_use_temp_images_not_role_image_order() {
         vec!["storyboard-temp", "hero-home", "cat-ref"]
     );
     assert!(prompt_arg.contains("根据分镜图 @图1 女主是 @图2，猫猫是 @图3"));
+}
+
+#[test]
+fn picture_number_mentions_use_temp_images_as_command_inputs() {
+    let task = TaskDraft {
+        title: "temp picture mention".to_string(),
+        prompt: "根据临时参考图 @图片1 生成挖掘机动画".to_string(),
+        image_asset_ids: vec!["temp-digger".to_string()],
+        audio_asset_ids: vec![],
+        role_ids: vec![],
+        manual_mention_ids: vec![],
+        auto_match_roles: false,
+        params: VideoParams::default(),
+        scheduled_at: None,
+        temp_image_asset_ids: vec!["temp-digger".to_string()],
+        temp_image_paths: vec!["/tmp/digger.png".to_string()],
+    };
+    let assets = vec![image_asset(
+        "temp-digger",
+        "小挖机迪奇参考图",
+        "/tmp/digger.png",
+    )];
+
+    let resolved = resolve_task_inputs(&task, &assets, &[]).expect("inputs resolve");
+    let args = build_multimodal2video_args(&task, &resolved).expect("args build");
+    let prompt_arg = args
+        .iter()
+        .find(|arg| arg.starts_with("--prompt="))
+        .expect("prompt arg");
+
+    assert_eq!(resolved.image_asset_ids, vec!["temp-digger"]);
+    assert!(args.iter().any(|arg| arg == "--image=/tmp/digger.png"));
+    assert!(prompt_arg.contains("根据临时参考图 @图1 生成挖掘机动画"));
 }
 
 #[test]

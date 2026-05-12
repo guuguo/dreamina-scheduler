@@ -109,6 +109,7 @@ export function applyMentionRefsToTaskForm(form, refs) {
     role_ids: uniqueInOrder([...nonMentionRoleIds, ...refs.roleIds]),
     manual_mention_ids: refs.roleIds,
     image_asset_ids: uniqueInOrder([...refs.imageAssetIds, ...(form.temp_image_asset_ids || [])]),
+    temp_image_asset_ids: uniqueInOrder([...(form.temp_image_asset_ids || []), ...(refs.tempImageAssetIds || [])]),
     audio_asset_ids: refs.audioAssetIds,
   };
 }

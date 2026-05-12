@@ -139,6 +139,21 @@ test('applyMentionRefsToTaskForm writes image_asset_ids including temp_image_ass
   assert.deepEqual(result.image_asset_ids, ['img-1', 'tmp-1']);
 });
 
+test('applyMentionRefsToTaskForm writes temp_image_asset_ids from temp image refs', () => {
+  const form = {
+    prompt: '@粘贴图片',
+    role_ids: [],
+    manual_mention_ids: [],
+    image_asset_ids: [],
+    audio_asset_ids: [],
+    temp_image_asset_ids: [],
+  };
+  const refs = { roleIds: [], imageAssetIds: ['tmp-1'], audioAssetIds: [], tempImageAssetIds: ['tmp-1'] };
+  const result = applyMentionRefsToTaskForm(form, refs);
+  assert.deepEqual(result.image_asset_ids, ['tmp-1']);
+  assert.deepEqual(result.temp_image_asset_ids, ['tmp-1']);
+});
+
 test('applyMentionRefsToTaskForm removes stale mention-derived role when its mention is deleted', () => {
   const form = {
     prompt: '',
