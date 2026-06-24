@@ -5327,25 +5327,61 @@ impl Drop for StoreQueueLockGuard {
     }
 }
 
+/// queue.lock 陈旧阈值：超过此时长仍存在的锁视为持有者非正常退出遗留，可回收。
+/// 取 600s，明显大于单步 CLI 合法最大持锁（IMAGE_SUBMIT_TIMEOUT_SECS=300），避免误抢正在干活的锁。
+const QUEUE_LOCK_STALE_SECS: i64 = 600;
+
+/// 根据锁文件内容判断是否陈旧：created_at 距 now 超过阈值，或无法解析 created_at（旧格式/损坏），
+/// 均视为陈旧（可被回收）。纯函数，便于测试。
+fn lock_is_stale(content: &str, now: DateTime<Utc>, stale_secs: i64) -> bool {
+    for line in content.lines() {
+        if let Some(ts) = line.strip_prefix("created_at=") {
+            if let Ok(created) = DateTime::parse_from_rfc3339(ts.trim()) {
+                return now
+                    .signed_duration_since(created.with_timezone(&Utc))
+                    .num_seconds()
+                    >= stale_secs;
+            }
+        }
+    }
+    true
+}
+
+fn create_store_queue_lock(lock_path: &Path, origin: &str) -> Option<StoreQueueLockGuard> {
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(lock_path)
+    {
+        Ok(mut file) => {
+            let _ = writeln!(file, "origin={origin}");
+            let _ = writeln!(file, "pid={}", std::process::id());
+            let _ = writeln!(file, "created_at={}", now_rfc3339());
+            Some(StoreQueueLockGuard {
+                path: lock_path.to_path_buf(),
+            })
+        }
+        Err(_) => None,
+    }
+}
+
 fn try_acquire_store_queue_lock(store: &AppStore, origin: &str) -> Option<StoreQueueLockGuard> {
     let lock_path = store.root_dir.join("queue.lock");
     let parent = lock_path.parent()?;
     if fs::create_dir_all(parent).is_err() {
         return None;
     }
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock_path)
-    {
-        Ok(mut file) => {
-            let _ = writeln!(file, "origin={origin}");
-            let _ = writeln!(file, "pid={}", std::process::id());
-            let _ = writeln!(file, "created_at={}", now_rfc3339());
-            Some(StoreQueueLockGuard { path: lock_path })
-        }
-        Err(_) => None,
+    if let Some(guard) = create_store_queue_lock(&lock_path, origin) {
+        return Some(guard);
     }
+    // 已存在：若是陈旧锁（持有者崩溃/强退/被 kill 遗留），回收后重试一次，避免永久卡死调度。
+    if let Ok(content) = fs::read_to_string(&lock_path) {
+        if lock_is_stale(&content, Utc::now(), QUEUE_LOCK_STALE_SECS) {
+            let _ = fs::remove_file(&lock_path);
+            return create_store_queue_lock(&lock_path, origin);
+        }
+    }
+    None
 }
 
 /// 每条执行记录保留的 query_records（自动轮询历史）上限。
@@ -8147,6 +8183,108 @@ mod tests {
         assert_ne!(s1, s2, "写入后签名应变化");
         // 不写入时连续取签名应稳定
         assert_eq!(store.state_signature(), s2, "空闲时签名应稳定不变");
+    }
+
+    // ── lock_is_stale（陈旧锁回收）─────────────────────────────────────────
+
+    #[test]
+    fn lock_is_stale_when_created_at_exceeds_threshold() {
+        let now = DateTime::parse_from_rfc3339("2026-06-24T23:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // 11 分钟前创建，阈值 600s → 陈旧
+        let content = "origin=background\npid=584\ncreated_at=2026-06-24T23:19:00Z\n";
+        assert!(lock_is_stale(content, now, 600));
+    }
+
+    #[test]
+    fn lock_is_fresh_when_created_recently() {
+        let now = DateTime::parse_from_rfc3339("2026-06-24T23:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // 30 秒前创建 → 未陈旧
+        let content = "origin=background\npid=584\ncreated_at=2026-06-24T23:29:30Z\n";
+        assert!(!lock_is_stale(content, now, 600));
+    }
+
+    #[test]
+    fn lock_is_stale_when_created_at_unparseable() {
+        let now = DateTime::parse_from_rfc3339("2026-06-24T23:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // 无 created_at（旧格式/损坏）→ 保守视为陈旧，可被回收
+        assert!(lock_is_stale("origin=background\npid=1\n", now, 600));
+    }
+
+    #[test]
+    fn try_acquire_reclaims_stale_lock_file() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = AppStore::load(temp.path().to_path_buf());
+        let lock_path = temp.path().join("queue.lock");
+        // 写入陈旧锁（created_at 远早于现在，模拟崩溃/被 kill 遗留）
+        std::fs::write(
+            &lock_path,
+            "origin=old\npid=99999\ncreated_at=2000-01-01T00:00:00Z\n",
+        )
+        .expect("write stale lock");
+        let guard = try_acquire_store_queue_lock(&store, "background");
+        assert!(guard.is_some(), "应回收陈旧锁并获取成功");
+        drop(guard);
+        assert!(!lock_path.exists(), "释放后锁文件应被删除");
+    }
+
+    #[test]
+    fn try_acquire_blocked_by_fresh_lock() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = AppStore::load(temp.path().to_path_buf());
+        let g1 = try_acquire_store_queue_lock(&store, "a");
+        assert!(g1.is_some(), "首次应获取成功");
+        let g2 = try_acquire_store_queue_lock(&store, "b");
+        assert!(g2.is_none(), "新鲜锁应阻塞第二次获取");
+    }
+
+    // process_queue_for_store_blocking 用进程级全局原子 PROCESS_QUEUE_RUNNING，
+    // 这些端到端测试串行执行以避免相互干扰。
+    static PQ_E2E_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn process_queue_recovers_from_stale_lock_end_to_end() {
+        let _serial = PQ_E2E_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = AppStore::load(temp.path().to_path_buf());
+        // 模拟崩溃/被 kill 的前一进程遗留的陈旧锁
+        let lock_path = temp.path().join("queue.lock");
+        std::fs::write(
+            &lock_path,
+            "origin=old\npid=99999\ncreated_at=2000-01-01T00:00:00Z\n",
+        )
+        .expect("write stale lock");
+        // 无到期任务：走 no_due_task 路径，不触发 CLI；但必须先经过真实的锁获取
+        let result = process_queue_for_store_blocking(&store, "test");
+        assert!(result.is_ok(), "应正常完成（回收陈旧锁后处理）");
+        assert!(
+            !lock_path.exists(),
+            "陈旧锁应被回收并在处理后释放，不残留——这正是导致调度卡死的故障路径"
+        );
+    }
+
+    #[test]
+    fn process_queue_skips_under_fresh_foreign_lock_end_to_end() {
+        let _serial = PQ_E2E_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = AppStore::load(temp.path().to_path_buf());
+        let lock_path = temp.path().join("queue.lock");
+        std::fs::write(
+            &lock_path,
+            format!("origin=other\npid=1\ncreated_at={}\n", now_rfc3339()),
+        )
+        .expect("write fresh lock");
+        let result = process_queue_for_store_blocking(&store, "test");
+        assert!(result.is_ok());
+        assert!(
+            lock_path.exists(),
+            "新鲜的外部锁不应被偷走（避免误抢正在干活的进程）"
+        );
     }
 
     // ── cap_execution_history（历史裁剪）───────────────────────────────────
