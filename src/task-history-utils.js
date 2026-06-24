@@ -4,6 +4,86 @@
  * 统一派生成 UI 可展示的历史列表。
  */
 
+const RETRY_ERROR_DETAILS = {
+  ConcurrencyLimit: '并发任务仍在生成中，已自动排队等待下次重试。',
+  Transient: '提交时遇到临时网络或平台错误，已自动排队等待下次重试。',
+};
+
+const FAILED_RETRY_ERROR_DETAILS = {
+  ConcurrencyLimit: '并发任务仍在生成中，已自动排队等待下次重试。',
+  Transient: '提交时遇到临时网络或平台错误，自动重试已达上限，已标记失败。',
+};
+
+function isConcurrencyError(errorKind, errorDetail) {
+  if (errorKind === 'ConcurrencyLimit') return true;
+  if (!errorDetail) return false;
+  return (
+    errorDetail.includes('ExceedConcurrencyLimit') ||
+    errorDetail.includes('ret=1310') ||
+    errorDetail.includes('并发')
+  );
+}
+
+function retryErrorKind(errorKind, errorDetail) {
+  if (isConcurrencyError(errorKind, errorDetail)) return 'ConcurrencyLimit';
+  if (errorKind === 'Transient') return 'Transient';
+  return '';
+}
+
+function compactRetryErrorDetail(errorKind, errorDetail) {
+  const kind = retryErrorKind(errorKind, errorDetail);
+  if (kind && RETRY_ERROR_DETAILS[kind]) return RETRY_ERROR_DETAILS[kind];
+  return errorDetail || '';
+}
+
+function compactSubmitErrorDetail(status, errorKind, errorDetail) {
+  const kind = retryErrorKind(errorKind, errorDetail);
+  if (!kind) return errorDetail || '';
+  if (status === 'failed') return FAILED_RETRY_ERROR_DETAILS[kind];
+  return RETRY_ERROR_DETAILS[kind];
+}
+
+function collapseRetryWaitRecords(items) {
+  const collapsed = [];
+  const retryIndexes = new Map();
+
+  for (const item of items) {
+    const canCollapse = ['retry_wait', 'failed'].includes(item.status);
+    const kind = canCollapse ? retryErrorKind(item.error_kind, item.error_detail) : '';
+    if (!kind) {
+      collapsed.push(item);
+      continue;
+    }
+
+    const key = `retry_wait:${kind}`;
+    const existingIndex = retryIndexes.get(key);
+    const compactItem = {
+      ...item,
+      error_kind: kind,
+      error_detail: compactSubmitErrorDetail(item.status, kind, item.error_detail),
+      retry_count: 1,
+    };
+
+    if (existingIndex === undefined) {
+      retryIndexes.set(key, collapsed.length);
+      collapsed.push(compactItem);
+      continue;
+    }
+
+    const existing = collapsed[existingIndex];
+    const useIncoming = (item.started_at || '') >= (existing.started_at || '');
+    const nextStatus = useIncoming ? item.status : existing.status;
+    collapsed[existingIndex] = {
+      ...(useIncoming ? compactItem : existing),
+      retry_count: Number(existing.retry_count || 1) + 1,
+      error_kind: kind,
+      error_detail: compactSubmitErrorDetail(nextStatus, kind, ''),
+    };
+  }
+
+  return collapsed;
+}
+
 /**
  * 从单条 task 派生出执行历史列表，最新在前。
  * @param {object} task - ScheduledTask
@@ -36,6 +116,7 @@ export function deriveTaskHistory(task) {
       });
     }
     // 最新在前
+    items.splice(0, items.length, ...collapseRetryWaitRecords(items));
     items.sort((a, b) => (b.started_at > a.started_at ? 1 : -1));
     return items;
   }
@@ -132,6 +213,7 @@ export function historyHasResults(historyItems) {
  * @param {number} index - 1-based
  */
 export function historyItemLabel(item, index) {
+  if (Number(item?.retry_count || 0) > 1) return `第 ${index} 次 · 自动重试 ${item.retry_count} 次`;
   if (item.submit_id) return `第 ${index} 次 · ${item.submit_id.slice(0, 8)}`;
   return `第 ${index} 次`;
 }

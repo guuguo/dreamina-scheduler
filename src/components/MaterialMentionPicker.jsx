@@ -1,5 +1,4 @@
 import React, { useState, useCallback, useMemo, useEffect, useRef } from 'react';
-import { convertFileSrc } from '@tauri-apps/api/core';
 import { Search, X, Play, Loader2, Check, Copy, Image as ImageIcon } from 'lucide-react';
 import {
   normalizeMentionItems,
@@ -10,6 +9,7 @@ import {
   CATEGORY_LABELS,
 } from '../material-mention-picker-utils.js';
 import { Waveform } from './media/Waveform.jsx';
+import { resolveMediaSrc } from '../media-src.js';
 
 const GRID_COLS = 5;
 
@@ -79,7 +79,7 @@ const MaterialMentionPicker = React.forwardRef(function MaterialMentionPicker(
     if (playingKey === item.key) { stopAudio(); return; }
     stopAudio();
     if (!item.storedPath) return;
-    const audio = new Audio(convertFileSrc(item.storedPath));
+    const audio = new Audio(resolveMediaSrc(item.storedPath));
     audio.onended = () => setPlayingKey(null);
     audio.onerror = () => setPlayingKey(null);
     audioRef.current = audio;
@@ -252,7 +252,7 @@ const MaterialMentionPicker = React.forwardRef(function MaterialMentionPicker(
                     <div className="mmp-img-thumb">
                       {item.storedPath ? (
                         <img
-                          src={convertFileSrc(item.storedPath)}
+                          src={resolveMediaSrc(item.storedPath)}
                           alt={item.label}
                           onError={(e) => { e.currentTarget.style.display = 'none'; }}
                         />
@@ -374,13 +374,13 @@ function DetailPanel({ item, isPlaying, onToggleAudio, onInsert, onPreviewImage 
         ) : (
           <div
             className="mmp-detail-img-preview"
-            onClick={() => item.storedPath ? onPreviewImage(convertFileSrc(item.storedPath)) : null}
+            onClick={() => item.storedPath ? onPreviewImage(resolveMediaSrc(item.storedPath)) : null}
             style={{ cursor: item.storedPath ? 'zoom-in' : 'default' }}
             title={item.storedPath ? '点击放大预览' : ''}
           >
             {item.storedPath ? (
               <img
-                src={convertFileSrc(item.storedPath)}
+                src={resolveMediaSrc(item.storedPath)}
                 alt={item.label}
                 onLoad={(e) => setImgSize({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })}
               />

@@ -32,6 +32,25 @@ test('buildMentionItems exposes role images, temp images, and audio assets', () 
   assert.ok(items.some((item) => item.key === 'temp:tmp-img-1' && item.label === '图片1'));
 });
 
+test('buildMentionItems keeps imported asset names mention-safe when source file had spaces', () => {
+  const spacedRole = {
+    id: 'role-car',
+    name: '威威',
+    aliases: [],
+    asset_ids: ['img-space'],
+  };
+  const spacedAssets = new Map([
+    ['img-space', { id: 'img-space', kind: 'image', name: 'main_shot', stored_path: '/tmp/main shot.png', source_path: '/tmp/main shot.png' }],
+  ]);
+
+  const items = buildMentionItems({ roles: [spacedRole], assetById: spacedAssets });
+
+  assert.ok(items.some((item) => item.key === 'img:img-space' && item.label === '威威main_shot'));
+  assert.deepEqual(collectPromptMentions('@威威main_shot', items), [
+    { text: '@威威main_shot', name: '威威main_shot', matched: true, type: 'image' },
+  ]);
+});
+
 test('applyMentionSelection binds selected image and audio assets into the task form', () => {
   const baseForm = {
     prompt: '@女',
@@ -189,4 +208,64 @@ test('pasting clipboard image inserts @image N', () => {
   });
   assert.ok(result.prompt.includes('@图片1'));
   assert.deepEqual(result.image_asset_ids, ['clip-1']);
+});
+
+test('temp_image mentions can use unique random labels without depending on ordinal names', () => {
+  const items = [
+    ...buildMentionItems({ tempImagePaths: ['/tmp/existing.png'], tempImageAssetIds: ['old-2'] }),
+    { key: 'temp:new-6d', label: '图片834271', type: 'temp_image', assetId: 'new-6d', storedPath: '/tmp/new.png' },
+  ];
+
+  const mentions = collectPromptMentions('@图片834271', items);
+  assert.deepEqual(mentions, [{ text: '@图片834271', name: '图片834271', matched: true, type: 'temp_image' }]);
+
+  const form = { prompt: '', image_asset_ids: [], audio_asset_ids: [], role_ids: [], manual_mention_ids: [] };
+  const result = applyMentionSelection({
+    form,
+    item: { label: '图片834271', type: 'temp_image', assetId: 'new-6d' },
+    atQuery: { start: 0, query: '' },
+  });
+
+  assert.ok(result.prompt.includes('@图片834271'));
+  assert.deepEqual(result.image_asset_ids, ['new-6d']);
+});
+
+test('historical clipboard temp images get unique mention labels instead of repeated 粘贴图片', () => {
+  const recentA = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+  const recentB = new Date(Date.now() - 1 * 60 * 60 * 1000).toISOString();
+  const items = buildMentionItems({
+    tempImagePaths: ['/tmp/current.png'],
+    tempImageAssetIds: ['current-1'],
+    assetById: new Map([
+      ['hist-a', { id: 'hist-a', kind: 'image', name: '粘贴图片', stored_path: '/tmp/hist-a.png', tags: ['temp_image'], created_at: recentA }],
+      ['hist-b', { id: 'hist-b', kind: 'image', name: '粘贴图片', stored_path: '/tmp/hist-b.png', tags: ['temp_image'], created_at: recentB }],
+    ]),
+  });
+
+  const tempItems = items.filter((item) => item.type === 'temp_image');
+  const labels = tempItems.map((item) => item.label);
+
+  assert.equal(labels[0], '图片1');
+  assert.equal(new Set(labels).size, labels.length);
+  assert.ok(labels.includes('图片hista'));
+  assert.ok(labels.includes('图片histb'));
+  assert.ok(!labels.includes('粘贴图片'));
+});
+
+test('historical clipboard temp image mention matches only its unique generated label', () => {
+  const recentA = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+  const recentB = new Date(Date.now() - 1 * 60 * 60 * 1000).toISOString();
+  const items = buildMentionItems({
+    assetById: new Map([
+      ['hist-a', { id: 'hist-a', kind: 'image', name: '粘贴图片', stored_path: '/tmp/hist-a.png', tags: ['temp_image'], created_at: recentA }],
+      ['hist-b', { id: 'hist-b', kind: 'image', name: '粘贴图片', stored_path: '/tmp/hist-b.png', tags: ['temp_image'], created_at: recentB }],
+    ]),
+  });
+
+  assert.deepEqual(collectPromptMentions('@图片hista', items), [
+    { text: '@图片hista', name: '图片hista', matched: true, type: 'temp_image' },
+  ]);
+  assert.deepEqual(collectPromptMentions('@粘贴图片', items), [
+    { text: '@粘贴图片', name: '粘贴图片', matched: false, type: 'unknown' },
+  ]);
 });

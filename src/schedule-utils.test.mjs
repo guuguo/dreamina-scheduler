@@ -40,6 +40,14 @@ test('buildBatchSchedulePlan: assigns incremental scheduled times by selected ta
   ]);
 });
 
+test('buildBatchSchedulePlan: defaults to continuous queue with the same start time', () => {
+  const startAt = new Date('2026-05-01T20:00:00+08:00').toISOString();
+  assert.deepEqual(buildBatchSchedulePlan(['task-1', 'task-2'], { startAt }), [
+    { taskId: 'task-1', scheduledAt: startAt },
+    { taskId: 'task-2', scheduledAt: startAt },
+  ]);
+});
+
 test('canScheduleTask: saved or finished tasks can be prepared for scheduled generation', () => {
   assert.equal(canScheduleTask({ status: 'draft' }), true);
   assert.equal(canScheduleTask({ status: 'queued' }), true);

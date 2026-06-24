@@ -1,9 +1,12 @@
 use dreamina_scheduler_lib::{
     build_ai_title_request, build_multimodal2video_args, classify_dreamina_error,
     extract_generated_task_title, format_ai_model_test_log, format_image_model_settings_log,
-    parse_credit_info, parse_imagegen_json_response, parse_submit_output, resolve_task_inputs,
-    sanitize_generated_task_title, AiModelConfig, Asset, AssetKind, ConcurrencyLimitPolicy,
-    DreaminaErrorKind, ImageModelConfig, Role, SchedulerSettings, TaskDraft, VideoParams,
+    parse_credit_info, parse_imagegen_json_response, parse_mcp_queue_videos_input,
+    parse_mcp_video_task_input, parse_submit_output, queue_mcp_video_task, queue_mcp_video_tasks,
+    resolve_task_inputs, sanitize_generated_task_title, AiModelConfig, AppData, AppStore, Asset,
+    AssetKind, ConcurrencyLimitPolicy, DreaminaErrorKind, ImageModelConfig, McpQueueVideosInput,
+    McpVideoTaskDefaults, McpVideoTaskInput, Role, ScheduledTask, SchedulerSettings, TaskDraft,
+    VideoParams,
 };
 
 fn image_asset(id: &str, name: &str, path: &str) -> Asset {
@@ -19,6 +22,7 @@ fn image_asset(id: &str, name: &str, path: &str) -> Asset {
         size_bytes: 100,
         duration_seconds: None,
         created_at: String::new(),
+        content_hash: None,
     }
 }
 
@@ -82,7 +86,329 @@ fn audio_asset(id: &str, name: &str, path: &str) -> Asset {
         size_bytes: 100,
         duration_seconds: Some(4.0),
         created_at: String::new(),
+        content_hash: None,
     }
+}
+
+fn persistence_test_task(title: &str) -> ScheduledTask {
+    ScheduledTask::from(TaskDraft {
+        title: title.to_string(),
+        prompt: format!("prompt {title}"),
+        image_asset_ids: vec![],
+        audio_asset_ids: vec![],
+        role_ids: vec![],
+        manual_mention_ids: vec![],
+        auto_match_roles: false,
+        params: VideoParams::default(),
+        scheduled_at: None,
+        temp_image_asset_ids: vec![],
+        temp_image_paths: vec![],
+    })
+}
+
+#[test]
+fn app_store_refreshes_disk_state_across_process_like_instances() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("store");
+    let store_a = AppStore::load(root.clone());
+    let store_b = AppStore::load(root.clone());
+
+    store_a
+        .mutate(|data| {
+            data.tasks.push(persistence_test_task("from mcp"));
+            Ok(())
+        })
+        .expect("store a writes task");
+
+    assert!(
+        store_b
+            .snapshot()
+            .tasks
+            .iter()
+            .any(|task| task.title == "from mcp"),
+        "stale store snapshots should reload tasks written by another process"
+    );
+
+    store_b
+        .mutate(|data| {
+            data.tasks.push(persistence_test_task("from app"));
+            Ok(())
+        })
+        .expect("store b writes task");
+
+    let reloaded = AppStore::load(root).snapshot();
+    assert!(reloaded.tasks.iter().any(|task| task.title == "from mcp"));
+    assert!(reloaded.tasks.iter().any(|task| task.title == "from app"));
+}
+
+#[test]
+fn mcp_queue_video_imports_direct_assets_and_maps_simple_params() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let source_dir = temp.path().join("source");
+    let assets_dir = temp.path().join("assets");
+    std::fs::create_dir_all(&source_dir).expect("create source dir");
+    let image_path = source_dir.join("hero.png");
+    let audio_path = source_dir.join("voice.mp3");
+    std::fs::write(&image_path, b"fake-png").expect("write image");
+    std::fs::write(&audio_path, b"fake-mp3").expect("write audio");
+    let start_at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    let mut data = AppData::default();
+
+    let queued = queue_mcp_video_task(
+        &mut data,
+        &assets_dir,
+        McpVideoTaskInput {
+            title: "MCP 测试".to_string(),
+            prompt: "生成一个镜头".to_string(),
+            image_paths: vec![image_path.to_string_lossy().to_string()],
+            audio_paths: vec![audio_path.to_string_lossy().to_string()],
+            start_at: Some(start_at.clone()),
+            orientation: Some("landscape".to_string()),
+            model: Some("fast".to_string()),
+            duration: Some(12),
+            video_resolution: Some("720p".to_string()),
+            planned_submit_count: Some(3),
+        },
+    )
+    .expect("queue mcp task");
+
+    assert_eq!(data.assets.len(), 2);
+    assert_eq!(data.tasks.len(), 1);
+    assert_eq!(queued.imported_assets.len(), 2);
+    assert_eq!(queued.task.status, "scheduled");
+    assert_eq!(queued.task.scheduled_at.as_deref(), Some(start_at.as_str()));
+    assert_eq!(queued.task.params.ratio, "16:9");
+    assert_eq!(queued.task.params.model_version, "seedance2.0fast");
+    assert_eq!(queued.task.params.duration, 12);
+    assert_eq!(queued.task.planned_submit_count, 3);
+    assert!(queued
+        .imported_assets
+        .iter()
+        .all(|asset| asset.tags.contains(&"mcp".to_string())));
+    assert!(queued
+        .task
+        .command_preview
+        .iter()
+        .any(|arg| arg.starts_with("--image=")));
+    assert!(queued
+        .task
+        .command_preview
+        .iter()
+        .any(|arg| arg.starts_with("--audio=")));
+}
+
+#[test]
+fn mcp_queue_video_resolves_numbered_image_and_audio_mentions() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let source_dir = temp.path().join("source");
+    let assets_dir = temp.path().join("assets");
+    std::fs::create_dir_all(&source_dir).expect("create source dir");
+    let storyboard_path = source_dir.join("act2-storyboard.png");
+    let character_path = source_dir.join("characters.png");
+    let audio_path = source_dir.join("narration.wav");
+    std::fs::write(&storyboard_path, b"fake-storyboard").expect("write storyboard");
+    std::fs::write(&character_path, b"fake-characters").expect("write characters");
+    std::fs::write(&audio_path, b"fake-audio").expect("write audio");
+    let mut data = AppData::default();
+
+    let queued = queue_mcp_video_task(
+        &mut data,
+        &assets_dir,
+        McpVideoTaskInput {
+            title: "第二幕".to_string(),
+            prompt: "参考分镜图 @图1 和角色设定图 @图2，旁白参考 @音频1".to_string(),
+            image_paths: vec![
+                storyboard_path.to_string_lossy().to_string(),
+                character_path.to_string_lossy().to_string(),
+            ],
+            audio_paths: vec![audio_path.to_string_lossy().to_string()],
+            orientation: Some("landscape".to_string()),
+            model: Some("standard".to_string()),
+            duration: Some(15),
+            video_resolution: Some("720p".to_string()),
+            planned_submit_count: Some(1),
+            ..McpVideoTaskInput::default()
+        },
+    )
+    .expect("numbered mentions should resolve to MCP imported assets");
+
+    let image_args = queued
+        .task
+        .command_preview
+        .iter()
+        .filter(|arg| arg.starts_with("--image="))
+        .count();
+    let audio_args = queued
+        .task
+        .command_preview
+        .iter()
+        .filter(|arg| arg.starts_with("--audio="))
+        .count();
+
+    assert_eq!(image_args, 2);
+    assert_eq!(audio_args, 1);
+    assert_eq!(
+        queued.task.image_asset_ids,
+        vec![
+            queued.imported_assets[0].id.clone(),
+            queued.imported_assets[1].id.clone()
+        ]
+    );
+    assert_eq!(
+        queued.task.audio_asset_ids,
+        vec![queued.imported_assets[2].id.clone()]
+    );
+}
+
+#[test]
+fn mcp_video_input_accepts_common_client_field_aliases() {
+    let input = parse_mcp_video_task_input(serde_json::json!({
+        "title": "字段别名测试",
+        "prompt": "测试 prompt",
+        "images": ["/tmp/角色设定图.png", "/tmp/第二幕 分镜图.png"],
+        "audioPaths": ["/tmp/旁白参考.wav"],
+        "startAt": "2026-06-22T12:00:00+08:00",
+        "videoResolution": "720p",
+        "plannedSubmitCount": 2
+    }))
+    .expect("mcp input aliases should deserialize");
+
+    assert_eq!(
+        input.image_paths,
+        vec!["/tmp/角色设定图.png", "/tmp/第二幕 分镜图.png"]
+    );
+    assert_eq!(input.audio_paths, vec!["/tmp/旁白参考.wav"]);
+    assert_eq!(input.start_at.as_deref(), Some("2026-06-22T12:00:00+08:00"));
+    assert_eq!(input.video_resolution.as_deref(), Some("720p"));
+    assert_eq!(input.planned_submit_count, Some(2));
+}
+
+#[test]
+fn mcp_queue_videos_accepts_batch_aliases() {
+    let input = parse_mcp_queue_videos_input(serde_json::json!({
+        "startAt": "2026-06-22T12:00:00+08:00",
+        "defaults": {
+            "aspectRatio": "landscape",
+            "plannedSubmitCount": 2
+        },
+        "tasks": [
+            {
+                "title": "第二幕",
+                "prompt": "只排第二幕",
+                "imagePaths": ["/tmp/act2_storyboard.png", "/tmp/characters.png"],
+                "audioPaths": ["/tmp/narration_ref.wav"]
+            }
+        ]
+    }))
+    .expect("batch aliases should deserialize");
+
+    assert_eq!(input.items.len(), 1);
+    assert_eq!(input.start_at.as_deref(), Some("2026-06-22T12:00:00+08:00"));
+    assert_eq!(input.defaults.orientation.as_deref(), Some("landscape"));
+    assert_eq!(input.defaults.planned_submit_count, Some(2));
+    assert_eq!(
+        input.items[0].image_paths,
+        vec!["/tmp/act2_storyboard.png", "/tmp/characters.png"]
+    );
+    assert_eq!(input.items[0].audio_paths, vec!["/tmp/narration_ref.wav"]);
+}
+
+#[test]
+fn mcp_video_input_accepts_object_and_single_path_shapes() {
+    let input = parse_mcp_video_task_input(serde_json::json!({
+        "title": "对象路径测试",
+        "prompt": "测试 prompt",
+        "image": { "path": "/tmp/第二幕 分镜图.png" },
+        "audios": [{ "path": "/tmp/旁白参考.wav" }]
+    }))
+    .expect("object path fields should deserialize");
+
+    assert_eq!(input.image_paths, vec!["/tmp/第二幕 分镜图.png"]);
+    assert_eq!(input.audio_paths, vec!["/tmp/旁白参考.wav"]);
+}
+
+#[test]
+fn mcp_video_input_accepts_mcp_resource_path_shapes() {
+    let input = parse_mcp_video_task_input(serde_json::json!({
+        "title": "MCP 资源路径测试",
+        "prompt": "测试 prompt",
+        "image_paths": [
+            { "uri": "file:///tmp/%E7%AC%AC%E4%BA%8C%E5%B9%95%20%E5%88%86%E9%95%9C%E5%9B%BE.png" },
+            { "resource": { "localPath": "/tmp/characters.png" } },
+            { "text": "{\"path\":\"/tmp/from-json-string.png\"}" }
+        ],
+        "audio_paths": [
+            { "value": { "path": "/tmp/narration_ref.wav" } }
+        ]
+    }))
+    .expect("mcp resource path shapes should deserialize");
+
+    assert_eq!(
+        input.image_paths,
+        vec![
+            "/tmp/第二幕 分镜图.png",
+            "/tmp/characters.png",
+            "/tmp/from-json-string.png"
+        ]
+    );
+    assert_eq!(input.audio_paths, vec!["/tmp/narration_ref.wav"]);
+}
+
+#[test]
+fn mcp_queue_videos_applies_batch_defaults_and_shared_start_time() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let source_dir = temp.path().join("source");
+    let assets_dir = temp.path().join("assets");
+    std::fs::create_dir_all(&source_dir).expect("create source dir");
+    let image_a = source_dir.join("a.png");
+    let image_b = source_dir.join("b.png");
+    std::fs::write(&image_a, b"fake-png-a").expect("write image a");
+    std::fs::write(&image_b, b"fake-png-b").expect("write image b");
+    let start_at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    let mut data = AppData::default();
+
+    let queued = queue_mcp_video_tasks(
+        &mut data,
+        &assets_dir,
+        McpQueueVideosInput {
+            start_at: Some(start_at.clone()),
+            defaults: McpVideoTaskDefaults {
+                orientation: Some("portrait".to_string()),
+                model: Some("standard".to_string()),
+                duration: Some(15),
+                video_resolution: Some("720p".to_string()),
+                planned_submit_count: Some(2),
+            },
+            items: vec![
+                McpVideoTaskInput {
+                    title: "第一条".to_string(),
+                    prompt: "第一条 prompt".to_string(),
+                    image_paths: vec![image_a.to_string_lossy().to_string()],
+                    ..McpVideoTaskInput::default()
+                },
+                McpVideoTaskInput {
+                    title: "第二条".to_string(),
+                    prompt: "第二条 prompt".to_string(),
+                    image_paths: vec![image_b.to_string_lossy().to_string()],
+                    model: Some("fast".to_string()),
+                    ..McpVideoTaskInput::default()
+                },
+            ],
+        },
+    )
+    .expect("queue mcp batch");
+
+    assert_eq!(queued.len(), 2);
+    assert_eq!(data.tasks.len(), 2);
+    assert_eq!(data.assets.len(), 2);
+    assert!(data
+        .tasks
+        .iter()
+        .all(|task| task.scheduled_at.as_deref() == Some(start_at.as_str())));
+    assert!(data.tasks.iter().all(|task| task.params.ratio == "9:16"));
+    assert_eq!(data.tasks[0].params.model_version, "seedance2.0");
+    assert_eq!(data.tasks[1].params.model_version, "seedance2.0fast");
+    assert!(data.tasks.iter().all(|task| task.planned_submit_count == 2));
 }
 
 #[test]
@@ -591,6 +917,7 @@ fn rejects_video_asset_type() {
         size_bytes: 100,
         duration_seconds: Some(5.0),
         created_at: String::new(),
+        content_hash: None,
     };
     let assets = vec![image_asset("img-1", "角色图", "/tmp/role.png"), video_asset];
     let result = resolve_task_inputs(&task, &assets, &[]);
@@ -929,6 +1256,39 @@ fn concurrency_limit_chinese_keywords_detected() {
 fn timeout_error_classified_as_transient() {
     let settings = SchedulerSettings::default();
     let classified = classify_dreamina_error("context deadline exceeded", &settings);
+    assert_eq!(classified.kind, DreaminaErrorKind::Transient);
+    assert_eq!(classified.next_status, "retry_wait");
+}
+
+#[test]
+fn imagex_apply_upload_eof_classified_as_transient() {
+    let settings = SchedulerSettings::default();
+    let classified = classify_dreamina_error(
+        r#"upload image: apply phase, ApplyImageUpload: do request, Get "http://imagex.bytedanceapi.com/?Action=ApplyImageUpload": EOF"#,
+        &settings,
+    );
+    assert_eq!(classified.kind, DreaminaErrorKind::Transient);
+    assert_eq!(classified.next_status, "retry_wait");
+}
+
+#[test]
+fn vod_apply_upload_inner_eof_classified_as_transient() {
+    let settings = SchedulerSettings::default();
+    let classified = classify_dreamina_error(
+        r#"upload resource "/tmp/voice.mp3": upload video/audio: Get "http://vod.bytedanceapi.com/top/v1?Action=ApplyUploadInner&FileType=video&SessionKey=&SpaceName=dreamina&Version=2020-11-19": EOF"#,
+        &settings,
+    );
+    assert_eq!(classified.kind, DreaminaErrorKind::Transient);
+    assert_eq!(classified.next_status, "retry_wait");
+}
+
+#[test]
+fn tos_upload_connection_reset_classified_as_transient() {
+    let settings = SchedulerSettings::default();
+    let classified = classify_dreamina_error(
+        r#"upload resource "/tmp/voice.mp3": upload video/audio: Post "http://tos-d-x-hl.snssdk.com/upload/v1/tos-cn-v": read tcp 198.18.0.1:55944->198.18.3.122:80: read: connection reset by peer"#,
+        &settings,
+    );
     assert_eq!(classified.kind, DreaminaErrorKind::Transient);
     assert_eq!(classified.next_status, "retry_wait");
 }

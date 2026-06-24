@@ -23,7 +23,7 @@ test('settings page no longer renders the future roadmap sidebar', () => {
 
 test('settings page renders an explicit save settings submit button', () => {
   const mainSource = readSource('main.jsx');
-  const settingsViewSource = mainSource.match(/function SettingsView\([\s\S]*?\n}\n\nfunction Metric/)?.[0] || '';
+  const settingsViewSource = mainSource.match(/function SettingsView\([\s\S]*?\n}\n\nfunction PanelHeading/)?.[0] || '';
 
   assert.match(settingsViewSource, /type="submit"[\s\S]*保存设置/);
 });

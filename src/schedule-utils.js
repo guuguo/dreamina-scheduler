@@ -23,9 +23,9 @@ export function resolveScheduleAt(options = {}, now = new Date()) {
   return null;
 }
 
-export function buildBatchSchedulePlan(taskIds = [], { startAt, intervalMinutes = 30 } = {}) {
+export function buildBatchSchedulePlan(taskIds = [], { startAt, intervalMinutes = 0 } = {}) {
   const startMs = new Date(startAt).getTime();
-  const intervalMs = Math.max(1, Number(intervalMinutes || 30)) * 60 * 1000;
+  const intervalMs = Math.max(0, Number(intervalMinutes || 0)) * 60 * 1000;
   return taskIds.map((taskId, index) => ({
     taskId,
     scheduledAt: new Date(startMs + index * intervalMs).toISOString(),
@@ -49,6 +49,9 @@ export function formatSchedulePlanSummary(plan = []) {
   if (!plan.length) return '未选择任务';
   const first = new Date(plan[0].scheduledAt);
   const last = new Date(plan[plan.length - 1].scheduledAt);
+  if (first.getTime() === last.getTime()) {
+    return `${plan.length} 个任务 · 从 ${first.toLocaleString()} 连续排队`;
+  }
   return `${plan.length} 个任务 · ${first.toLocaleString()} 至 ${last.toLocaleString()}`;
 }
 

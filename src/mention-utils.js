@@ -56,6 +56,7 @@ export function buildMentionItems({ roles = [], assetById = new Map(), tempImage
   });
 
   const currentTempIds = new Set(tempImageAssetIds.filter(Boolean));
+  const usedLabels = new Set(items.filter((item) => item.type === 'temp_image').map((item) => item.label));
   const TEN_DAYS_MS = 10 * 24 * 60 * 60 * 1000;
   const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
   const now = Date.now();
@@ -69,9 +70,11 @@ export function buildMentionItems({ roles = [], assetById = new Map(), tempImage
     ) {
       const createdMs = asset.created_at ? new Date(asset.created_at).getTime() : 0;
       if (now - createdMs <= TEN_DAYS_MS) {
+        const label = buildTempLibraryLabel(asset, usedLabels);
+        usedLabels.add(label);
         items.push({
           key: `temp:${asset.id}`,
-          label: asset.name || `临时图_${asset.id.slice(-6)}`,
+          label,
           type: 'temp_image',
           assetId: asset.id,
           path: asset.stored_path,
@@ -86,6 +89,26 @@ export function buildMentionItems({ roles = [], assetById = new Map(), tempImage
   });
 
   return items;
+}
+
+function buildTempLibraryLabel(asset, usedLabels) {
+  const base = tempImageLabelFromAsset(asset);
+  if (!usedLabels.has(base)) return base;
+  for (let i = 1; i <= 20; i += 1) {
+    const candidate = `${base}_${i}`;
+    if (!usedLabels.has(candidate)) return candidate;
+  }
+  return `${base}_${String(asset?.id || 'temp').slice(-6)}`;
+}
+
+function tempImageLabelFromAsset(asset) {
+  const normalizedName = String(asset?.name || '').trim();
+  if (/^图片\d+$/.test(normalizedName)) return normalizedName;
+  if (/^(粘贴图片|临时图片)$/.test(normalizedName)) {
+    const suffix = String(asset?.id || '').replace(/[^a-zA-Z0-9]/g, '').slice(-6);
+    return `图片${suffix || 'temp'}`;
+  }
+  return normalizedName || `图片${String(asset?.id || 'temp').slice(-6)}`;
 }
 
 export function applyMentionSelection({ form, item, atQuery }) {

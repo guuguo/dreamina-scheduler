@@ -2,10 +2,15 @@
 name = "dreamina-scheduler"
 version = "0.2.3"
 edition = "2021"
+default-run = "dreamina-scheduler"
 
 [lib]
 name = "dreamina_scheduler_lib"
 path = "src/lib.rs"
+
+[[bin]]
+name = "dreamina-mcp"
+path = "src/bin/dreamina-mcp.rs"
 
 [dependencies]
 tauri = { version = "2", features = ["protocol-asset"] }
@@ -19,6 +24,7 @@ arboard = "3.6.1"
 png = "0.17.16"
 reqwest = { version = "0.12", features = ["blocking", "multipart"] }
 base64 = "0.22"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

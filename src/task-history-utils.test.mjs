@@ -60,6 +60,116 @@ test('execution_records are sorted newest first', () => {
   assert.equal(items[1].id, 'rec-1');
 });
 
+test('retry_wait execution_records with same retry error are collapsed for display', () => {
+  const task = {
+    id: 't2b',
+    execution_records: [
+      {
+        id: 'rec-retry-1',
+        started_at: '2026-04-30T09:00:00Z',
+        finished_at: '2026-04-30T09:00:01Z',
+        submit_id: '',
+        status: 'retry_wait',
+        result_paths: [],
+        result_urls: [],
+        query_records: [],
+        error_kind: 'ConcurrencyLimit',
+        error_detail: 'api error: ret=1310, message=ExceedConcurrencyLimit submit_preflight={...}',
+        command_preview: [],
+      },
+      {
+        id: 'rec-retry-2',
+        started_at: '2026-04-30T09:05:00Z',
+        finished_at: '2026-04-30T09:05:01Z',
+        submit_id: '',
+        status: 'retry_wait',
+        result_paths: [],
+        result_urls: [],
+        query_records: [],
+        error_kind: 'ConcurrencyLimit',
+        error_detail: 'api error: ret=1310, message=ExceedConcurrencyLimit submit_preflight={...}',
+        command_preview: [],
+      },
+    ],
+  };
+
+  const items = deriveTaskHistory(task);
+
+  assert.equal(items.length, 1);
+  assert.equal(items[0].id, 'rec-retry-2');
+  assert.equal(items[0].retry_count, 2);
+  assert.equal(items[0].error_detail, '并发任务仍在生成中，已自动排队等待下次重试。');
+});
+
+test('final failed concurrency retry record is collapsed into one short display item', () => {
+  const task = {
+    id: 't2c',
+    execution_records: [
+      {
+        id: 'rec-retry-1',
+        started_at: '2026-04-30T09:00:00Z',
+        finished_at: '2026-04-30T09:00:01Z',
+        submit_id: '',
+        status: 'retry_wait',
+        result_paths: [],
+        result_urls: [],
+        query_records: [],
+        error_kind: 'ConcurrencyLimit',
+        error_detail: 'api error: ret=1310, message=ExceedConcurrencyLimit submit_preflight={...}',
+        command_preview: [],
+      },
+      {
+        id: 'rec-failed',
+        started_at: '2026-04-30T09:05:00Z',
+        finished_at: '2026-04-30T09:05:01Z',
+        submit_id: '',
+        status: 'failed',
+        result_paths: [],
+        result_urls: [],
+        query_records: [],
+        error_kind: 'ConcurrencyLimit',
+        error_detail: 'api error: ret=1310, message=ExceedConcurrencyLimit submit_preflight={...}',
+        command_preview: [],
+      },
+    ],
+  };
+
+  const items = deriveTaskHistory(task);
+
+  assert.equal(items.length, 1);
+  assert.equal(items[0].id, 'rec-failed');
+  assert.equal(items[0].status, 'failed');
+  assert.equal(items[0].retry_count, 2);
+  assert.equal(items[0].error_detail, '并发任务仍在生成中，已自动排队等待下次重试。');
+});
+
+test('single legacy failed concurrency record uses short error detail', () => {
+  const task = {
+    id: 't2d',
+    execution_records: [
+      {
+        id: 'rec-failed',
+        started_at: '2026-04-30T09:00:00Z',
+        finished_at: '2026-04-30T09:00:01Z',
+        submit_id: '',
+        status: 'failed',
+        result_paths: [],
+        result_urls: [],
+        query_records: [],
+        error_kind: 'ConcurrencyLimit',
+        error_detail: 'api error: ret=1310, message=ExceedConcurrencyLimit submit_preflight={...}',
+        command_preview: [],
+      },
+    ],
+  };
+
+  const items = deriveTaskHistory(task);
+
+  assert.equal(items.length, 1);
+  assert.equal(items[0].retry_count, 1);
+  assert.equal(items[0].error_detail, '并发任务仍在生成中，已自动排队等待下次重试。');
+});
+
 test('legacy task with only top-level attempts/results becomes legacy record', () => {
   const task = {
     id: 't3',
@@ -196,6 +306,11 @@ test('historyItemLabel with submit_id shows truncated id', () => {
 test('historyItemLabel without submit_id shows index only', () => {
   const item = { submit_id: '' };
   assert.equal(historyItemLabel(item, 2), '第 2 次');
+});
+
+test('historyItemLabel includes collapsed retry count', () => {
+  const item = { submit_id: '', retry_count: 5 };
+  assert.equal(historyItemLabel(item, 2), '第 2 次 · 自动重试 5 次');
 });
 
 // ── isInterruptNotice ──────────────────────────────────────────────────────

@@ -183,6 +183,114 @@ export function getCommandPreviewPresentation(commandText) {
   };
 }
 
+export function deriveTaskDispatchInfo(task, {
+  nowMs = Date.now(),
+  schedulerTickSeconds = 30,
+  concurrencyCooldownUntil = '',
+} = {}) {
+  const status = task?.status || 'draft';
+  const attemptCount = Number(task?.attempt_count || 0);
+  const plannedSubmitCount = Math.max(1, Number(task?.planned_submit_count || 1));
+  const concurrencyRetryCount = Number(task?.concurrency_retry_count || 0);
+  const concurrencyRetryText = concurrencyRetryCount > 0
+    ? `已等待 ${concurrencyRetryCount} 轮，持续重试`
+    : '尚未触发并发等待';
+  const nextRunAt = task?.next_run_at || (status === 'scheduled' ? task?.scheduled_at : '');
+  const nextTime = nextRunAt ? new Date(nextRunAt).getTime() : NaN;
+  const isFutureNextRun = Number.isFinite(nextTime) && nextTime > nowMs;
+  const isDueNextRun = Number.isFinite(nextTime) && nextTime <= nowMs;
+  const cooldownTime = concurrencyCooldownUntil ? new Date(concurrencyCooldownUntil).getTime() : NaN;
+  const hasFutureConcurrencyCooldown = Number.isFinite(cooldownTime) && cooldownTime > nowMs;
+  const fallbackCheckText = `${schedulerTickSeconds} 秒内检查`;
+
+  if (status === 'scheduled') {
+    return {
+      status,
+      attemptCount,
+      plannedSubmitCount,
+      concurrencyRetryCount,
+      concurrencyRetryText,
+      nextLabel: isDueNextRun ? '下次尝试' : '开始时间',
+      nextAt: nextRunAt || '',
+      nextText: nextRunAt ? '' : fallbackCheckText,
+      reason: isDueNextRun ? '已到预定时间，等待调度补偿' : '等待预定开始时间',
+      compactText: `尝试 ${attemptCount} 次 · 等待开始`,
+    };
+  }
+
+  if (status === 'retry_wait') {
+    if (isDueNextRun && hasFutureConcurrencyCooldown) {
+      return {
+        status,
+        attemptCount,
+        plannedSubmitCount,
+        concurrencyRetryCount,
+        concurrencyRetryText,
+        nextLabel: '并发冷却',
+        nextAt: concurrencyCooldownUntil,
+        nextText: '',
+        reason: '其他任务仍在并发冷却，冷却结束后继续调度',
+        compactText: `尝试 ${attemptCount} 次 · 等待并发冷却`,
+        blockedByConcurrencyCooldown: true,
+      };
+    }
+    if (isDueNextRun) {
+      return {
+        status,
+        attemptCount,
+        plannedSubmitCount,
+        concurrencyRetryCount,
+        concurrencyRetryText,
+        nextLabel: '等待调度',
+        nextAt: '',
+        nextText: '冷却已结束',
+        reason: '重试冷却已结束，等待调度',
+        compactText: `尝试 ${attemptCount} 次 · 等待调度`,
+      };
+    }
+    return {
+      status,
+      attemptCount,
+      plannedSubmitCount,
+      concurrencyRetryCount,
+      concurrencyRetryText,
+      nextLabel: '下次重试',
+      nextAt: nextRunAt || '',
+      nextText: nextRunAt ? '' : fallbackCheckText,
+      reason: isFutureNextRun ? '等待重试冷却结束' : '重试冷却已结束，等待调度',
+      compactText: `尝试 ${attemptCount} 次 · 等待重试`,
+    };
+  }
+
+  if (status === 'queued') {
+    return {
+      status,
+      attemptCount,
+      plannedSubmitCount,
+      concurrencyRetryCount,
+      concurrencyRetryText,
+      nextLabel: nextRunAt ? '下次尝试' : '下次检查',
+      nextAt: nextRunAt || '',
+      nextText: isDueNextRun ? '即将尝试' : fallbackCheckText,
+      reason: nextRunAt && isFutureNextRun ? '等待调度窗口' : '等待调度器空闲',
+      compactText: `尝试 ${attemptCount} 次 · ${nextRunAt && isFutureNextRun ? '等待窗口' : fallbackCheckText}`,
+    };
+  }
+
+  return {
+    status,
+    attemptCount,
+    plannedSubmitCount,
+    concurrencyRetryCount,
+    concurrencyRetryText,
+    nextLabel: '下次尝试',
+    nextAt: '',
+    nextText: '-',
+    reason: '',
+    compactText: attemptCount ? `尝试 ${attemptCount} 次` : '',
+  };
+}
+
 function basename(value) {
   const clean = String(value || '').split('?')[0].split('#')[0];
   return clean.split(/[\\/]/).filter(Boolean).pop() || String(value || '结果视频');
@@ -198,8 +306,8 @@ export function deriveTaskProgress(task) {
 
   const map = {
     draft: { percent: 0, stage: '草稿' },
-    queued: { percent: 8, stage: '等待执行' },
-    scheduled: { percent: 8, stage: '计划中' },
+    queued: { percent: 8, stage: '等待调度' },
+    scheduled: { percent: 8, stage: '等待预定时间' },
     paused: { percent: 8, stage: '已暂停' },
     submitting: { percent: 30, stage: '提交中' },
     submitted: { percent: 55, stage: '已提交，等待结果' },

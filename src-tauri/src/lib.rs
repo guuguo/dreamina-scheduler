@@ -1,15 +1,22 @@
 mod keep_awake;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map as JsonMap, Value as JsonValue};
+use sha2::{Digest, Sha256};
 use std::{
     borrow::Cow,
     collections::HashMap,
     fs,
-    io::Cursor,
+    io::{Cursor, Write},
     path::{Path, PathBuf},
     process::Command,
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
+    time::{Duration as StdDuration, UNIX_EPOCH},
 };
+use tauri::Manager;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -22,6 +29,18 @@ const MAX_WAIT_HOURS: i64 = 4;
 const MAX_NO_REMOTE_QUEUE_INFO_MINUTES: i64 = 5;
 /// 5xx 服务器错误自动重试上限次数
 const MAX_SERVER_ERROR_RETRIES: u32 = 2;
+/// 上传 EOF / connection reset 等提交阶段瞬时错误，最多自动重试次数。
+const MAX_TRANSIENT_SUBMIT_RETRIES: u32 = 3;
+/// 队列空闲后，因提交瞬时错误失败的任务额外补试次数。
+const MAX_IDLE_TRANSIENT_FAILED_RETRIES: u32 = 3;
+/// 队列空闲后，因并发限制被旧策略标失败的任务额外补试次数。
+const MAX_IDLE_CONCURRENCY_FAILED_RETRIES: u32 = 3;
+/// 只自动捞起近期并发限制失败，避免把几周前的历史失败任务重新提交。
+const MAX_CONCURRENCY_FAILURE_RECOVERY_HOURS: i64 = 24;
+const IMAGE_SUBMIT_TIMEOUT_SECS: u64 = 300;
+const IMAGE_SUBMIT_CONNECT_TIMEOUT_SECS: u64 = 300;
+const SCHEDULER_TICK_INTERVAL_SECS: u64 = 30;
+static PROCESS_QUEUE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// 退避间隔阶梯（秒），index = consecutive_no_result_queries 的次数映射
 const BACKOFF_INTERVALS_SECS: &[u64] = &[0, 60, 120, 300, 600];
@@ -47,6 +66,8 @@ pub struct Asset {
     pub duration_seconds: Option<f64>,
     #[serde(default)]
     pub created_at: String,
+    #[serde(default)]
+    pub content_hash: Option<String>,
 }
 
 impl Asset {
@@ -77,6 +98,7 @@ impl Asset {
             .and_then(|value| value.to_str())
             .unwrap_or("素材")
             .to_string();
+        let normalized_name = sanitize_asset_name_for_mention(&file_name);
         let mime = match kind {
             AssetKind::Image => match extension.as_str() {
                 "jpg" | "jpeg" => "image/jpeg",
@@ -93,7 +115,9 @@ impl Asset {
         Ok(Self {
             id,
             kind,
-            name: name.unwrap_or(file_name),
+            name: name
+                .map(|value| sanitize_asset_name_for_mention(&value))
+                .unwrap_or(normalized_name),
             aliases: vec![],
             tags: vec![],
             stored_path: stored_path.to_string_lossy().to_string(),
@@ -102,7 +126,40 @@ impl Asset {
             size_bytes: metadata.len(),
             duration_seconds: None,
             created_at: now_rfc3339(),
+            content_hash: None,
         })
+    }
+}
+
+fn sanitize_asset_name_for_mention(name: &str) -> String {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return "素材".to_string();
+    }
+    let mut normalized = String::with_capacity(trimmed.len());
+    let mut last_was_underscore = false;
+    for ch in trimmed.chars() {
+        if ch.is_whitespace() {
+            if !last_was_underscore {
+                normalized.push('_');
+                last_was_underscore = true;
+            }
+        } else {
+            normalized.push(ch);
+            last_was_underscore = false;
+        }
+    }
+    normalized.trim_matches('_').to_string()
+}
+
+fn rebuild_asset_hash_index(data: &mut AppData) {
+    data.asset_hash_index.clear();
+    for a in &data.assets {
+        if let Some(ref h) = a.content_hash {
+            data.asset_hash_index
+                .entry(h.clone())
+                .or_insert(a.id.clone());
+        }
     }
 }
 
@@ -110,17 +167,24 @@ impl Asset {
 pub fn purge_expired_temp_images(data: &mut AppData, days: i64) {
     let cutoff = Utc::now() - Duration::days(days);
     let mut expired_paths = Vec::new();
+    let mut expired_hashes = Vec::new();
     data.assets.retain(|a| {
         if a.tags.contains(&"temp_image".to_string()) {
             if let Ok(dt) = DateTime::parse_from_rfc3339(&a.created_at) {
                 if dt < cutoff {
                     expired_paths.push(a.stored_path.clone());
+                    if let Some(ref h) = a.content_hash {
+                        expired_hashes.push(h.clone());
+                    }
                     return false;
                 }
             }
         }
         true
     });
+    for hash in expired_hashes {
+        data.asset_hash_index.remove(&hash);
+    }
     for path in expired_paths {
         let _ = fs::remove_file(&path);
     }
@@ -132,6 +196,19 @@ pub fn save_clipboard_image_asset(
     input: ClipboardImageInput,
 ) -> Result<Asset, SchedulerError> {
     purge_expired_temp_images(data, 10);
+
+    // 计算内容哈希，复用已有素材
+    let content_hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(&input.bytes);
+        format!("{:x}", hasher.finalize())
+    };
+    if let Some(existing_id) = data.asset_hash_index.get(&content_hash) {
+        if let Some(existing) = data.assets.iter().find(|a| a.id == *existing_id) {
+            return Ok(existing.clone());
+        }
+    }
+
     let extension = clipboard_image_extension(&input.file_name, &input.mime)?;
     if input.bytes.is_empty() {
         return Err(SchedulerError::Io("剪贴板图片为空".to_string()));
@@ -168,7 +245,9 @@ pub fn save_clipboard_image_asset(
         size_bytes: metadata.len(),
         duration_seconds: None,
         created_at: now_rfc3339(),
+        content_hash: Some(content_hash.clone()),
     };
+    data.asset_hash_index.insert(content_hash, asset.id.clone());
     data.assets.push(asset.clone());
     Ok(asset)
 }
@@ -442,6 +521,8 @@ pub struct ScheduledTask {
     /// 5xx 服务器错误重试次数（上限 MAX_SERVER_ERROR_RETRIES，超过后标 failed）
     #[serde(default)]
     pub server_error_retry_count: u32,
+    #[serde(default = "default_planned_submit_count")]
+    pub planned_submit_count: u32,
 }
 
 impl From<TaskDraft> for ScheduledTask {
@@ -486,8 +567,17 @@ impl From<TaskDraft> for ScheduledTask {
             auto_query_stopped: false,
             consecutive_no_result_queries: 0,
             server_error_retry_count: 0,
+            planned_submit_count: default_planned_submit_count(),
         }
     }
+}
+
+fn default_planned_submit_count() -> u32 {
+    1
+}
+
+fn normalize_planned_submit_count(value: u32) -> u32 {
+    value.clamp(1, 10)
 }
 
 fn normalize_task_title(title: &str, prompt: &str) -> String {
@@ -526,7 +616,9 @@ pub enum LogLevel {
 }
 
 impl Default for LogLevel {
-    fn default() -> Self { LogLevel::Info }
+    fn default() -> Self {
+        LogLevel::Info
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -545,7 +637,9 @@ pub enum LogSource {
 }
 
 impl Default for LogSource {
-    fn default() -> Self { LogSource::System }
+    fn default() -> Self {
+        LogSource::System
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -701,6 +795,8 @@ pub struct AppData {
     pub logs: Vec<LogEntry>,
     #[serde(default)]
     pub imagegen_history: Vec<ImageGenHistoryItem>,
+    #[serde(skip, default = "HashMap::new")]
+    pub asset_hash_index: HashMap<String, String>,
 }
 
 impl Default for AppData {
@@ -712,6 +808,7 @@ impl Default for AppData {
             tasks: vec![],
             logs: vec![],
             imagegen_history: vec![],
+            asset_hash_index: HashMap::new(),
         }
     }
 }
@@ -740,7 +837,9 @@ pub struct ImageGenHistoryItem {
     pub error: Option<String>,
 }
 
-fn default_status_completed() -> String { "completed".to_string() }
+fn default_status_completed() -> String {
+    "completed".to_string()
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CliStatus {
@@ -760,6 +859,282 @@ pub struct HostPlatform {
 pub struct ImportAssetInput {
     pub path: String,
     pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct McpVideoTaskDefaults {
+    #[serde(default, alias = "aspectRatio")]
+    pub orientation: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub duration: Option<u8>,
+    #[serde(default, alias = "videoResolution")]
+    pub video_resolution: Option<String>,
+    #[serde(default, alias = "plannedSubmitCount")]
+    pub planned_submit_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct McpVideoTaskInput {
+    #[serde(default)]
+    pub title: String,
+    pub prompt: String,
+    #[serde(default, alias = "imagePaths", alias = "images", alias = "imagePath")]
+    pub image_paths: Vec<String>,
+    #[serde(default, alias = "audioPaths", alias = "audios", alias = "audioPath")]
+    pub audio_paths: Vec<String>,
+    #[serde(
+        default,
+        alias = "startAt",
+        alias = "scheduled_at",
+        alias = "scheduledAt"
+    )]
+    pub start_at: Option<String>,
+    #[serde(default, alias = "aspectRatio")]
+    pub orientation: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub duration: Option<u8>,
+    #[serde(default, alias = "videoResolution")]
+    pub video_resolution: Option<String>,
+    #[serde(default, alias = "plannedSubmitCount")]
+    pub planned_submit_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct McpQueueVideosInput {
+    #[serde(
+        default,
+        alias = "startAt",
+        alias = "scheduled_at",
+        alias = "scheduledAt"
+    )]
+    pub start_at: Option<String>,
+    #[serde(default)]
+    pub defaults: McpVideoTaskDefaults,
+    #[serde(default, alias = "tasks", alias = "videos")]
+    pub items: Vec<McpVideoTaskInput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpQueuedVideoTask {
+    pub task: ScheduledTask,
+    pub imported_assets: Vec<Asset>,
+}
+
+fn json_string_array(value: &JsonValue) -> Vec<String> {
+    match value {
+        JsonValue::String(item) => json_string_value_array(item),
+        JsonValue::Array(items) => items
+            .iter()
+            .flat_map(json_string_array)
+            .filter(|item| !item.trim().is_empty())
+            .collect(),
+        JsonValue::Object(map) => json_object_string_array(map),
+        _ => vec![],
+    }
+}
+
+fn json_string_value_array(item: &str) -> Vec<String> {
+    let trimmed = item.trim();
+    if trimmed.is_empty() {
+        return vec![];
+    }
+    if let Ok(parsed) = serde_json::from_str::<JsonValue>(trimmed) {
+        let parsed_values = json_string_array(&parsed);
+        if !parsed_values.is_empty() {
+            return parsed_values;
+        }
+    }
+    vec![normalize_mcp_path_string(trimmed)]
+}
+
+fn json_object_string_array(map: &JsonMap<String, JsonValue>) -> Vec<String> {
+    const DIRECT_KEYS: &[&str] = &[
+        "path",
+        "file",
+        "file_path",
+        "filePath",
+        "local_path",
+        "localPath",
+        "absolute_path",
+        "absolutePath",
+        "resolved_path",
+        "resolvedPath",
+        "stored_path",
+        "storedPath",
+        "source_path",
+        "sourcePath",
+        "uri",
+        "url",
+        "href",
+        "text",
+        "value",
+        "content",
+    ];
+    const NESTED_KEYS: &[&str] = &[
+        "paths", "files", "items", "values", "data", "resource", "asset", "input", "image", "audio",
+    ];
+
+    for key in DIRECT_KEYS {
+        if let Some(value) = map.get(*key) {
+            let values = json_string_array(value);
+            if !values.is_empty() {
+                return values;
+            }
+        }
+    }
+    for key in NESTED_KEYS {
+        if let Some(value) = map.get(*key) {
+            let values = json_string_array(value);
+            if !values.is_empty() {
+                return values;
+            }
+        }
+    }
+
+    let mut numeric_keys = map.keys().collect::<Vec<_>>();
+    numeric_keys.sort();
+    if numeric_keys
+        .iter()
+        .all(|key| key.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        return numeric_keys
+            .into_iter()
+            .filter_map(|key| map.get(key))
+            .flat_map(json_string_array)
+            .collect();
+    }
+
+    vec![]
+}
+
+fn normalize_mcp_path_string(value: &str) -> String {
+    let trimmed = value.trim();
+    let Some(rest) = trimmed.strip_prefix("file://") else {
+        return trimmed.to_string();
+    };
+    let path = rest.strip_prefix("localhost").unwrap_or(rest);
+    let normalized = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    percent_decode_path(&normalized)
+}
+
+fn percent_decode_path(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
+                output.push(high * 16 + low);
+                index += 3;
+                continue;
+            }
+        }
+        output.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(output).unwrap_or_else(|_| value.to_string())
+}
+
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn take_first_string_array(map: &mut JsonMap<String, JsonValue>, keys: &[&str]) -> Vec<String> {
+    let mut values = Vec::new();
+    for key in keys {
+        if let Some(value) = map.remove(*key) {
+            for item in json_string_array(&value) {
+                if !values.iter().any(|existing| existing == &item) {
+                    values.push(item);
+                }
+            }
+        }
+    }
+    values
+}
+
+fn normalize_mcp_video_task_value(value: JsonValue) -> JsonValue {
+    let JsonValue::Object(mut map) = value else {
+        return value;
+    };
+    let image_paths = take_first_string_array(
+        &mut map,
+        &[
+            "image_paths",
+            "imagePaths",
+            "images",
+            "image",
+            "imagePath",
+            "image_path",
+        ],
+    );
+    if !image_paths.is_empty() {
+        map.insert(
+            "image_paths".to_string(),
+            JsonValue::Array(image_paths.into_iter().map(JsonValue::String).collect()),
+        );
+    }
+    let audio_paths = take_first_string_array(
+        &mut map,
+        &[
+            "audio_paths",
+            "audioPaths",
+            "audios",
+            "audio",
+            "audioPath",
+            "audio_path",
+        ],
+    );
+    if !audio_paths.is_empty() {
+        map.insert(
+            "audio_paths".to_string(),
+            JsonValue::Array(audio_paths.into_iter().map(JsonValue::String).collect()),
+        );
+    }
+    JsonValue::Object(map)
+}
+
+pub fn parse_mcp_video_task_input(value: JsonValue) -> Result<McpVideoTaskInput, SchedulerError> {
+    serde_json::from_value(normalize_mcp_video_task_value(value))
+        .map_err(|error| SchedulerError::Io(format!("MCP 参数解析失败：{error}")))
+}
+
+pub fn parse_mcp_queue_videos_input(
+    value: JsonValue,
+) -> Result<McpQueueVideosInput, SchedulerError> {
+    let normalized = match value {
+        JsonValue::Object(mut map) => {
+            for key in ["items", "tasks", "videos"] {
+                if let Some(JsonValue::Array(items)) = map.remove(key) {
+                    let normalized_items = items
+                        .into_iter()
+                        .map(normalize_mcp_video_task_value)
+                        .collect::<Vec<_>>();
+                    map.insert("items".to_string(), JsonValue::Array(normalized_items));
+                    break;
+                }
+            }
+            JsonValue::Object(map)
+        }
+        other => other,
+    };
+    serde_json::from_value(normalized)
+        .map_err(|error| SchedulerError::Io(format!("MCP 批量参数解析失败：{error}")))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -981,25 +1356,38 @@ pub struct AppStore {
 
 impl AppStore {
     pub fn load(root_dir: PathBuf) -> Self {
-        let data_path = root_dir.join("state.json");
-        let mut data: AppData = fs::read_to_string(&data_path)
-            .ok()
-            .and_then(|content| serde_json::from_str(&content).ok())
-            .unwrap_or_default();
-        normalize_image_model_settings(&mut data.settings);
-        backfill_execution_records_from_attempts(&mut data);
-        recover_tasks_on_load(&mut data);
-        backfill_draft_command_previews(&mut data);
-        // 日志保留清理
-        apply_log_retention(&mut data);
-        Self {
+        let data = load_app_data_from_disk(&root_dir).unwrap_or_default();
+        let store = Self {
             root_dir,
             data: Mutex::new(data),
+        };
+        store.compact_on_disk_if_oversized();
+        store
+    }
+
+    /// 启动时一次性压实：当磁盘 `state.json` 明显大于规整（紧凑序列化 + 历史裁剪）后的数据时，
+    /// 重写一次使旧的 pretty 格式 / 历史臃肿文件立即瘦身。压实后磁盘体积≈紧凑数据，不会重复触发。
+    fn compact_on_disk_if_oversized(&self) {
+        let path = self.root_dir.join("state.json");
+        let Ok(meta) = fs::metadata(&path) else {
+            return;
+        };
+        let data = self.data.lock().expect("store lock");
+        let Ok(serialized) = serde_json::to_string(&*data) else {
+            return;
+        };
+        // 留 10% 余量，避免等大文件的无谓重写。
+        if meta.len() as usize > serialized.len() + serialized.len() / 10 {
+            let _ = self.persist(&data);
         }
     }
 
     pub fn snapshot(&self) -> AppData {
-        self.data.lock().expect("store lock").clone()
+        let mut data = self.data.lock().expect("store lock");
+        if let Ok(latest) = load_app_data_from_disk(&self.root_dir) {
+            *data = latest;
+        }
+        data.clone()
     }
 
     pub fn assets_dir(&self) -> PathBuf {
@@ -1015,9 +1403,31 @@ impl AppStore {
         F: FnOnce(&mut AppData) -> Result<T, SchedulerError>,
     {
         let mut data = self.data.lock().expect("store lock");
+        if let Ok(latest) = load_app_data_from_disk(&self.root_dir) {
+            *data = latest;
+        }
         let result = mutate(&mut data)?;
         self.persist(&data)?;
         Ok(result)
+    }
+
+    /// 廉价变更签名：仅 stat `state.json`（不读取/解析内容），返回 `体积:mtime毫秒`。
+    /// 供前端轮询比对——签名不变即跳过整份状态拉取，空闲时彻底省去大文件读解析。
+    /// 基于文件元数据，可捕获本进程与外部进程（如 MCP）的任何写入。
+    pub fn state_signature(&self) -> String {
+        let path = self.root_dir.join("state.json");
+        match fs::metadata(&path) {
+            Ok(meta) => {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                format!("{}:{}", meta.len(), mtime)
+            }
+            Err(_) => "0:0".to_string(),
+        }
     }
 
     fn persist(&self, data: &AppData) -> Result<(), SchedulerError> {
@@ -1025,12 +1435,36 @@ impl AppStore {
             .map_err(|error| SchedulerError::Io(error.to_string()))?;
         let state_path = self.root_dir.join("state.json");
         let temp_path = self.root_dir.join("state.json.tmp");
-        let content = serde_json::to_string_pretty(data)
-            .map_err(|error| SchedulerError::Io(error.to_string()))?;
+        // 紧凑序列化：state.json 为机器状态文件，pretty 缩进会让磁盘体积近乎翻倍，
+        // 加重每次读/写/解析的 I/O 与 CPU。compact 不改变可读回的数据。
+        let content =
+            serde_json::to_string(data).map_err(|error| SchedulerError::Io(error.to_string()))?;
         fs::write(&temp_path, content).map_err(|error| SchedulerError::Io(error.to_string()))?;
         fs::rename(temp_path, state_path).map_err(|error| SchedulerError::Io(error.to_string()))?;
         Ok(())
     }
+}
+
+fn load_app_data_from_disk(root_dir: &Path) -> Result<AppData, SchedulerError> {
+    let data_path = root_dir.join("state.json");
+    let mut data: AppData = fs::read_to_string(&data_path)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default();
+    normalize_loaded_app_data(&mut data);
+    Ok(data)
+}
+
+fn normalize_loaded_app_data(data: &mut AppData) {
+    data.settings.concurrency_limit_policy = ConcurrencyLimitPolicy::SilentRetry;
+    normalize_image_model_settings(&mut data.settings);
+    backfill_execution_records_from_attempts(data);
+    compact_retry_execution_records_for_display(data);
+    recover_tasks_on_load(data);
+    backfill_draft_command_previews(data);
+    apply_log_retention(data);
+    cap_execution_history(data);
+    rebuild_asset_hash_index(data);
 }
 
 pub fn default_store_dir() -> PathBuf {
@@ -1268,11 +1702,15 @@ pub fn format_image_model_settings_log(settings: &SchedulerSettings) -> String {
     let active_label = active
         .map(|config| format!("{} / {}", config.name, config.model))
         .unwrap_or_else(|| "-".to_string());
-    let base_url = active
-        .map(|config| config.base_url.as_str())
-        .unwrap_or("-");
+    let base_url = active.map(|config| config.base_url.as_str()).unwrap_or("-");
     let key_state = active
-        .map(|config| if config.api_key.trim().is_empty() { "未填写" } else { "已填写" })
+        .map(|config| {
+            if config.api_key.trim().is_empty() {
+                "未填写"
+            } else {
+                "已填写"
+            }
+        })
         .unwrap_or("未填写");
     format!(
         "图片模型数量={}；active_image_model_id={}；当前图片模型={}；base_url={}；api_key={}",
@@ -1285,7 +1723,11 @@ pub fn format_image_model_settings_log(settings: &SchedulerSettings) -> String {
 }
 
 fn truncate_text(s: &str, max: usize) -> String {
-    if s.len() <= max { s.to_string() } else { format!("{}…", &s[..max]) }
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max])
+    }
 }
 
 pub fn parse_imagegen_json_response(
@@ -1303,8 +1745,13 @@ pub fn parse_imagegen_json_response(
             truncate_text(response_text, 300),
         ));
     }
-    serde_json::from_str::<serde_json::Value>(response_text)
-        .map_err(|e| format!("解析响应失败：{e}；url={}；原始内容：{}", url, truncate_text(response_text, 300)))
+    serde_json::from_str::<serde_json::Value>(response_text).map_err(|e| {
+        format!(
+            "解析响应失败：{e}；url={}；原始内容：{}",
+            url,
+            truncate_text(response_text, 300)
+        )
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1376,14 +1823,76 @@ impl Default for SchedulerSettings {
     }
 }
 
-/// 检查当前是否存在需要防休眠的任务（预定/等待重试/提交中/查询中/非停止的提交后查询）。
+/// 检查当前是否存在需要防休眠的任务（排队/预定/等待重试/提交中/查询中/非停止的提交后查询）。
 pub fn needs_keep_awake(tasks: &[ScheduledTask]) -> bool {
     tasks.iter().any(|t| {
         matches!(
             t.status.as_str(),
-            "scheduled" | "retry_wait" | "submitting" | "submitted" | "querying"
+            "queued" | "scheduled" | "retry_wait" | "submitting" | "submitted" | "querying"
         ) && !t.auto_query_stopped
     })
+}
+
+/// 完全空闲（无活跃任务）时的调度等待上限。
+const IDLE_WAIT_SECS: u64 = 60;
+/// 有活跃任务时维持的灵敏间隔（沿用原调度间隔常量）。
+const ACTIVE_WAIT_SECS: u64 = SCHEDULER_TICK_INTERVAL_SECS;
+
+/// 是否存在需要调度线程持续照看的活跃任务。与 `needs_keep_awake` 同源真值。
+pub fn has_active_tasks(tasks: &[ScheduledTask]) -> bool {
+    needs_keep_awake(tasks)
+}
+
+/// 二元自适应等待时长：有活跃任务保持 30s，完全空闲拉长到 60s。
+/// 拉长后的灵敏度由入队 `SchedulerWaker::notify` 唤醒兜底。
+pub fn compute_wait_duration(tasks: &[ScheduledTask]) -> StdDuration {
+    if has_active_tasks(tasks) {
+        StdDuration::from_secs(ACTIVE_WAIT_SECS)
+    } else {
+        StdDuration::from_secs(IDLE_WAIT_SECS)
+    }
+}
+
+/// 调度线程唤醒原语：把不可打断的 `sleep` 换成可被入队事件提前唤醒的等待。
+pub struct SchedulerWaker {
+    /// true=有新工作待处理，用于防止唤醒丢失。
+    pending: std::sync::Mutex<bool>,
+    cvar: std::sync::Condvar,
+}
+
+impl SchedulerWaker {
+    pub fn new() -> Self {
+        Self {
+            pending: std::sync::Mutex::new(false),
+            cvar: std::sync::Condvar::new(),
+        }
+    }
+
+    /// 入队/改期路径调用：标记 pending 并唤醒调度线程。
+    pub fn notify(&self) {
+        let mut pending = self.pending.lock().expect("waker lock");
+        *pending = true;
+        self.cvar.notify_one();
+    }
+
+    /// 调度线程调用：最多等 `wait`，被 `notify` 可提前返回；返回前消费 pending。
+    pub fn wait(&self, wait: StdDuration) {
+        let mut pending = self.pending.lock().expect("waker lock");
+        if !*pending {
+            let (guard, _timeout) = self
+                .cvar
+                .wait_timeout(pending, wait)
+                .expect("waker wait_timeout");
+            pending = guard;
+        }
+        *pending = false;
+    }
+}
+
+impl Default for SchedulerWaker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// 根据连续无结果查询次数返回退避间隔秒数
@@ -1404,7 +1913,8 @@ pub fn is_backoff_due(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
     let Some(ref last_at) = task.last_auto_query_at else {
         return true;
     };
-    let interval = Duration::seconds(backoff_interval_secs(task.consecutive_no_result_queries) as i64);
+    let interval =
+        Duration::seconds(backoff_interval_secs(task.consecutive_no_result_queries) as i64);
     DateTime::parse_from_rfc3339(last_at)
         .map(|t| now.signed_duration_since(t.with_timezone(&Utc)) >= interval)
         .unwrap_or(true)
@@ -1421,7 +1931,9 @@ pub fn is_past_max_wait(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
         return false;
     }
     DateTime::parse_from_rfc3339(trimmed)
-        .map(|t| now.signed_duration_since(t.with_timezone(&Utc)) >= Duration::hours(MAX_WAIT_HOURS))
+        .map(|t| {
+            now.signed_duration_since(t.with_timezone(&Utc)) >= Duration::hours(MAX_WAIT_HOURS)
+        })
         .unwrap_or(false)
 }
 
@@ -1540,26 +2052,26 @@ pub fn resolve_task_inputs(
     let mut prompt_rewrites = Vec::new();
     let mentions = extract_mentions(&task.prompt);
 
-    if mentions.is_empty() {
-        for asset_id in &task.image_asset_ids {
-            push_asset_id(
-                asset_id,
-                AssetKind::Image,
-                &asset_by_id,
-                &mut image_asset_ids,
-                &mut audio_asset_ids,
-            )?;
-        }
-        for asset_id in &task.audio_asset_ids {
-            push_asset_id(
-                asset_id,
-                AssetKind::Audio,
-                &asset_by_id,
-                &mut image_asset_ids,
-                &mut audio_asset_ids,
-            )?;
-        }
-    } else {
+    for asset_id in &task.image_asset_ids {
+        push_asset_id(
+            asset_id,
+            AssetKind::Image,
+            &asset_by_id,
+            &mut image_asset_ids,
+            &mut audio_asset_ids,
+        )?;
+    }
+    for asset_id in &task.audio_asset_ids {
+        push_asset_id(
+            asset_id,
+            AssetKind::Audio,
+            &asset_by_id,
+            &mut image_asset_ids,
+            &mut audio_asset_ids,
+        )?;
+    }
+
+    if !mentions.is_empty() {
         let mention_asset_index = build_mention_asset_index(task, assets, roles);
         for mention in mentions {
             let candidate = mention_asset_index
@@ -1642,6 +2154,80 @@ pub fn build_multimodal2video_args(
     Ok(args)
 }
 
+fn build_submit_preflight_detail(
+    task: &ScheduledTask,
+    resolved: &ResolvedTaskInputs,
+    assets: &[Asset],
+) -> String {
+    let asset_by_id = assets
+        .iter()
+        .map(|asset| (asset.id.as_str(), asset))
+        .collect::<HashMap<_, _>>();
+    let detail = serde_json::json!({
+        "task_id": task.id,
+        "title": task.title,
+        "attempt_count_after_start": task.attempt_count,
+        "planned_submit_count": planned_submit_count(task),
+        "params": task.params,
+        "resolved_counts": {
+            "images": resolved.image_paths.len(),
+            "audios": resolved.audio_paths.len(),
+            "prompt_rewrites": resolved.prompt_rewrites.len(),
+            "unresolved_mentions": resolved.unresolved_mentions.len(),
+        },
+        "images": build_asset_preflight_entries(&resolved.image_asset_ids, &resolved.image_paths, &asset_by_id),
+        "audios": build_asset_preflight_entries(&resolved.audio_asset_ids, &resolved.audio_paths, &asset_by_id),
+        "unresolved_mentions": resolved.unresolved_mentions,
+    });
+    serde_json::to_string_pretty(&detail).unwrap_or_else(|_| detail.to_string())
+}
+
+fn build_asset_preflight_entries(
+    asset_ids: &[String],
+    paths: &[String],
+    asset_by_id: &HashMap<&str, &Asset>,
+) -> Vec<serde_json::Value> {
+    paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let asset_id = asset_ids.get(index).cloned().unwrap_or_default();
+            let asset = asset_by_id.get(asset_id.as_str()).copied();
+            let metadata = fs::metadata(path);
+            let (exists, actual_size_bytes, modified_unix_secs, metadata_error) = match metadata {
+                Ok(meta) => {
+                    let modified = meta
+                        .modified()
+                        .ok()
+                        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_secs());
+                    (true, Some(meta.len()), modified, None)
+                }
+                Err(error) => (false, None, None, Some(error.to_string())),
+            };
+            serde_json::json!({
+                "index": index + 1,
+                "asset_id": asset_id,
+                "asset_name": asset.map(|a| a.name.clone()).unwrap_or_default(),
+                "asset_kind": asset.map(|a| format!("{:?}", a.kind)).unwrap_or_default(),
+                "mime": asset.map(|a| a.mime.clone()).unwrap_or_default(),
+                "declared_size_bytes": asset.map(|a| a.size_bytes),
+                "duration_seconds": asset.and_then(|a| a.duration_seconds),
+                "content_hash": asset.and_then(|a| a.content_hash.clone()),
+                "source_path": asset.map(|a| a.source_path.clone()).unwrap_or_default(),
+                "stored_path": asset.map(|a| a.stored_path.clone()).unwrap_or_default(),
+                "resolved_path": path,
+                "resolved_matches_stored_path": asset.map(|a| a.stored_path == *path).unwrap_or(false),
+                "extension": Path::new(path).extension().and_then(|value| value.to_str()).unwrap_or(""),
+                "exists": exists,
+                "actual_size_bytes": actual_size_bytes,
+                "modified_unix_secs": modified_unix_secs,
+                "metadata_error": metadata_error,
+            })
+        })
+        .collect()
+}
+
 fn build_prompt_for_cli(prompt: &str, rewrites: &[PromptMentionRewrite]) -> String {
     let prompt = prompt.trim();
     if rewrites.is_empty() {
@@ -1650,27 +2236,163 @@ fn build_prompt_for_cli(prompt: &str, rewrites: &[PromptMentionRewrite]) -> Stri
     rewrite_prompt_mentions(prompt, rewrites)
 }
 
+fn consecutive_transient_submit_retries(task: &ScheduledTask) -> u32 {
+    task.execution_records
+        .iter()
+        .rev()
+        .take_while(|record| record.status == "retry_wait" && record.error_kind == "Transient")
+        .count() as u32
+}
+
+fn latest_execution_record(task: &ScheduledTask) -> Option<&TaskExecutionRecord> {
+    task.execution_records
+        .iter()
+        .rev()
+        .find(|record| !record.status.trim().is_empty())
+}
+
+fn latest_record_is_transient_failure(task: &ScheduledTask) -> bool {
+    latest_execution_record(task)
+        .map(|record| record.status == "failed" && record.error_kind == "Transient")
+        .unwrap_or(false)
+}
+
+fn apply_submit_error_retry_state(
+    task: &mut ScheduledTask,
+    classified: &ClassifiedDreaminaError,
+    _concurrency_retry_max_attempts: u32,
+) -> String {
+    let mut next_status = classified.next_status.clone();
+    if classified.kind == DreaminaErrorKind::ConcurrencyLimit {
+        task.concurrency_retry_count += 1;
+    } else if classified.kind == DreaminaErrorKind::Transient
+        && next_status == "retry_wait"
+        && (consecutive_transient_submit_retries(task) >= MAX_TRANSIENT_SUBMIT_RETRIES
+            || latest_record_is_transient_failure(task))
+    {
+        next_status = "failed".to_string();
+    }
+    if next_status == "retry_wait" {
+        if let Some(seconds) = classified.retry_after_seconds {
+            task.next_run_at = Some((Utc::now() + Duration::seconds(seconds as i64)).to_rfc3339());
+        }
+    } else if next_status == "failed" {
+        task.next_run_at = None;
+    }
+    next_status
+}
+
+fn compact_submit_error_detail(kind: &str, message: &str) -> String {
+    match kind {
+        "ConcurrencyLimit" => "并发任务仍在生成中，已自动排队等待下次重试。".to_string(),
+        "Transient" => "提交时遇到临时网络或平台错误，已自动排队等待下次重试。".to_string(),
+        _ => message.trim().to_string(),
+    }
+}
+
+fn compact_failed_submit_error_detail(kind: &str, message: &str) -> String {
+    match kind {
+        "ConcurrencyLimit" => "并发任务仍在生成中，已自动排队等待下次重试。".to_string(),
+        "Transient" => "提交时遇到临时网络或平台错误，自动重试已达上限，已标记失败。".to_string(),
+        _ => message.trim().to_string(),
+    }
+}
+
+fn should_merge_retry_execution_record(status: &str, error_kind: &str) -> bool {
+    matches!(status, "retry_wait" | "failed")
+        && matches!(error_kind, "ConcurrencyLimit" | "Transient")
+}
+
+fn upsert_submit_execution_record(task: &mut ScheduledTask, record: TaskExecutionRecord) {
+    if should_merge_retry_execution_record(&record.status, &record.error_kind) {
+        if let Some(existing) = task
+            .execution_records
+            .iter_mut()
+            .rev()
+            .find(|item| {
+                matches!(item.status.as_str(), "retry_wait" | "failed")
+                    && item.error_kind == record.error_kind
+            })
+        {
+            existing.finished_at = record.finished_at;
+            existing.status = record.status;
+            existing.submit_id = record.submit_id;
+            existing.command_preview = record.command_preview;
+            existing.error_detail = record.error_detail;
+            return;
+        }
+    }
+    task.execution_records.push(record);
+}
+
+fn submit_execution_record_error_detail(status: &str, error_kind: &str, message: &str) -> String {
+    if message.trim().is_empty() {
+        String::new()
+    } else if status == "failed" {
+        compact_failed_submit_error_detail(error_kind, message)
+    } else {
+        compact_submit_error_detail(error_kind, message)
+    }
+}
+
+pub fn compact_retry_execution_records_for_display(data: &mut AppData) -> usize {
+    let mut removed = 0;
+
+    for task in &mut data.tasks {
+        let mut compacted = Vec::with_capacity(task.execution_records.len());
+
+        for mut record in task.execution_records.drain(..) {
+            if !should_merge_retry_execution_record(&record.status, &record.error_kind) {
+                compacted.push(record);
+                continue;
+            }
+
+            record.error_detail = submit_execution_record_error_detail(
+                &record.status,
+                &record.error_kind,
+                &record.error_detail,
+            );
+            let existing_index = compacted.iter().rposition(|existing: &TaskExecutionRecord| {
+                should_merge_retry_execution_record(&existing.status, &existing.error_kind)
+                    && existing.error_kind == record.error_kind
+            });
+
+            let Some(index) = existing_index else {
+                compacted.push(record);
+                continue;
+            };
+
+            if record.started_at >= compacted[index].started_at {
+                compacted[index] = record;
+            } else {
+                compacted[index].error_detail = submit_execution_record_error_detail(
+                    &compacted[index].status,
+                    &compacted[index].error_kind,
+                    &compacted[index].error_detail,
+                );
+            }
+            removed += 1;
+        }
+
+        task.execution_records = compacted;
+    }
+
+    removed
+}
+
 pub fn classify_dreamina_error(
     message: &str,
     settings: &SchedulerSettings,
 ) -> ClassifiedDreaminaError {
     let text = message.trim().to_string();
+    let lower_text = text.to_ascii_lowercase();
     if is_concurrency_limit(&text) {
-        return match settings.concurrency_limit_policy {
-            ConcurrencyLimitPolicy::SilentRetry => ClassifiedDreaminaError {
-                kind: DreaminaErrorKind::ConcurrencyLimit,
-                next_status: "retry_wait".to_string(),
-                retry_after_seconds: Some(settings.concurrency_retry_delay_seconds),
-                show_modal: false,
-                message: text,
-            },
-            ConcurrencyLimitPolicy::SilentFail => ClassifiedDreaminaError {
-                kind: DreaminaErrorKind::ConcurrencyLimit,
-                next_status: "failed".to_string(),
-                retry_after_seconds: None,
-                show_modal: false,
-                message: text,
-            },
+        return ClassifiedDreaminaError {
+            kind: DreaminaErrorKind::ConcurrencyLimit,
+            next_status: "retry_wait".to_string(),
+            retry_after_seconds: Some(settings.concurrency_retry_delay_seconds),
+            show_modal: false,
+            message: text,
         };
     }
     if text.contains("AigcComplianceConfirmationRequired") {
@@ -1686,6 +2408,14 @@ pub fn classify_dreamina_error(
         || text.contains("Unexpected token")
         || text.contains("context deadline exceeded")
         || text.contains("timeout")
+        || lower_text.contains("eof")
+        || lower_text.contains("applyimageupload")
+        || lower_text.contains("applyuploadinner")
+        || lower_text.contains("imagex.bytedanceapi.com")
+        || lower_text.contains("vod.bytedanceapi.com")
+        || lower_text.contains("upload video/audio")
+        || lower_text.contains("connection reset")
+        || lower_text.contains("broken pipe")
     {
         return ClassifiedDreaminaError {
             kind: DreaminaErrorKind::Transient,
@@ -1755,14 +2485,20 @@ pub fn parse_query_output(output: &str) -> QueryOutput {
     if let Some(value) = &parsed {
         collect_json_strings(value, &mut text);
     }
-    let queue_info = parsed.as_ref().and_then(|v| v.get("queue_info")).and_then(|qi| {
-        Some(QueueInfo {
-            queue_idx: qi.get("queue_idx").and_then(|v| v.as_u64()),
-            priority: qi.get("priority").and_then(|v| v.as_u64()),
-            queue_status: qi.get("queue_status").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            queue_length: qi.get("queue_length").and_then(|v| v.as_u64()),
-        })
-    });
+    let queue_info = parsed
+        .as_ref()
+        .and_then(|v| v.get("queue_info"))
+        .and_then(|qi| {
+            Some(QueueInfo {
+                queue_idx: qi.get("queue_idx").and_then(|v| v.as_u64()),
+                priority: qi.get("priority").and_then(|v| v.as_u64()),
+                queue_status: qi
+                    .get("queue_status")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                queue_length: qi.get("queue_length").and_then(|v| v.as_u64()),
+            })
+        });
     QueryOutput {
         gen_status: parsed
             .as_ref()
@@ -2202,6 +2938,173 @@ pub fn create_task_with_preview(
     Ok(task)
 }
 
+fn mcp_orientation_to_ratio(value: Option<&str>) -> Result<String, SchedulerError> {
+    match value
+        .unwrap_or("portrait")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "portrait" | "vertical" | "9:16" => Ok("9:16".to_string()),
+        "landscape" | "horizontal" | "16:9" => Ok("16:9".to_string()),
+        other => Err(SchedulerError::UnsupportedRatio(other.to_string())),
+    }
+}
+
+fn mcp_model_to_version(value: Option<&str>) -> Result<String, SchedulerError> {
+    match value.unwrap_or("fast").trim().to_ascii_lowercase().as_str() {
+        "" | "fast" | "seedance2.0fast" => Ok("seedance2.0fast".to_string()),
+        "standard" | "seedance2.0" => Ok("seedance2.0".to_string()),
+        other => Err(SchedulerError::UnsupportedModel(other.to_string())),
+    }
+}
+
+fn mcp_video_params_from_parts(
+    orientation: Option<&str>,
+    model: Option<&str>,
+    duration: Option<u8>,
+    video_resolution: Option<&str>,
+) -> Result<VideoParams, SchedulerError> {
+    let params = VideoParams {
+        model_version: mcp_model_to_version(model)?,
+        ratio: mcp_orientation_to_ratio(orientation)?,
+        duration: duration.unwrap_or(15),
+        video_resolution: video_resolution.unwrap_or("720p").trim().to_string(),
+    };
+    validate_video_params(&params)?;
+    Ok(params)
+}
+
+fn import_mcp_asset_from_path(
+    assets_dir: &Path,
+    source_path: &str,
+) -> Result<Asset, SchedulerError> {
+    let source = PathBuf::from(source_path);
+    let mut asset = Asset::from_path(&source, assets_dir, None)?;
+    asset.tags.push("mcp".to_string());
+    Ok(asset)
+}
+
+pub fn queue_mcp_video_task(
+    data: &mut AppData,
+    assets_dir: &Path,
+    input: McpVideoTaskInput,
+) -> Result<McpQueuedVideoTask, SchedulerError> {
+    let mut imported_assets = Vec::new();
+    let mut image_asset_ids = Vec::new();
+    let mut audio_asset_ids = Vec::new();
+    let mcp_assets_dir = assets_dir.join("mcp");
+
+    for path in &input.image_paths {
+        let asset = import_mcp_asset_from_path(&mcp_assets_dir, path)?;
+        if asset.kind != AssetKind::Image {
+            return Err(SchedulerError::UnsupportedAssetType(asset.mime));
+        }
+        image_asset_ids.push(asset.id.clone());
+        imported_assets.push(asset);
+    }
+    for path in &input.audio_paths {
+        let asset = import_mcp_asset_from_path(&mcp_assets_dir, path)?;
+        if asset.kind != AssetKind::Audio {
+            return Err(SchedulerError::UnsupportedAssetType(asset.mime));
+        }
+        audio_asset_ids.push(asset.id.clone());
+        imported_assets.push(asset);
+    }
+
+    let draft = TaskDraft {
+        title: input.title,
+        prompt: input.prompt,
+        image_asset_ids,
+        audio_asset_ids,
+        role_ids: vec![],
+        manual_mention_ids: vec![],
+        auto_match_roles: false,
+        params: mcp_video_params_from_parts(
+            input.orientation.as_deref(),
+            input.model.as_deref(),
+            input.duration,
+            input.video_resolution.as_deref(),
+        )?,
+        scheduled_at: input.start_at.filter(|value| !value.trim().is_empty()),
+        temp_image_asset_ids: vec![],
+        temp_image_paths: vec![],
+    };
+    let mut preview_data = data.clone();
+    preview_data.assets.extend(imported_assets.clone());
+    let mut task = create_task_with_preview(&preview_data, draft)?;
+    task.planned_submit_count =
+        normalize_planned_submit_count(input.planned_submit_count.unwrap_or(1));
+    data.assets.extend(imported_assets.clone());
+    data.tasks.push(task.clone());
+    append_log(
+        data,
+        LogEntryDraft {
+            level: LogLevel::Success,
+            source: LogSource::Scheduler,
+            category: "task".to_string(),
+            event_type: "mcp_create".to_string(),
+            message: format!("MCP 创建任务：{}", task.title),
+            detail: String::new(),
+            task_id: Some(task.id.clone()),
+            task_title: Some(task.title.clone()),
+            submit_id: None,
+            execution_record_id: None,
+            error_detail: None,
+            raw_output: None,
+            stdout: None,
+            stderr: None,
+            module: Some("mcp".to_string()),
+        },
+    );
+
+    Ok(McpQueuedVideoTask {
+        task,
+        imported_assets,
+    })
+}
+
+fn merge_mcp_video_defaults(
+    mut item: McpVideoTaskInput,
+    start_at: &Option<String>,
+    defaults: &McpVideoTaskDefaults,
+) -> McpVideoTaskInput {
+    if item.start_at.is_none() {
+        item.start_at = start_at.clone();
+    }
+    if item.orientation.is_none() {
+        item.orientation = defaults.orientation.clone();
+    }
+    if item.model.is_none() {
+        item.model = defaults.model.clone();
+    }
+    if item.duration.is_none() {
+        item.duration = defaults.duration;
+    }
+    if item.video_resolution.is_none() {
+        item.video_resolution = defaults.video_resolution.clone();
+    }
+    if item.planned_submit_count.is_none() {
+        item.planned_submit_count = defaults.planned_submit_count;
+    }
+    item
+}
+
+pub fn queue_mcp_video_tasks(
+    data: &mut AppData,
+    assets_dir: &Path,
+    input: McpQueueVideosInput,
+) -> Result<Vec<McpQueuedVideoTask>, SchedulerError> {
+    let mut working = data.clone();
+    let mut queued = Vec::new();
+    for item in input.items {
+        let merged = merge_mcp_video_defaults(item, &input.start_at, &input.defaults);
+        queued.push(queue_mcp_video_task(&mut working, assets_dir, merged)?);
+    }
+    *data = working;
+    Ok(queued)
+}
+
 pub fn create_draft_task(
     data: &AppData,
     draft: TaskDraft,
@@ -2286,14 +3189,19 @@ pub fn backfill_execution_records_from_attempts(data: &mut AppData) -> usize {
     for task in &mut data.tasks {
         let attempts = task.attempts.clone();
         for attempt in attempts.iter().filter(|attempt| {
-            attempt.command_preview.first().map(|cmd| cmd == "multimodal2video").unwrap_or(false)
+            attempt
+                .command_preview
+                .first()
+                .map(|cmd| cmd == "multimodal2video")
+                .unwrap_or(false)
         }) {
             let raw = format!("{}\n{}", attempt.stdout, attempt.stderr);
             let parsed = parse_submit_output(&raw);
             let submit_id = parsed.submit_id.unwrap_or_default();
             let already_exists = if submit_id.is_empty() {
                 task.execution_records.iter().any(|record| {
-                    record.started_at == attempt.started_at && record.command_preview == attempt.command_preview
+                    record.started_at == attempt.started_at
+                        && record.command_preview == attempt.command_preview
                 })
             } else {
                 task.execution_records
@@ -2304,10 +3212,18 @@ pub fn backfill_execution_records_from_attempts(data: &mut AppData) -> usize {
                 continue;
             }
 
-            task.execution_records.push(TaskExecutionRecord {
+            let status = attempt.status.clone();
+            let error_kind = attempt.error_kind.clone();
+            let error_detail = submit_execution_record_error_detail(
+                &status,
+                &error_kind,
+                &attempt.error_detail,
+            );
+            let before_len = task.execution_records.len();
+            upsert_submit_execution_record(task, TaskExecutionRecord {
                 id: format!("exec_legacy_{}", attempt.id),
                 submit_id,
-                status: attempt.status.clone(),
+                status,
                 started_at: attempt.started_at.clone(),
                 finished_at: attempt.finished_at.clone(),
                 input_snapshot: TaskExecutionInputSnapshot {
@@ -2324,14 +3240,20 @@ pub fn backfill_execution_records_from_attempts(data: &mut AppData) -> usize {
                 query_records: vec![],
                 result_paths: vec![],
                 result_urls: vec![],
-                error_kind: attempt.error_kind.clone(),
-                error_detail: attempt.error_detail.clone(),
+                error_kind,
+                error_detail,
             });
-            updated += 1;
+            if task.execution_records.len() > before_len {
+                updated += 1;
+            }
         }
 
         for attempt in attempts.iter().filter(|attempt| {
-            attempt.command_preview.first().map(|cmd| cmd == "query_result").unwrap_or(false)
+            attempt
+                .command_preview
+                .first()
+                .map(|cmd| cmd == "query_result")
+                .unwrap_or(false)
         }) {
             let submit_id = query_submit_id_from_attempt(attempt);
             if submit_id.is_empty() {
@@ -2344,7 +3266,11 @@ pub fn backfill_execution_records_from_attempts(data: &mut AppData) -> usize {
             else {
                 continue;
             };
-            if !record.query_records.iter().any(|query| query.id == attempt.id) {
+            if !record
+                .query_records
+                .iter()
+                .any(|query| query.id == attempt.id)
+            {
                 record.query_records.push(attempt.clone());
             }
             let raw = format!("{}\n{}", attempt.stdout, attempt.stderr);
@@ -2392,6 +3318,7 @@ pub fn backfill_execution_records_from_attempts(data: &mut AppData) -> usize {
 }
 
 pub fn recover_tasks_on_load(data: &mut AppData) {
+    let settings = data.settings.clone();
     for task in &mut data.tasks {
         // 清理旧数据中残留的"应用重启，查询中断"文案（迁移兼容）
         for rec in &mut task.execution_records {
@@ -2407,7 +3334,18 @@ pub fn recover_tasks_on_load(data: &mut AppData) {
                 task.last_error = "自动查询已超时，请手动查询".to_string();
             }
         }
-        if task.status == "submitting" {
+        if task.status == "retry_wait" && is_concurrency_limit(&task.last_error) {
+            recover_failed_concurrency_execution_record(task);
+        }
+        if should_recover_failed_concurrency_limit(task, &settings) {
+            task.status = "retry_wait".to_string();
+            task.next_run_at = Some(
+                (Utc::now() + Duration::seconds(settings.concurrency_retry_delay_seconds as i64))
+                    .to_rfc3339(),
+            );
+            task.updated_at = now_rfc3339();
+            recover_failed_concurrency_execution_record(task);
+        } else if task.status == "submitting" {
             task.status = "queued".to_string();
             task.last_error.clear();
         } else if task.status == "querying" {
@@ -2472,7 +3410,9 @@ pub fn delete_execution_record_from_data(
         .retain(|r| r.id != execution_id);
 
     if data.tasks[task_index].execution_records.len() == before_count {
-        return Err(SchedulerError::Io(format!("找不到执行记录：{execution_id}")));
+        return Err(SchedulerError::Io(format!(
+            "找不到执行记录：{execution_id}"
+        )));
     }
 
     let current_submit_id = data.tasks[task_index].submit_id.clone();
@@ -2565,7 +3505,9 @@ fn archive_task_results_into_matching_execution_record(task: &mut ScheduledTask)
             changed = true;
         }
     }
-    if (!task.result_paths.is_empty() || !task.result_urls.is_empty()) && record.status != "succeeded" {
+    if (!task.result_paths.is_empty() || !task.result_urls.is_empty())
+        && record.status != "succeeded"
+    {
         record.status = "succeeded".to_string();
         changed = true;
     }
@@ -2634,6 +3576,245 @@ fn validate_draft_references(data: &AppData, draft: &TaskDraft) -> Result<(), Sc
     Ok(())
 }
 
+fn planned_submit_count(task: &ScheduledTask) -> u32 {
+    normalize_planned_submit_count(task.planned_submit_count)
+}
+
+fn successful_execution_count(task: &ScheduledTask) -> u32 {
+    let record_count = task
+        .execution_records
+        .iter()
+        .filter(|record| record.status == "succeeded")
+        .count() as u32;
+    if record_count > 0 {
+        return record_count;
+    }
+    if task.status == "succeeded"
+        && (!task.submit_id.trim().is_empty()
+            || !task.result_paths.is_empty()
+            || !task.result_urls.is_empty())
+    {
+        return 1;
+    }
+    0
+}
+
+fn needs_more_successful_submits(task: &ScheduledTask) -> bool {
+    successful_execution_count(task) < planned_submit_count(task)
+}
+
+fn ensure_task_has_pending_submit(task: &mut ScheduledTask) {
+    let successful = successful_execution_count(task);
+    if successful >= planned_submit_count(task) {
+        task.planned_submit_count = normalize_planned_submit_count(successful.saturating_add(1));
+    }
+}
+
+fn is_active_remote_task(task: &ScheduledTask) -> bool {
+    task.status == "submitting"
+        || ((task.status == "querying" || task.status == "submitted")
+            && !task.submit_id.trim().is_empty()
+            && !task.auto_query_stopped)
+}
+
+fn has_concurrency_cooldown(data: &AppData, now: DateTime<Utc>) -> bool {
+    data.tasks.iter().any(|task| {
+        task.status == "retry_wait"
+            && is_concurrency_limit(&task.last_error)
+            && !is_due(task.next_run_at.as_deref(), now)
+    })
+}
+
+fn is_due_for_submit(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
+    task.status == "queued"
+        || (task.status == "retry_wait" && is_due(task.next_run_at.as_deref(), now))
+        || (task.status == "scheduled" && is_due(task.next_run_at.as_deref(), now))
+}
+
+fn due_sort_key(task: &ScheduledTask) -> String {
+    task.next_run_at
+        .clone()
+        .or_else(|| task.scheduled_at.clone())
+        .unwrap_or_else(|| task.created_at.clone())
+}
+
+fn retryable_failed_execution_count(task: &ScheduledTask, error_kind: &str) -> u32 {
+    task.execution_records
+        .iter()
+        .filter(|record| record.status == "failed" && record.error_kind == error_kind)
+        .count() as u32
+}
+
+fn retryable_idle_failed_limit(error_kind: &str) -> u32 {
+    match error_kind {
+        "Transient" => MAX_IDLE_TRANSIENT_FAILED_RETRIES,
+        "ConcurrencyLimit" => MAX_IDLE_CONCURRENCY_FAILED_RETRIES,
+        _ => 0,
+    }
+}
+
+fn record_finished_or_started_at(record: &TaskExecutionRecord) -> &str {
+    if record.finished_at.trim().is_empty() {
+        record.started_at.as_str()
+    } else {
+        record.finished_at.as_str()
+    }
+}
+
+fn is_recent_concurrency_failure(record: &TaskExecutionRecord, now: DateTime<Utc>) -> bool {
+    if record.error_kind != "ConcurrencyLimit" {
+        return true;
+    }
+    DateTime::parse_from_rfc3339(record_finished_or_started_at(record))
+        .map(|time| {
+            now.signed_duration_since(time.with_timezone(&Utc))
+                <= Duration::hours(MAX_CONCURRENCY_FAILURE_RECOVERY_HOURS)
+        })
+        .unwrap_or(false)
+}
+
+fn is_idle_failed_retry_due(
+    task: &ScheduledTask,
+    now: DateTime<Utc>,
+    retry_delay_seconds: u64,
+) -> bool {
+    if task.status != "failed" || !needs_more_successful_submits(task) {
+        return false;
+    }
+    let Some(latest) = latest_execution_record(task) else {
+        return false;
+    };
+    if latest.status != "failed" {
+        return false;
+    }
+    let retry_limit = retryable_idle_failed_limit(latest.error_kind.as_str());
+    if retry_limit == 0 {
+        return false;
+    }
+    if !is_recent_concurrency_failure(latest, now) {
+        return false;
+    }
+    let failed_count = retryable_failed_execution_count(task, latest.error_kind.as_str());
+    if failed_count == 0 || failed_count > retry_limit {
+        return false;
+    }
+    DateTime::parse_from_rfc3339(record_finished_or_started_at(latest))
+        .map(|time| now >= time.with_timezone(&Utc) + Duration::seconds(retry_delay_seconds as i64))
+        .unwrap_or(true)
+}
+
+fn should_recover_failed_concurrency_limit(
+    task: &ScheduledTask,
+    settings: &SchedulerSettings,
+) -> bool {
+    if task.status != "failed"
+        || settings.concurrency_limit_policy != ConcurrencyLimitPolicy::SilentRetry
+    {
+        return false;
+    }
+    latest_execution_record(task)
+        .map(|record| {
+            record.status == "failed"
+                && is_recent_concurrency_failure(record, Utc::now())
+                && (record.error_kind == "ConcurrencyLimit" || is_concurrency_limit(&task.last_error))
+        })
+        .unwrap_or(false)
+}
+
+fn recover_failed_concurrency_execution_record(task: &mut ScheduledTask) {
+    if let Some(record) = task
+        .execution_records
+        .iter_mut()
+        .rev()
+        .find(|record| {
+            record.status == "failed"
+                && (record.error_kind == "ConcurrencyLimit"
+                    || is_concurrency_limit(&record.error_detail))
+        })
+    {
+        record.status = "retry_wait".to_string();
+        record.error_kind = "ConcurrencyLimit".to_string();
+        record.error_detail = compact_submit_error_detail("ConcurrencyLimit", &record.error_detail);
+        record.finished_at = now_rfc3339();
+    }
+}
+
+fn next_due_submit_task_id(data: &AppData, now: DateTime<Utc>) -> Option<String> {
+    data.tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, task)| needs_more_successful_submits(task) && is_due_for_submit(task, now))
+        .min_by(|(left_index, left), (right_index, right)| {
+            successful_execution_count(left)
+                .cmp(&successful_execution_count(right))
+                .then_with(|| due_sort_key(left).cmp(&due_sort_key(right)))
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left_index.cmp(right_index))
+        })
+        .map(|(_, task)| task.id.clone())
+}
+
+fn next_idle_failed_retry_task_id(data: &AppData, now: DateTime<Utc>) -> Option<String> {
+    let retry_delay_seconds = data.settings.concurrency_retry_delay_seconds;
+    data.tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, task)| is_idle_failed_retry_due(task, now, retry_delay_seconds))
+        .min_by(|(left_index, left), (right_index, right)| {
+            successful_execution_count(left)
+                .cmp(&successful_execution_count(right))
+                .then_with(|| {
+                    retryable_failed_execution_count(left, "Transient")
+                        .cmp(&retryable_failed_execution_count(right, "Transient"))
+                })
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left_index.cmp(right_index))
+        })
+        .map(|(_, task)| task.id.clone())
+}
+
+fn next_submit_task_id(data: &AppData, now: DateTime<Utc>) -> Option<String> {
+    next_due_submit_task_id(data, now).or_else(|| next_idle_failed_retry_task_id(data, now))
+}
+
+fn apply_planned_submit_completion(task: &mut ScheduledTask) {
+    if task.status != "succeeded" {
+        return;
+    }
+    if needs_more_successful_submits(task) {
+        task.status = "queued".to_string();
+        task.next_run_at = None;
+    }
+}
+
+pub fn set_task_planned_submit_count(
+    data: &mut AppData,
+    task_id: &str,
+    count: u32,
+) -> Result<ScheduledTask, SchedulerError> {
+    let task_index = data
+        .tasks
+        .iter()
+        .position(|task| task.id == task_id)
+        .ok_or_else(|| SchedulerError::Io(format!("找不到任务：{task_id}")))?;
+    let task = &mut data.tasks[task_index];
+    task.planned_submit_count = normalize_planned_submit_count(count);
+    if !is_active_remote_task(task) {
+        if needs_more_successful_submits(task) {
+            if task.status == "succeeded" || task.status == "failed" {
+                task.status = "queued".to_string();
+                task.next_run_at = None;
+                task.last_error.clear();
+                task.finished_at.clear();
+            }
+        } else {
+            task.status = "succeeded".to_string();
+        }
+    }
+    task.updated_at = now_rfc3339();
+    Ok(task.clone())
+}
+
 pub fn process_next_due_task(data: &mut AppData) -> Result<Option<ScheduledTask>, SchedulerError> {
     process_next_due_task_with_runner(data, |args| run_dreamina_command(args))
 }
@@ -2649,34 +3830,43 @@ where
         return Ok(None);
     }
 
+    let now = Utc::now();
     if let Some(task_id) = data
         .tasks
         .iter()
-        .find(|task| task.status == "querying" && !task.submit_id.trim().is_empty())
-        .map(|task| task.id.clone())
+        .find(|task| {
+            (task.status == "querying" || task.status == "submitted")
+                && !task.submit_id.trim().is_empty()
+                && !task.auto_query_stopped
+        })
+        .map(|task| {
+            if is_backoff_due(task, now) {
+                Some(task.id.clone())
+            } else {
+                None
+            }
+        })
     {
+        let Some(task_id) = task_id else {
+            return Ok(None);
+        };
         return query_task_once_with_runner(data, &task_id, &mut runner).map(Some);
     }
 
-    let now = Utc::now();
-    if let Some(task) = data
+    if has_concurrency_cooldown(data, now) {
+        return Ok(None);
+    }
+
+    for task in data
         .tasks
         .iter_mut()
-        .find(|task| task.status == "scheduled" && is_due(task.next_run_at.as_deref(), now))
+        .filter(|task| task.status == "scheduled" && is_due(task.next_run_at.as_deref(), now))
     {
         task.status = "queued".to_string();
         task.updated_at = now_rfc3339();
     }
 
-    let Some(task_id) = data
-        .tasks
-        .iter()
-        .find(|task| {
-            task.status == "queued"
-                || (task.status == "retry_wait" && is_due(task.next_run_at.as_deref(), now))
-        })
-        .map(|task| task.id.clone())
-    else {
+    let Some(task_id) = next_submit_task_id(data, now) else {
         return Ok(None);
     };
 
@@ -2760,6 +3950,7 @@ pub fn reschedule_task(
         )));
     }
     if new_scheduled_at.trim().is_empty() {
+        ensure_task_has_pending_submit(&mut data.tasks[task_index]);
         data.tasks[task_index].scheduled_at = None;
         data.tasks[task_index].next_run_at = None;
         data.tasks[task_index].status = "queued".to_string();
@@ -2773,6 +3964,7 @@ pub fn reschedule_task(
             }
         }
     }
+    ensure_task_has_pending_submit(&mut data.tasks[task_index]);
     data.tasks[task_index].scheduled_at = Some(new_scheduled_at.to_string());
     data.tasks[task_index].next_run_at = Some(new_scheduled_at.to_string());
     data.tasks[task_index].status = "scheduled".to_string();
@@ -2913,39 +4105,58 @@ pub fn download_result_urls(urls: &[String], results_dir: &Path) -> Vec<String> 
     saved
 }
 
-/// 从快照中探测下一个应执行的 CLI 调用：(task_id, args, is_query)。
+#[derive(Debug, Clone)]
+pub struct DueTaskCli {
+    pub task_id: String,
+    pub args: Vec<String>,
+    pub is_query: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DueTaskBuildError {
+    pub task_id: String,
+    pub task_title: String,
+    pub message: String,
+}
+
+/// 从快照中探测下一个应执行的 CLI 调用。
 /// 不修改 data，供 async 命令在锁外预先构建参数。
-pub fn peek_due_task_cli(data: &AppData) -> Option<(String, Vec<String>, bool)> {
+pub fn peek_due_task_cli(data: &AppData) -> Result<Option<DueTaskCli>, DueTaskBuildError> {
     if data.tasks.iter().any(|t| t.status == "submitting") {
-        return None;
+        return Ok(None);
     }
     let now = Utc::now();
-    // 优先处理已提交、正在排队的任务（querying = 有 submit_id 且自动查询未停止）
-    if let Some(task) = data
-        .tasks
-        .iter()
-        .find(|t| {
-            (t.status == "querying" || t.status == "submitted")
+    // 优先处理已提交、正在排队的任务；未到查询退避时阻塞新提交。
+    if let Some(task) = data.tasks.iter().find(|t| {
+        (t.status == "querying" || t.status == "submitted")
             && !t.submit_id.trim().is_empty()
             && !t.auto_query_stopped
-            && is_backoff_due(t, now)
-        })
-    {
+    }) {
+        if !is_backoff_due(task, now) {
+            return Ok(None);
+        }
         // 对于 querying 状态且超过 4 小时的任务，标记停止（不在 peek 中修改数据，返回 None）
         // 让 process_queue_command 的锁内部分处理
         let args = vec![
             "query_result".to_string(),
             format!("--submit_id={}", task.submit_id),
         ];
-        return Some((task.id.clone(), args, true));
+        return Ok(Some(DueTaskCli {
+            task_id: task.id.clone(),
+            args,
+            is_query: true,
+        }));
     }
-    let now = Utc::now();
-    // 找下一个待提交任务（包含 scheduled 到期的）
-    let task = data.tasks.iter().find(|t| {
-        t.status == "queued"
-            || (t.status == "retry_wait" && is_due(t.next_run_at.as_deref(), now))
-            || (t.status == "scheduled" && is_due(t.next_run_at.as_deref(), now))
-    })?;
+    if has_concurrency_cooldown(data, now) {
+        return Ok(None);
+    }
+    // 找下一个待提交任务；普通任务优先，队列空闲时再补试瞬时失败任务。
+    let Some(task_id) = next_submit_task_id(data, now) else {
+        return Ok(None);
+    };
+    let Some(task) = data.tasks.iter().find(|task| task.id == task_id) else {
+        return Ok(None);
+    };
     let draft = TaskDraft {
         title: task.title.clone(),
         prompt: task.prompt.clone(),
@@ -2959,9 +4170,30 @@ pub fn peek_due_task_cli(data: &AppData) -> Option<(String, Vec<String>, bool)> 
         temp_image_asset_ids: task.temp_image_asset_ids.clone(),
         temp_image_paths: task.temp_image_paths.clone(),
     };
-    let resolved = resolve_task_inputs(&draft, &data.assets, &data.roles).ok()?;
-    let args = build_multimodal2video_args(&draft, &resolved).ok()?;
-    Some((task.id.clone(), args, false))
+    let resolved = resolve_task_inputs(&draft, &data.assets, &data.roles).map_err(|error| {
+        DueTaskBuildError {
+            task_id: task.id.clone(),
+            task_title: task.title.clone(),
+            message: format!("构建提交输入失败：{error}"),
+        }
+    })?;
+    let args =
+        build_multimodal2video_args(&draft, &resolved).map_err(|error| DueTaskBuildError {
+            task_id: task.id.clone(),
+            task_title: task.title.clone(),
+            message: format!("构建提交命令失败：{error}"),
+        })?;
+    Ok(Some(DueTaskCli {
+        task_id: task.id.clone(),
+        args,
+        is_query: false,
+    }))
+}
+
+/// 后台调度循环的空闲短路判定：仅当存在活跃任务、或有到期工作（含构建出错需处理）时才跑重函数。
+/// 完全空闲（无活跃任务且 `peek_due_task_cli` 返回 Ok(None)）时返回 false，跳过整份读写与噪音日志。
+pub fn should_process_now(data: &AppData) -> bool {
+    has_active_tasks(&data.tasks) || !matches!(peek_due_task_cli(data), Ok(None))
 }
 
 pub fn query_task_once_with_runner<F>(
@@ -3071,7 +4303,8 @@ where
         final_status = "succeeded".to_string();
         final_result_paths = parsed.result_paths;
         final_result_urls = parsed.result_urls;
-    } else if status_text.contains("fail") || status_text.contains("cancel")
+    } else if status_text.contains("fail")
+        || status_text.contains("cancel")
         || parsed.error_code.map_or(false, |c| c >= 400)
     {
         final_status = "failed".to_string();
@@ -3096,9 +4329,7 @@ where
                 MAX_NO_REMOTE_QUEUE_INFO_MINUTES
             );
             reset_query_backoff(&mut data.tasks[task_index]);
-        } else if !is_manual
-            && is_current_submit
-            && is_past_max_wait(&data.tasks[task_index], now)
+        } else if !is_manual && is_current_submit && is_past_max_wait(&data.tasks[task_index], now)
         {
             // 检查是否超过 4 小时等待上限（手动查询不触发该限制）
             final_status = "submitted".to_string();
@@ -3188,6 +4419,7 @@ where
             rec.error_detail = final_error_detail;
         }
     }
+    apply_planned_submit_completion(&mut data.tasks[task_index]);
     Ok(data.tasks[task_index].clone())
 }
 
@@ -3243,13 +4475,48 @@ where
     data.tasks[task_index].updated_at = now_rfc3339();
     // 重置退避状态
     reset_query_backoff(&mut data.tasks[task_index]);
+    let preflight_detail =
+        build_submit_preflight_detail(&data.tasks[task_index], &resolved, &data.assets);
+    let log_task = data.tasks[task_index].clone();
+    append_task_log(
+        data,
+        &log_task,
+        LogEntryDraft {
+            level: LogLevel::Info,
+            source: LogSource::Worker,
+            category: "task".to_string(),
+            event_type: "submit_preflight".to_string(),
+            message: format!("提交前素材诊断：{}", log_task.title),
+            detail: preflight_detail.clone(),
+            task_id: None,
+            task_title: None,
+            submit_id: None,
+            execution_record_id: None,
+            error_detail: None,
+            raw_output: None,
+            stdout: None,
+            stderr: None,
+            module: Some("submit".to_string()),
+        },
+    );
 
     let (stdout, stderr) = match runner(&args) {
         Ok(output) => output,
         Err(message) => {
             let finished = now_rfc3339();
             let duration_secs = calc_duration_seconds(&started_at, &finished);
-            data.tasks[task_index].status = "failed".to_string();
+            let classified = classify_dreamina_error(&message, &data.settings);
+            let concurrency_retry_max_attempts = data.settings.concurrency_retry_max_attempts;
+            let next_status = apply_submit_error_retry_state(
+                &mut data.tasks[task_index],
+                &classified,
+                concurrency_retry_max_attempts,
+            );
+            let error_kind = format!("{:?}", classified.kind);
+            let display_error_detail = compact_submit_error_detail(&error_kind, &message);
+            let diagnostic_error_detail =
+                format!("{message}\n\nsubmit_preflight={preflight_detail}");
+            data.tasks[task_index].status = next_status.clone();
             data.tasks[task_index].last_error = message.clone();
             data.tasks[task_index].updated_at = finished.clone();
             let input_snapshot = TaskExecutionInputSnapshot {
@@ -3266,52 +4533,88 @@ where
                 id: format!("attempt_{}", Uuid::new_v4().simple()),
                 started_at: started_at.clone(),
                 finished_at: finished.clone(),
-                status: "failed".to_string(),
+                status: next_status.clone(),
                 command_preview: args.clone(),
                 stdout: String::new(),
                 stderr: truncate_log(&message),
-                error_kind: String::new(),
+                error_kind: error_kind.clone(),
                 duration_seconds: duration_secs,
-                error_detail: message.clone(),
+                error_detail: diagnostic_error_detail.clone(),
             });
-            data.tasks[task_index].execution_records.push(TaskExecutionRecord {
-                id: format!("exec_{}", Uuid::new_v4().simple()),
-                submit_id: String::new(),
-                status: "failed".to_string(),
-                started_at,
-                finished_at: finished,
-                input_snapshot,
-                command_preview: args,
-                query_records: vec![],
-                result_paths: vec![],
-                result_urls: vec![],
-                error_kind: String::new(),
-                error_detail: message,
-            });
+            upsert_submit_execution_record(
+                &mut data.tasks[task_index],
+                TaskExecutionRecord {
+                    id: format!("exec_{}", Uuid::new_v4().simple()),
+                    submit_id: String::new(),
+                    status: next_status,
+                    started_at,
+                    finished_at: finished,
+                    input_snapshot,
+                    command_preview: args,
+                    query_records: vec![],
+                    result_paths: vec![],
+                    result_urls: vec![],
+                    error_kind,
+                    error_detail: display_error_detail,
+                },
+            );
             return Ok(data.tasks[task_index].clone());
         }
     };
     let raw = format!("{}\n{}", stdout, stderr);
     let parsed = parse_submit_output(&raw);
     let mut error_kind = String::new();
+    let mut record_submit_id = String::new();
+
+    let submit_failed = parsed
+        .gen_status
+        .as_deref()
+        .map(|status| {
+            let normalized = status.trim().to_ascii_lowercase();
+            normalized.contains("fail") || normalized.contains("cancel")
+        })
+        .unwrap_or(false);
+    let submit_failure_message = parsed
+        .fail_reason
+        .clone()
+        .unwrap_or_else(|| raw.trim().to_string());
 
     if let Some(submit_id) = parsed.submit_id {
-        data.tasks[task_index].submit_id = submit_id;
-        data.tasks[task_index].submitted_at = Some(started_at.clone());
-        data.tasks[task_index].server_error_retry_count = 0;
-        data.tasks[task_index].status = if parsed.gen_status.as_deref() == Some("success") {
-            "succeeded".to_string()
-        } else if data.settings.auto_query_enabled {
-            "querying".to_string()
+        record_submit_id = submit_id.clone();
+        if submit_failed {
+            let classified = classify_dreamina_error(&submit_failure_message, &data.settings);
+            error_kind = format!("{:?}", classified.kind);
+            let concurrency_retry_max_attempts = data.settings.concurrency_retry_max_attempts;
+            let next_status = apply_submit_error_retry_state(
+                &mut data.tasks[task_index],
+                &classified,
+                concurrency_retry_max_attempts,
+            );
+            data.tasks[task_index].submit_id.clear();
+            data.tasks[task_index].submitted_at = None;
+            data.tasks[task_index].status = next_status;
+            data.tasks[task_index].last_error = submit_failure_message;
         } else {
-            "submitted".to_string()
-        };
-        data.tasks[task_index].last_error.clear();
+            data.tasks[task_index].submit_id = submit_id;
+            data.tasks[task_index].submitted_at = Some(started_at.clone());
+            data.tasks[task_index].server_error_retry_count = 0;
+            data.tasks[task_index].concurrency_retry_count = 0;
+            data.tasks[task_index].status = if parsed.gen_status.as_deref() == Some("success") {
+                "succeeded".to_string()
+            } else if data.settings.auto_query_enabled {
+                "querying".to_string()
+            } else {
+                "submitted".to_string()
+            };
+            data.tasks[task_index].last_error.clear();
+        }
     } else {
         let message = parsed.fail_reason.unwrap_or_else(|| raw.trim().to_string());
         // 5xx 服务器错误（如 HTTP 500-599 或 Dreamina 自定义 50000-59999）：
         // 可能是平台侧瞬时故障，自动重试最多 MAX_SERVER_ERROR_RETRIES 次
-        if parsed.error_code.map_or(false, |c| (c >= 500 && c < 600) || (c >= 50000 && c < 60000)) {
+        if parsed.error_code.map_or(false, |c| {
+            (c >= 500 && c < 600) || (c >= 50000 && c < 60000)
+        }) {
             data.tasks[task_index].server_error_retry_count += 1;
             error_kind = format!("{:?}", DreaminaErrorKind::Transient);
             if data.tasks[task_index].server_error_retry_count <= MAX_SERVER_ERROR_RETRIES {
@@ -3326,27 +4629,16 @@ where
             }
             data.tasks[task_index].last_error = message;
         } else {
-        let classified = classify_dreamina_error(&message, &data.settings);
-        error_kind = format!("{:?}", classified.kind);
-        let mut next_status = classified.next_status.clone();
-        if classified.kind == DreaminaErrorKind::ConcurrencyLimit {
-            data.tasks[task_index].concurrency_retry_count += 1;
-            if data.tasks[task_index].concurrency_retry_count
-                > data.settings.concurrency_retry_max_attempts
-            {
-                next_status = "failed".to_string();
-            } else if let Some(seconds) = classified.retry_after_seconds {
-                data.tasks[task_index].next_run_at =
-                    Some((Utc::now() + Duration::seconds(seconds as i64)).to_rfc3339());
-            }
-        } else if next_status == "retry_wait" {
-            if let Some(seconds) = classified.retry_after_seconds {
-                data.tasks[task_index].next_run_at =
-                    Some((Utc::now() + Duration::seconds(seconds as i64)).to_rfc3339());
-            }
-        }
-        data.tasks[task_index].status = next_status;
-        data.tasks[task_index].last_error = message;
+            let classified = classify_dreamina_error(&message, &data.settings);
+            error_kind = format!("{:?}", classified.kind);
+            let concurrency_retry_max_attempts = data.settings.concurrency_retry_max_attempts;
+            let next_status = apply_submit_error_retry_state(
+                &mut data.tasks[task_index],
+                &classified,
+                concurrency_retry_max_attempts,
+            );
+            data.tasks[task_index].status = next_status;
+            data.tasks[task_index].last_error = message;
         } // end else (non-5xx)
     }
     data.tasks[task_index].updated_at = now_rfc3339();
@@ -3354,7 +4646,23 @@ where
     let finished = now_rfc3339();
     let duration_secs = calc_duration_seconds(&started_at, &finished);
     let error_detail = data.tasks[task_index].last_error.clone();
-    let submit_id_now = data.tasks[task_index].submit_id.clone();
+    let diagnostic_error_detail = if error_detail.is_empty() {
+        String::new()
+    } else {
+        format!("{error_detail}\n\nsubmit_preflight={preflight_detail}")
+    };
+    let display_error_detail = if error_detail.is_empty() {
+        String::new()
+    } else if final_status == "failed" {
+        compact_failed_submit_error_detail(&error_kind, &error_detail)
+    } else {
+        compact_submit_error_detail(&error_kind, &error_detail)
+    };
+    let submit_id_now = if record_submit_id.is_empty() {
+        data.tasks[task_index].submit_id.clone()
+    } else {
+        record_submit_id
+    };
     data.tasks[task_index].attempts.push(TaskAttempt {
         id: format!("attempt_{}", Uuid::new_v4().simple()),
         started_at: started_at.clone(),
@@ -3365,7 +4673,7 @@ where
         stderr: truncate_log(&stderr),
         error_kind: error_kind.clone(),
         duration_seconds: duration_secs,
-        error_detail: error_detail.clone(),
+        error_detail: diagnostic_error_detail.clone(),
     });
     // 每次真实提交生成一条执行记录，携带输入快照
     let input_snapshot = TaskExecutionInputSnapshot {
@@ -3378,20 +4686,24 @@ where
         params: task.params.clone(),
         temp_image_asset_ids: task.temp_image_asset_ids.clone(),
     };
-    data.tasks[task_index].execution_records.push(TaskExecutionRecord {
-        id: format!("exec_{}", Uuid::new_v4().simple()),
-        submit_id: submit_id_now,
-        status: final_status,
-        started_at,
-        finished_at: finished,
-        input_snapshot,
-        command_preview: args,
-        query_records: vec![],
-        result_paths: vec![],
-        result_urls: vec![],
-        error_kind,
-        error_detail,
-    });
+    upsert_submit_execution_record(
+        &mut data.tasks[task_index],
+        TaskExecutionRecord {
+            id: format!("exec_{}", Uuid::new_v4().simple()),
+            submit_id: submit_id_now,
+            status: final_status,
+            started_at,
+            finished_at: finished,
+            input_snapshot,
+            command_preview: args,
+            query_records: vec![],
+            result_paths: vec![],
+            result_urls: vec![],
+            error_kind,
+            error_detail: display_error_detail,
+        },
+    );
+    apply_planned_submit_completion(&mut data.tasks[task_index]);
     Ok(data.tasks[task_index].clone())
 }
 
@@ -3422,8 +4734,39 @@ fn build_mention_asset_index(
         .collect::<HashMap<_, _>>();
     let mut index = HashMap::new();
 
+    for asset_id in task
+        .image_asset_ids
+        .iter()
+        .chain(task.audio_asset_ids.iter())
+    {
+        if let Some(asset) = asset_by_id.get(asset_id.as_str()) {
+            insert_asset_mention_labels(&mut index, asset, None);
+        }
+    }
+
     for asset in assets {
         insert_asset_mention_labels(&mut index, asset, None);
+    }
+
+    for (idx, asset_id) in task.image_asset_ids.iter().enumerate() {
+        if let Some(asset) = asset_by_id.get(asset_id.as_str()) {
+            insert_mention_label(
+                &mut index,
+                format!("图{}", idx + 1),
+                asset.kind.clone(),
+                asset.id.clone(),
+            );
+        }
+    }
+    for (idx, asset_id) in task.audio_asset_ids.iter().enumerate() {
+        if let Some(asset) = asset_by_id.get(asset_id.as_str()) {
+            insert_mention_label(
+                &mut index,
+                format!("音频{}", idx + 1),
+                asset.kind.clone(),
+                asset.id.clone(),
+            );
+        }
     }
 
     let storyboard_asset_ids = storyboard_asset_ids_for_mentions(task, &asset_by_id);
@@ -3521,12 +4864,11 @@ fn storyboard_mention_index(mention: &str) -> Option<usize> {
 }
 
 fn is_temporary_image_asset(asset: &Asset) -> bool {
-    asset.tags.iter().any(|tag| {
-        matches!(
-            tag.as_str(),
-            "temp_image" | "temporary" | "clipboard"
-        )
-    }) || asset.source_path == "clipboard"
+    asset
+        .tags
+        .iter()
+        .any(|tag| matches!(tag.as_str(), "temp_image" | "temporary" | "clipboard"))
+        || asset.source_path == "clipboard"
 }
 
 fn insert_asset_mention_labels(
@@ -3906,8 +5248,133 @@ fn append_log(data: &mut AppData, draft: LogEntryDraft) {
 fn append_task_log(data: &mut AppData, task: &ScheduledTask, mut draft: LogEntryDraft) {
     draft.task_id = Some(task.id.clone());
     draft.task_title = Some(task.title.clone());
-    draft.submit_id = if task.submit_id.is_empty() { None } else { Some(task.submit_id.clone()) };
+    draft.submit_id = if task.submit_id.is_empty() {
+        None
+    } else {
+        Some(task.submit_id.clone())
+    };
     append_log(data, draft);
+}
+
+pub fn record_lifecycle_event(data: &mut AppData, event_type: &str, message: &str, detail: &str) {
+    append_log(
+        data,
+        LogEntryDraft {
+            level: LogLevel::Info,
+            source: LogSource::System,
+            category: "lifecycle".to_string(),
+            event_type: event_type.to_string(),
+            message: message.to_string(),
+            detail: detail.to_string(),
+            task_id: None,
+            task_title: None,
+            submit_id: None,
+            execution_record_id: None,
+            error_detail: None,
+            raw_output: None,
+            stdout: None,
+            stderr: None,
+            module: None,
+        },
+    );
+}
+
+pub fn record_scheduler_tick(data: &mut AppData, origin: &str, phase: &str) {
+    append_log(
+        data,
+        LogEntryDraft {
+            level: LogLevel::Debug,
+            source: LogSource::Scheduler,
+            category: "scheduler_tick".to_string(),
+            event_type: "tick".to_string(),
+            message: format!("调度 tick：{origin}"),
+            detail: format!("phase={phase}"),
+            task_id: None,
+            task_title: None,
+            submit_id: None,
+            execution_record_id: None,
+            error_detail: None,
+            raw_output: None,
+            stdout: None,
+            stderr: None,
+            module: None,
+        },
+    );
+}
+
+struct ProcessQueueGuard;
+
+impl Drop for ProcessQueueGuard {
+    fn drop(&mut self) {
+        PROCESS_QUEUE_RUNNING.store(false, Ordering::Release);
+    }
+}
+
+fn try_begin_process_queue() -> Option<ProcessQueueGuard> {
+    PROCESS_QUEUE_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()
+        .map(|_| ProcessQueueGuard)
+}
+
+struct StoreQueueLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for StoreQueueLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn try_acquire_store_queue_lock(store: &AppStore, origin: &str) -> Option<StoreQueueLockGuard> {
+    let lock_path = store.root_dir.join("queue.lock");
+    let parent = lock_path.parent()?;
+    if fs::create_dir_all(parent).is_err() {
+        return None;
+    }
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(mut file) => {
+            let _ = writeln!(file, "origin={origin}");
+            let _ = writeln!(file, "pid={}", std::process::id());
+            let _ = writeln!(file, "created_at={}", now_rfc3339());
+            Some(StoreQueueLockGuard { path: lock_path })
+        }
+        Err(_) => None,
+    }
+}
+
+/// 每条执行记录保留的 query_records（自动轮询历史）上限。
+const MAX_QUERY_RECORDS_PER_EXECUTION: usize = 30;
+/// 每个任务保留的 attempts（尝试历史）上限。
+const MAX_ATTEMPTS_PER_TASK: usize = 50;
+
+/// 丢弃 `v` 中最旧的若干项，仅保留最近 `max` 个；返回移除数量。
+fn cap_history_vec<T>(v: &mut Vec<T>, max: usize) -> usize {
+    if v.len() > max {
+        let remove = v.len() - max;
+        v.drain(0..remove);
+        remove
+    } else {
+        0
+    }
+}
+
+/// 裁剪无界增长的历史：每任务 attempts 留最近 50，每执行记录 query_records 留最近 30。
+/// 只裁剪过程态轮询/尝试历史，不动结果、状态、成败等顶层字段。返回移除的总条数。
+pub fn cap_execution_history(data: &mut AppData) -> usize {
+    let mut removed = 0;
+    for task in &mut data.tasks {
+        removed += cap_history_vec(&mut task.attempts, MAX_ATTEMPTS_PER_TASK);
+        for record in &mut task.execution_records {
+            removed += cap_history_vec(&mut record.query_records, MAX_QUERY_RECORDS_PER_EXECUTION);
+        }
+    }
+    removed
 }
 
 /// Trim old log entries to respect `settings.log_retention_count`.
@@ -3919,14 +5386,285 @@ fn apply_log_retention(data: &mut AppData) {
     }
 }
 
+pub fn process_queue_for_store_blocking(
+    store: &AppStore,
+    origin: &str,
+) -> Result<Option<ScheduledTask>, String> {
+    let _ = store.mutate(|data| {
+        record_scheduler_tick(data, origin, "started");
+        Ok(())
+    });
+
+    let Some(_guard) = try_begin_process_queue() else {
+        let _ = store.mutate(|data| {
+            record_scheduler_tick(data, origin, "skipped_busy");
+            Ok(())
+        });
+        return Ok(None);
+    };
+
+    let Some(_store_lock) = try_acquire_store_queue_lock(store, origin) else {
+        let _ = store.mutate(|data| {
+            record_scheduler_tick(data, origin, "skipped_busy");
+            Ok(())
+        });
+        return Ok(None);
+    };
+
+    // 锁外：探测下一步应执行的 CLI 调用
+    let due = {
+        let data = store.snapshot();
+        peek_due_task_cli(&data)
+    };
+    let DueTaskCli {
+        task_id,
+        args,
+        is_query,
+    } = match due {
+        Ok(None) => {
+            let _ = store.mutate(|data| {
+                append_log(
+                    data,
+                    LogEntryDraft {
+                        level: LogLevel::Debug,
+                        source: LogSource::Scheduler,
+                        category: "queue".to_string(),
+                        event_type: "no_due_task".to_string(),
+                        message: "队列暂无到期任务".to_string(),
+                        detail: String::new(),
+                        task_id: None,
+                        task_title: None,
+                        submit_id: None,
+                        execution_record_id: None,
+                        error_detail: None,
+                        raw_output: None,
+                        stdout: None,
+                        stderr: None,
+                        module: None,
+                    },
+                );
+                Ok(())
+            });
+            return Ok(None);
+        }
+        Ok(Some(x)) => x,
+        Err(error) => {
+            let task = store
+                .mutate(|data| {
+                    if let Some(task) = data.tasks.iter_mut().find(|task| task.id == error.task_id)
+                    {
+                        task.status = "failed".to_string();
+                        task.next_run_at = None;
+                        task.last_error = error.message.clone();
+                        task.updated_at = now_rfc3339();
+                    }
+                    append_log(
+                        data,
+                        LogEntryDraft {
+                            level: LogLevel::Error,
+                            source: LogSource::Scheduler,
+                            category: "queue".to_string(),
+                            event_type: "build_due_task_failed".to_string(),
+                            message: format!("到期任务构建失败：{}", error.task_title),
+                            detail: error.message.clone(),
+                            task_id: Some(error.task_id.clone()),
+                            task_title: Some(error.task_title.clone()),
+                            submit_id: None,
+                            execution_record_id: None,
+                            error_detail: Some(error.message.clone()),
+                            raw_output: None,
+                            stdout: None,
+                            stderr: None,
+                            module: Some("scheduler".to_string()),
+                        },
+                    );
+                    Ok(data
+                        .tasks
+                        .iter()
+                        .find(|task| task.id == error.task_id)
+                        .cloned())
+                })
+                .map_err(|error| error.to_string())?;
+            return Ok(task);
+        }
+    };
+
+    // 锁外：运行 CLI
+    let cli_result = run_dreamina_command(&args);
+
+    // 锁内：写回（使用 replay runner）
+    let task = store
+        .mutate(|data| {
+            // scheduled → queued 迁移（仅 submit 路径需要）
+            if !is_query {
+                let now = Utc::now();
+                let mut log_drafts: Vec<LogEntryDraft> = Vec::new();
+                for t in &mut data.tasks {
+                    if t.status == "scheduled" && is_due(t.next_run_at.as_deref(), now) {
+                        log_drafts.push(LogEntryDraft {
+                            level: LogLevel::Warn,
+                            source: LogSource::Scheduler,
+                            category: "queue".to_string(),
+                            event_type: "expired_compensation".to_string(),
+                            message: format!(
+                                "预定已到期，恢复后补偿处理：{}（原计划 {}）",
+                                t.title,
+                                t.scheduled_at.as_deref().unwrap_or("-")
+                            ),
+                            detail: String::new(),
+                            task_id: Some(t.id.clone()),
+                            task_title: Some(t.title.clone()),
+                            submit_id: None,
+                            execution_record_id: None,
+                            error_detail: None,
+                            raw_output: None,
+                            stdout: None,
+                            stderr: None,
+                            module: None,
+                        });
+                        t.status = "queued".to_string();
+                        t.updated_at = now_rfc3339();
+                    }
+                }
+                for draft in log_drafts {
+                    append_log(data, draft);
+                }
+            }
+            let task = if is_query {
+                query_task_once_with_runner(data, &task_id, |_| cli_result.clone())?
+            } else {
+                submit_task_once_with_runner(data, &task_id, |_| cli_result.clone())?
+            };
+            append_task_log(
+                data,
+                &task,
+                LogEntryDraft {
+                    level: match task.status.as_str() {
+                        "failed" => LogLevel::Error,
+                        "succeeded" => LogLevel::Success,
+                        _ => LogLevel::Info,
+                    },
+                    source: LogSource::Scheduler,
+                    category: "queue".to_string(),
+                    event_type: "execute".to_string(),
+                    message: format!("队列执行：{} -> {}", task.title, task.status),
+                    detail: String::new(),
+                    task_id: None,
+                    task_title: None,
+                    submit_id: None,
+                    execution_record_id: None,
+                    error_detail: None,
+                    raw_output: None,
+                    stdout: None,
+                    stderr: None,
+                    module: None,
+                },
+            );
+            Ok(task)
+        })
+        .map_err(|error| error.to_string())?;
+    if task.status == "succeeded" && !task.result_urls.is_empty() {
+        let results_dir = store.assets_dir().join("results");
+        let urls = task.result_urls.clone();
+        let tid = task.id.clone();
+        let downloaded = download_result_urls(&urls, &results_dir);
+        if !downloaded.is_empty() {
+            let _ = store.mutate(|data| {
+                if let Some(t) = data.tasks.iter_mut().find(|t| t.id == tid) {
+                    for p in &downloaded {
+                        if !t.result_paths.contains(p) {
+                            t.result_paths.push(p.clone());
+                        }
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
+    store
+        .snapshot()
+        .tasks
+        .into_iter()
+        .find(|t| t.id == task.id)
+        .map(Some)
+        .ok_or_else(|| "任务不存在".to_string())
+}
+
+fn start_background_scheduler(app_handle: tauri::AppHandle) {
+    std::thread::spawn(move || loop {
+        let store = app_handle.state::<AppStore>();
+        let waker = app_handle.state::<SchedulerWaker>();
+
+        // 单次快照供「空闲短路」与「等待时长」共用，避免一个 tick 内重复读盘。
+        let snapshot = store.snapshot();
+
+        // 完全空闲时跳过重函数：不写 started/no_due_task 噪音日志、不整份序列化落盘。
+        if should_process_now(&snapshot) {
+            if let Err(error) = process_queue_for_store_blocking(&store, "background") {
+                let _ = store.mutate(|data| {
+                    append_log(
+                        data,
+                        LogEntryDraft {
+                            level: LogLevel::Error,
+                            source: LogSource::Scheduler,
+                            category: "scheduler_tick".to_string(),
+                            event_type: "tick_error".to_string(),
+                            message: "后台调度 tick 失败".to_string(),
+                            detail: String::new(),
+                            task_id: None,
+                            task_title: None,
+                            submit_id: None,
+                            execution_record_id: None,
+                            error_detail: Some(error),
+                            raw_output: None,
+                            stdout: None,
+                            stderr: None,
+                            module: None,
+                        },
+                    );
+                    Ok(())
+                });
+            }
+        }
+
+        // 自适应等待：有活跃任务 30s，完全空闲 60s；入队 notify 可提前唤醒。
+        let wait = compute_wait_duration(&snapshot.tasks);
+        waker.wait(wait);
+    });
+}
+
+fn log_lifecycle_from_manager<R, M>(manager: &M, event_type: &str, message: &str, detail: &str)
+where
+    R: tauri::Runtime,
+    M: Manager<R>,
+{
+    let store = manager.state::<AppStore>();
+    let _ = store.mutate(|data| {
+        record_lifecycle_event(data, event_type, message, detail);
+        Ok(())
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppStore::load(default_store_dir()))
         .manage(keep_awake::KeepAwakeGuard::new())
+        .manage(SchedulerWaker::new())
+        .setup(|app| {
+            log_lifecycle_from_manager(app, "app_start", "应用启动", "");
+            start_background_scheduler(app.handle().clone());
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                log_lifecycle_from_manager(window, "window_close_requested", "窗口请求关闭", "");
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             commands::get_app_state,
+            commands::get_state_signature,
             commands::get_host_platform,
             commands::check_dreamina_cli,
             commands::get_dreamina_credit,
@@ -3945,6 +5683,7 @@ pub fn run() {
             commands::create_task_command,
             commands::submit_task_command,
             commands::query_task_command,
+            commands::set_task_planned_submit_count_command,
             commands::process_queue_command,
             commands::generate_task_title_command,
             commands::test_ai_model_command,
@@ -3969,21 +5708,40 @@ pub fn run() {
             commands::update_task_command,
             commands::update_task_draft_command,
             commands::clear_logs_command,
+            commands::record_lifecycle_event_command,
             commands::sync_keep_awake_command,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Dreamina Scheduler");
+        .build(tauri::generate_context!())
+        .expect("error while building Dreamina Scheduler")
+        .run(|app_handle, event| match event {
+            tauri::RunEvent::Resumed => {
+                log_lifecycle_from_manager(app_handle, "app_resumed", "应用事件循环恢复", "");
+            }
+            tauri::RunEvent::ExitRequested { .. } => {
+                log_lifecycle_from_manager(app_handle, "app_exit_requested", "应用请求退出", "");
+            }
+            tauri::RunEvent::Exit => {
+                log_lifecycle_from_manager(app_handle, "app_exit", "应用退出", "");
+            }
+            _ => {}
+        });
 }
 
 pub mod commands {
     use super::*;
-    use tauri::State;
-    use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use base64::Engine as _;
+    use tauri::State;
 
     #[tauri::command]
     pub fn get_app_state(store: State<'_, AppStore>) -> AppData {
         store.snapshot()
+    }
+
+    /// 廉价变更签名（仅 stat，不读取整份状态）。前端轮询比对，未变则跳过 `get_app_state`。
+    #[tauri::command]
+    pub fn get_state_signature(store: State<'_, AppStore>) -> String {
+        store.state_signature()
     }
 
     #[tauri::command]
@@ -4024,17 +5782,26 @@ pub mod commands {
                 asset.name = new_name.trim().to_string();
                 let new_name_val = asset.name.clone();
                 let asset_clone = asset.clone();
-                append_log(data, LogEntryDraft {
-                    level: LogLevel::Info,
-                    source: LogSource::Asset,
-                    category: "asset".to_string(),
-                    event_type: "rename".to_string(),
-                    message: format!("重命名素材：{} -> {}", old, new_name_val),
-                    detail: String::new(),
-                    task_id: None, task_title: None, submit_id: None,
-                    execution_record_id: None, error_detail: None,
-                    raw_output: None, stdout: None, stderr: None, module: None,
-                });
+                append_log(
+                    data,
+                    LogEntryDraft {
+                        level: LogLevel::Info,
+                        source: LogSource::Asset,
+                        category: "asset".to_string(),
+                        event_type: "rename".to_string(),
+                        message: format!("重命名素材：{} -> {}", old, new_name_val),
+                        detail: String::new(),
+                        task_id: None,
+                        task_title: None,
+                        submit_id: None,
+                        execution_record_id: None,
+                        error_detail: None,
+                        raw_output: None,
+                        stdout: None,
+                        stderr: None,
+                        module: None,
+                    },
+                );
                 Ok(asset_clone)
             })
             .map_err(|error| error.to_string())
@@ -4054,17 +5821,26 @@ pub mod commands {
                     .map_err(|error| SchedulerError::Io(error.to_string()))?;
                 asset.tags.push("temp_image".to_string());
                 data.assets.push(asset.clone());
-                append_log(data, LogEntryDraft {
-                    level: LogLevel::Info,
-                    source: LogSource::Asset,
-                    category: "asset".to_string(),
-                    event_type: "import_temp_image".to_string(),
-                    message: format!("导入临时图片：{}", asset.name),
-                    detail: String::new(),
-                    task_id: None, task_title: None, submit_id: None,
-                    execution_record_id: None, error_detail: None,
-                    raw_output: None, stdout: None, stderr: None, module: None,
-                });
+                append_log(
+                    data,
+                    LogEntryDraft {
+                        level: LogLevel::Info,
+                        source: LogSource::Asset,
+                        category: "asset".to_string(),
+                        event_type: "import_temp_image".to_string(),
+                        message: format!("导入临时图片：{}", asset.name),
+                        detail: String::new(),
+                        task_id: None,
+                        task_title: None,
+                        submit_id: None,
+                        execution_record_id: None,
+                        error_detail: None,
+                        raw_output: None,
+                        stdout: None,
+                        stderr: None,
+                        module: None,
+                    },
+                );
                 Ok(asset)
             })
             .map_err(|error| error.to_string())
@@ -4082,17 +5858,26 @@ pub mod commands {
         store
             .mutate(|data| {
                 data.assets.push(asset.clone());
-                append_log(data, LogEntryDraft {
-                    level: LogLevel::Info,
-                    source: LogSource::Asset,
-                    category: "asset".to_string(),
-                    event_type: "import".to_string(),
-                    message: format!("导入素材：{}", asset.name),
-                    detail: String::new(),
-                    task_id: None, task_title: None, submit_id: None,
-                    execution_record_id: None, error_detail: None,
-                    raw_output: None, stdout: None, stderr: None, module: None,
-                });
+                append_log(
+                    data,
+                    LogEntryDraft {
+                        level: LogLevel::Info,
+                        source: LogSource::Asset,
+                        category: "asset".to_string(),
+                        event_type: "import".to_string(),
+                        message: format!("导入素材：{}", asset.name),
+                        detail: String::new(),
+                        task_id: None,
+                        task_title: None,
+                        submit_id: None,
+                        execution_record_id: None,
+                        error_detail: None,
+                        raw_output: None,
+                        stdout: None,
+                        stderr: None,
+                        module: None,
+                    },
+                );
                 Ok(asset.clone())
             })
             .map_err(|error| error.to_string())
@@ -4107,17 +5892,26 @@ pub mod commands {
         store
             .mutate(|data| {
                 let asset = save_clipboard_image_asset(data, &assets_dir, input)?;
-                append_log(data, LogEntryDraft {
-                    level: LogLevel::Info,
-                    source: LogSource::Asset,
-                    category: "asset".to_string(),
-                    event_type: "paste_clipboard".to_string(),
-                    message: format!("粘贴临时图片：{}", asset.name),
-                    detail: String::new(),
-                    task_id: None, task_title: None, submit_id: None,
-                    execution_record_id: None, error_detail: None,
-                    raw_output: None, stdout: None, stderr: None, module: None,
-                });
+                append_log(
+                    data,
+                    LogEntryDraft {
+                        level: LogLevel::Info,
+                        source: LogSource::Asset,
+                        category: "asset".to_string(),
+                        event_type: "paste_clipboard".to_string(),
+                        message: format!("粘贴临时图片：{}", asset.name),
+                        detail: String::new(),
+                        task_id: None,
+                        task_title: None,
+                        submit_id: None,
+                        execution_record_id: None,
+                        error_detail: None,
+                        raw_output: None,
+                        stdout: None,
+                        stderr: None,
+                        module: None,
+                    },
+                );
                 Ok(asset)
             })
             .map_err(|error| error.to_string())
@@ -4129,17 +5923,26 @@ pub mod commands {
         store
             .mutate(|data| {
                 let asset = paste_system_clipboard_image_asset(data, &assets_dir)?;
-                append_log(data, LogEntryDraft {
-                    level: LogLevel::Info,
-                    source: LogSource::Asset,
-                    category: "asset".to_string(),
-                    event_type: "paste_system_clipboard".to_string(),
-                    message: format!("粘贴系统剪贴板图片：{}", asset.name),
-                    detail: String::new(),
-                    task_id: None, task_title: None, submit_id: None,
-                    execution_record_id: None, error_detail: None,
-                    raw_output: None, stdout: None, stderr: None, module: None,
-                });
+                append_log(
+                    data,
+                    LogEntryDraft {
+                        level: LogLevel::Info,
+                        source: LogSource::Asset,
+                        category: "asset".to_string(),
+                        event_type: "paste_system_clipboard".to_string(),
+                        message: format!("粘贴系统剪贴板图片：{}", asset.name),
+                        detail: String::new(),
+                        task_id: None,
+                        task_title: None,
+                        submit_id: None,
+                        execution_record_id: None,
+                        error_detail: None,
+                        raw_output: None,
+                        stdout: None,
+                        stderr: None,
+                        module: None,
+                    },
+                );
                 Ok(asset)
             })
             .map_err(|error| error.to_string())
@@ -4154,17 +5957,26 @@ pub mod commands {
         store
             .mutate(|data| {
                 let role = import_media_to_role(data, &role_media_dir, input)?;
-                append_log(data, LogEntryDraft {
-                    level: LogLevel::Info,
-                    source: LogSource::Role,
-                    category: "role".to_string(),
-                    event_type: "import_media".to_string(),
-                    message: format!("导入角色媒体：{}", role.name),
-                    detail: String::new(),
-                    task_id: None, task_title: None, submit_id: None,
-                    execution_record_id: None, error_detail: None,
-                    raw_output: None, stdout: None, stderr: None, module: None,
-                });
+                append_log(
+                    data,
+                    LogEntryDraft {
+                        level: LogLevel::Info,
+                        source: LogSource::Role,
+                        category: "role".to_string(),
+                        event_type: "import_media".to_string(),
+                        message: format!("导入角色媒体：{}", role.name),
+                        detail: String::new(),
+                        task_id: None,
+                        task_title: None,
+                        submit_id: None,
+                        execution_record_id: None,
+                        error_detail: None,
+                        raw_output: None,
+                        stdout: None,
+                        stderr: None,
+                        module: None,
+                    },
+                );
                 Ok(role)
             })
             .map_err(|error| error.to_string())
@@ -4178,17 +5990,26 @@ pub mod commands {
         store
             .mutate(|data| {
                 let role = remove_media_from_role(data, input)?;
-                append_log(data, LogEntryDraft {
-                    level: LogLevel::Info,
-                    source: LogSource::Role,
-                    category: "role".to_string(),
-                    event_type: "remove_media".to_string(),
-                    message: format!("移除角色媒体：{}", role.name),
-                    detail: String::new(),
-                    task_id: None, task_title: None, submit_id: None,
-                    execution_record_id: None, error_detail: None,
-                    raw_output: None, stdout: None, stderr: None, module: None,
-                });
+                append_log(
+                    data,
+                    LogEntryDraft {
+                        level: LogLevel::Info,
+                        source: LogSource::Role,
+                        category: "role".to_string(),
+                        event_type: "remove_media".to_string(),
+                        message: format!("移除角色媒体：{}", role.name),
+                        detail: String::new(),
+                        task_id: None,
+                        task_title: None,
+                        submit_id: None,
+                        execution_record_id: None,
+                        error_detail: None,
+                        raw_output: None,
+                        stdout: None,
+                        stderr: None,
+                        module: None,
+                    },
+                );
                 Ok(role)
             })
             .map_err(|error| error.to_string())
@@ -4202,17 +6023,26 @@ pub mod commands {
         store
             .mutate(|data| {
                 let role = upsert_role(data, input);
-                append_log(data, LogEntryDraft {
-                    level: LogLevel::Success,
-                    source: LogSource::Role,
-                    category: "role".to_string(),
-                    event_type: "create".to_string(),
-                    message: format!("新增角色：{}", role.name),
-                    detail: String::new(),
-                    task_id: None, task_title: None, submit_id: None,
-                    execution_record_id: None, error_detail: None,
-                    raw_output: None, stdout: None, stderr: None, module: None,
-                });
+                append_log(
+                    data,
+                    LogEntryDraft {
+                        level: LogLevel::Success,
+                        source: LogSource::Role,
+                        category: "role".to_string(),
+                        event_type: "create".to_string(),
+                        message: format!("新增角色：{}", role.name),
+                        detail: String::new(),
+                        task_id: None,
+                        task_title: None,
+                        submit_id: None,
+                        execution_record_id: None,
+                        error_detail: None,
+                        raw_output: None,
+                        stdout: None,
+                        stderr: None,
+                        module: None,
+                    },
+                );
                 Ok(role.clone())
             })
             .map_err(|error| error.to_string())
@@ -4226,17 +6056,26 @@ pub mod commands {
         store
             .mutate(|data| {
                 let role = upsert_role(data, input);
-                append_log(data, LogEntryDraft {
-                    level: LogLevel::Info,
-                    source: LogSource::Role,
-                    category: "role".to_string(),
-                    event_type: "update".to_string(),
-                    message: format!("更新角色：{}", role.name),
-                    detail: String::new(),
-                    task_id: None, task_title: None, submit_id: None,
-                    execution_record_id: None, error_detail: None,
-                    raw_output: None, stdout: None, stderr: None, module: None,
-                });
+                append_log(
+                    data,
+                    LogEntryDraft {
+                        level: LogLevel::Info,
+                        source: LogSource::Role,
+                        category: "role".to_string(),
+                        event_type: "update".to_string(),
+                        message: format!("更新角色：{}", role.name),
+                        detail: String::new(),
+                        task_id: None,
+                        task_title: None,
+                        submit_id: None,
+                        execution_record_id: None,
+                        error_detail: None,
+                        raw_output: None,
+                        stdout: None,
+                        stderr: None,
+                        module: None,
+                    },
+                );
                 Ok(role)
             })
             .map_err(|error| error.to_string())
@@ -4247,17 +6086,26 @@ pub mod commands {
         store
             .mutate(|data| {
                 delete_role(data, &role_id)?;
-                append_log(data, LogEntryDraft {
-                    level: LogLevel::Info,
-                    source: LogSource::Role,
-                    category: "role".to_string(),
-                    event_type: "delete".to_string(),
-                    message: format!("删除角色：{}", role_id),
-                    detail: String::new(),
-                    task_id: None, task_title: None, submit_id: None,
-                    execution_record_id: None, error_detail: None,
-                    raw_output: None, stdout: None, stderr: None, module: None,
-                });
+                append_log(
+                    data,
+                    LogEntryDraft {
+                        level: LogLevel::Info,
+                        source: LogSource::Role,
+                        category: "role".to_string(),
+                        event_type: "delete".to_string(),
+                        message: format!("删除角色：{}", role_id),
+                        detail: String::new(),
+                        task_id: None,
+                        task_title: None,
+                        submit_id: None,
+                        execution_record_id: None,
+                        error_detail: None,
+                        raw_output: None,
+                        stdout: None,
+                        stderr: None,
+                        module: None,
+                    },
+                );
                 Ok(())
             })
             .map_err(|error| error.to_string())
@@ -4284,17 +6132,26 @@ pub mod commands {
         store
             .mutate(|data| {
                 let task = create_draft_task(data, draft)?;
-                append_log(data, LogEntryDraft {
-                    level: LogLevel::Info,
-                    source: LogSource::Scheduler,
-                    category: "task".to_string(),
-                    event_type: "save_draft".to_string(),
-                    message: format!("保存草稿：{}", task.title),
-                    detail: String::new(),
-                    task_id: Some(task.id.clone()), task_title: Some(task.title.clone()),
-                    submit_id: None, execution_record_id: None, error_detail: None,
-                    raw_output: None, stdout: None, stderr: None, module: None,
-                });
+                append_log(
+                    data,
+                    LogEntryDraft {
+                        level: LogLevel::Info,
+                        source: LogSource::Scheduler,
+                        category: "task".to_string(),
+                        event_type: "save_draft".to_string(),
+                        message: format!("保存草稿：{}", task.title),
+                        detail: String::new(),
+                        task_id: Some(task.id.clone()),
+                        task_title: Some(task.title.clone()),
+                        submit_id: None,
+                        execution_record_id: None,
+                        error_detail: None,
+                        raw_output: None,
+                        stdout: None,
+                        stderr: None,
+                        module: None,
+                    },
+                );
                 data.tasks.push(task.clone());
                 Ok(task)
             })
@@ -4304,26 +6161,41 @@ pub mod commands {
     #[tauri::command]
     pub fn create_task_command(
         store: State<'_, AppStore>,
+        waker: State<'_, SchedulerWaker>,
         draft: TaskDraft,
     ) -> Result<ScheduledTask, String> {
-        store
+        let task = store
             .mutate(|data| {
                 let task = create_task_with_preview(data, draft)?;
-                append_log(data, LogEntryDraft {
-                    level: LogLevel::Success,
-                    source: LogSource::Scheduler,
-                    category: "task".to_string(),
-                    event_type: "create".to_string(),
-                    message: format!("创建任务：{}", task.title),
-                    detail: String::new(),
-                    task_id: Some(task.id.clone()), task_title: Some(task.title.clone()),
-                    submit_id: None, execution_record_id: None, error_detail: None,
-                    raw_output: None, stdout: None, stderr: None, module: None,
-                });
+                append_log(
+                    data,
+                    LogEntryDraft {
+                        level: LogLevel::Success,
+                        source: LogSource::Scheduler,
+                        category: "task".to_string(),
+                        event_type: "create".to_string(),
+                        message: format!("创建任务：{}", task.title),
+                        detail: String::new(),
+                        task_id: Some(task.id.clone()),
+                        task_title: Some(task.title.clone()),
+                        submit_id: None,
+                        execution_record_id: None,
+                        error_detail: None,
+                        raw_output: None,
+                        stdout: None,
+                        stderr: None,
+                        module: None,
+                    },
+                );
                 data.tasks.push(task.clone());
                 Ok(task)
             })
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        // 新任务入队，立即唤醒可能正处于空闲长等待的调度线程。
+        if has_active_tasks(std::slice::from_ref(&task)) {
+            waker.notify();
+        }
+        Ok(task)
     }
 
     #[tauri::command]
@@ -4352,8 +6224,8 @@ pub mod commands {
                 temp_image_asset_ids: task.temp_image_asset_ids.clone(),
                 temp_image_paths: task.temp_image_paths.clone(),
             };
-            let resolved =
-                resolve_task_inputs(&draft, &data.assets, &data.roles).map_err(|e| e.to_string())?;
+            let resolved = resolve_task_inputs(&draft, &data.assets, &data.roles)
+                .map_err(|e| e.to_string())?;
             build_multimodal2video_args(&draft, &resolved).map_err(|e| e.to_string())?
         };
         // 锁外：运行 CLI
@@ -4365,18 +6237,35 @@ pub mod commands {
             .mutate(|data| {
                 let task =
                     submit_task_once_with_runner(data, &task_id, |_args| cli_result.clone())?;
-                append_task_log(data, &task, LogEntryDraft {
-                    level: if task.status == "failed" { LogLevel::Error } else { LogLevel::Info },
-                    source: LogSource::Worker,
-                    category: "task".to_string(),
-                    event_type: "submit".to_string(),
-                    message: format!("提交任务：{} -> {}", task.title, task.status),
-                    detail: String::new(),
-                    task_id: None, task_title: None,
-                    submit_id: if task.submit_id.is_empty() { None } else { Some(task.submit_id.clone()) },
-                    execution_record_id: None, error_detail: None,
-                    raw_output: None, stdout: None, stderr: None, module: None,
-                });
+                append_task_log(
+                    data,
+                    &task,
+                    LogEntryDraft {
+                        level: if task.status == "failed" {
+                            LogLevel::Error
+                        } else {
+                            LogLevel::Info
+                        },
+                        source: LogSource::Worker,
+                        category: "task".to_string(),
+                        event_type: "submit".to_string(),
+                        message: format!("提交任务：{} -> {}", task.title, task.status),
+                        detail: String::new(),
+                        task_id: None,
+                        task_title: None,
+                        submit_id: if task.submit_id.is_empty() {
+                            None
+                        } else {
+                            Some(task.submit_id.clone())
+                        },
+                        execution_record_id: None,
+                        error_detail: None,
+                        raw_output: None,
+                        stdout: None,
+                        stderr: None,
+                        module: None,
+                    },
+                );
                 Ok(task)
             })
             .map_err(|e| e.to_string())?;
@@ -4385,10 +6274,11 @@ pub mod commands {
             let results_dir = store.assets_dir().join("results");
             let urls = task.result_urls.clone();
             let tid = task.id.clone();
-            let downloaded =
-                tauri::async_runtime::spawn_blocking(move || download_result_urls(&urls, &results_dir))
-                    .await
-                    .unwrap_or_default();
+            let downloaded = tauri::async_runtime::spawn_blocking(move || {
+                download_result_urls(&urls, &results_dir)
+            })
+            .await
+            .unwrap_or_default();
             if !downloaded.is_empty() {
                 let _ = store.mutate(|data| {
                     if let Some(t) = data.tasks.iter_mut().find(|t| t.id == tid) {
@@ -4420,7 +6310,8 @@ pub mod commands {
         // 锁外：取 submit_id
         let submit_id = {
             let data = store.snapshot();
-            let task = data.tasks
+            let task = data
+                .tasks
                 .iter()
                 .find(|t| t.id == task_id)
                 .ok_or_else(|| format!("找不到任务：{task_id}"))?;
@@ -4437,10 +6328,9 @@ pub mod commands {
             "query_result".to_string(),
             format!("--submit_id={submit_id}"),
         ];
-        let cli_result =
-            tauri::async_runtime::spawn_blocking(move || run_dreamina_command(&args))
-                .await
-                .map_err(|e| format!("任务错误：{e}"))?;
+        let cli_result = tauri::async_runtime::spawn_blocking(move || run_dreamina_command(&args))
+            .await
+            .map_err(|e| format!("任务错误：{e}"))?;
         // 锁内：写回
         let task = store
             .mutate(|data| {
@@ -4450,24 +6340,38 @@ pub mod commands {
                         reset_query_backoff(t);
                     }
                 }
-                let task = manual_query_task_submit_id_with_runner(
+                let task =
+                    manual_query_task_submit_id_with_runner(data, &task_id, &submit_id, |_args| {
+                        cli_result.clone()
+                    })?;
+                append_task_log(
                     data,
-                    &task_id,
-                    &submit_id,
-                    |_args| cli_result.clone(),
-                )?;
-                append_task_log(data, &task, LogEntryDraft {
-                    level: if task.status == "failed" { LogLevel::Error } else { LogLevel::Info },
-                    source: LogSource::Worker,
-                    category: "task".to_string(),
-                    event_type: "query".to_string(),
-                    message: format!("查询任务：{} / {} -> {}", task.title, submit_id, task.status),
-                    detail: String::new(),
-                    task_id: None, task_title: None,
-                    submit_id: Some(submit_id.clone()),
-                    execution_record_id: None, error_detail: None,
-                    raw_output: None, stdout: None, stderr: None, module: None,
-                });
+                    &task,
+                    LogEntryDraft {
+                        level: if task.status == "failed" {
+                            LogLevel::Error
+                        } else {
+                            LogLevel::Info
+                        },
+                        source: LogSource::Worker,
+                        category: "task".to_string(),
+                        event_type: "query".to_string(),
+                        message: format!(
+                            "查询任务：{} / {} -> {}",
+                            task.title, submit_id, task.status
+                        ),
+                        detail: String::new(),
+                        task_id: None,
+                        task_title: None,
+                        submit_id: Some(submit_id.clone()),
+                        execution_record_id: None,
+                        error_detail: None,
+                        raw_output: None,
+                        stdout: None,
+                        stderr: None,
+                        module: None,
+                    },
+                );
                 Ok(task)
             })
             .map_err(|e| e.to_string())?;
@@ -4483,10 +6387,11 @@ pub mod commands {
             let urls = result_urls.clone();
             let tid = task.id.clone();
             let queried_submit_id = submit_id.clone();
-            let downloaded =
-                tauri::async_runtime::spawn_blocking(move || download_result_urls(&urls, &results_dir))
-                    .await
-                    .unwrap_or_default();
+            let downloaded = tauri::async_runtime::spawn_blocking(move || {
+                download_result_urls(&urls, &results_dir)
+            })
+            .await
+            .unwrap_or_default();
             if !downloaded.is_empty() {
                 let _ = store.mutate(|data| {
                     if let Some(t) = data.tasks.iter_mut().find(|t| t.id == tid) {
@@ -4523,123 +6428,25 @@ pub mod commands {
     }
 
     #[tauri::command]
-    pub async fn process_queue_command(
+    pub fn process_queue_command(
         store: State<'_, AppStore>,
     ) -> Result<Option<ScheduledTask>, String> {
-        // 锁外：探测下一步应执行的 CLI 调用
-        let due = {
-            let data = store.snapshot();
-            peek_due_task_cli(&data)
-        };
-        let (task_id, args, is_query) = match due {
-            None => {
-                let _ = store.mutate(|data| {
-                    append_log(data, LogEntryDraft {
-                        level: LogLevel::Debug,
-                        source: LogSource::Scheduler,
-                        category: "queue".to_string(),
-                        event_type: "no_due_task".to_string(),
-                        message: "队列暂无到期任务".to_string(),
-                        detail: String::new(),
-                        task_id: None, task_title: None, submit_id: None,
-                        execution_record_id: None, error_detail: None,
-                        raw_output: None, stdout: None, stderr: None, module: None,
-                    });
-                    Ok(())
-                });
-                return Ok(None);
-            }
-            Some(x) => x,
-        };
-        // 锁外：运行 CLI
-        let cli_result =
-            tauri::async_runtime::spawn_blocking(move || run_dreamina_command(&args))
-                .await
-                .map_err(|e| format!("任务错误：{e}"))?;
-        // 锁内：写回（使用 replay runner）
-        let task = store
-            .mutate(|data| {
-                // scheduled → queued 迁移（仅 submit 路径需要）
-                if !is_query {
-                    let now = Utc::now();
-                    // Collect log drafts first to avoid borrow conflict
-                    let mut log_drafts: Vec<LogEntryDraft> = Vec::new();
-                    for t in &mut data.tasks {
-                        if t.status == "scheduled" && is_due(t.next_run_at.as_deref(), now) {
-                            log_drafts.push(LogEntryDraft {
-                                level: LogLevel::Warn,
-                                source: LogSource::Scheduler,
-                                category: "queue".to_string(),
-                                event_type: "expired_compensation".to_string(),
-                                message: format!(
-                                    "预定已到期，恢复后补偿处理：{}（原计划 {}）",
-                                    t.title,
-                                    t.scheduled_at.as_deref().unwrap_or("-")
-                                ),
-                                detail: String::new(),
-                                task_id: Some(t.id.clone()), task_title: Some(t.title.clone()),
-                                submit_id: None, execution_record_id: None, error_detail: None,
-                                raw_output: None, stdout: None, stderr: None, module: None,
-                            });
-                            t.status = "queued".to_string();
-                            t.updated_at = now_rfc3339();
-                        }
-                    }
-                    for draft in log_drafts {
-                        append_log(data, draft);
-                    }
-                }
-                let task = if is_query {
-                    query_task_once_with_runner(data, &task_id, |_| cli_result.clone())?
-                } else {
-                    submit_task_once_with_runner(data, &task_id, |_| cli_result.clone())?
-                };
-                append_task_log(data, &task, LogEntryDraft {
-                    level: if task.status == "succeeded" { LogLevel::Success }
-                           else if task.status == "failed" { LogLevel::Error }
-                           else { LogLevel::Info },
-                    source: LogSource::Scheduler,
-                    category: "queue".to_string(),
-                    event_type: "execute".to_string(),
-                    message: format!("队列执行：{} -> {}", task.title, task.status),
-                    detail: String::new(),
-                    task_id: None, task_title: None,
-                    submit_id: if task.submit_id.is_empty() { None } else { Some(task.submit_id.clone()) },
-                    execution_record_id: None, error_detail: None,
-                    raw_output: None, stdout: None, stderr: None, module: None,
-                });
-                Ok(task)
-            })
-            .map_err(|e| e.to_string())?;
-        // 锁外：下载结果
-        if task.status == "succeeded" && !task.result_urls.is_empty() {
-            let results_dir = store.assets_dir().join("results");
-            let urls = task.result_urls.clone();
-            let tid = task.id.clone();
-            let downloaded =
-                tauri::async_runtime::spawn_blocking(move || download_result_urls(&urls, &results_dir))
-                    .await
-                    .unwrap_or_default();
-            if !downloaded.is_empty() {
-                let _ = store.mutate(|data| {
-                    if let Some(t) = data.tasks.iter_mut().find(|t| t.id == tid) {
-                        for p in &downloaded {
-                            if !t.result_paths.contains(p) {
-                                t.result_paths.push(p.clone());
-                            }
-                        }
-                    }
-                    Ok(())
-                });
-            }
-        }
+        process_queue_for_store_blocking(&store, "manual")
+    }
+
+    #[tauri::command]
+    pub fn record_lifecycle_event_command(
+        store: State<'_, AppStore>,
+        event_type: String,
+        message: String,
+        detail: String,
+    ) -> Result<(), String> {
         store
-            .snapshot()
-            .tasks
-            .into_iter()
-            .find(|t| t.id == task.id)
-            .map(Some)
-            .ok_or_else(|| "任务不存在".to_string())
+            .mutate(|data| {
+                record_lifecycle_event(data, &event_type, &message, &detail);
+                Ok(())
+            })
+            .map_err(|error| error.to_string())
     }
 
     #[tauri::command]
@@ -4655,27 +6462,29 @@ pub mod commands {
             .or_else(|| settings.ai_model_configs.first())
             .ok_or_else(|| "未配置 AI 模型".to_string())?
             .clone();
-        let request = build_ai_title_request(&config, &prompt).map_err(|error| error.to_string())?;
+        let request =
+            build_ai_title_request(&config, &prompt).map_err(|error| error.to_string())?;
         let url = request.url.clone();
         let api_key = config.api_key.trim().to_string();
         let body = request.body.to_string();
-        let response_text = tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
-            let response = reqwest::blocking::Client::new()
-                .post(&url)
-                .bearer_auth(&api_key)
-                .header("content-type", "application/json")
-                .body(body)
-                .send()
-                .map_err(|error| format!("AI 标题生成请求失败：{error}"))?;
-            if !response.status().is_success() {
-                return Err(format!("AI 标题生成失败：HTTP {}", response.status()));
-            }
-            response
-                .text()
-                .map_err(|error| format!("AI 标题响应读取失败：{error}"))
-        })
-        .await
-        .map_err(|e| format!("任务执行错误：{e}"))??;
+        let response_text =
+            tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+                let response = reqwest::blocking::Client::new()
+                    .post(&url)
+                    .bearer_auth(&api_key)
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .send()
+                    .map_err(|error| format!("AI 标题生成请求失败：{error}"))?;
+                if !response.status().is_success() {
+                    return Err(format!("AI 标题生成失败：HTTP {}", response.status()));
+                }
+                response
+                    .text()
+                    .map_err(|error| format!("AI 标题响应读取失败：{error}"))
+            })
+            .await
+            .map_err(|e| format!("任务执行错误：{e}"))??;
         let payload = serde_json::from_str::<serde_json::Value>(&response_text)
             .map_err(|error| format!("AI 标题响应解析失败：{error}"))?;
         extract_generated_task_title(&payload).ok_or_else(|| "AI 标题响应中没有 title".to_string())
@@ -4697,28 +6506,34 @@ pub mod commands {
             model,
             api_mode,
         };
-        let request = build_ai_title_request(&config, "用一句话介绍自己").map_err(|e| e.to_string())?;
+        let request =
+            build_ai_title_request(&config, "用一句话介绍自己").map_err(|e| e.to_string())?;
         let url = request.url.clone();
         let log_url = url.clone();
         let log_mode = config.api_mode.clone();
         let log_model = config.model.clone();
         let key = config.api_key.trim().to_string();
         let body = request.body.to_string();
-        let response_result = tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
-            let response = reqwest::blocking::Client::new()
-                .post(&url)
-                .bearer_auth(&key)
-                .header("content-type", "application/json")
-                .body(body)
-                .send()
-                .map_err(|e| format!("请求失败：{e}"))?;
-            if !response.status().is_success() {
-                return Err(format!("HTTP {}：{}", response.status(), response.text().unwrap_or_default()));
-            }
-            response.text().map_err(|e| format!("读取响应失败：{e}"))
-        })
-        .await
-        .map_err(|e| format!("任务错误：{e}"))?;
+        let response_result =
+            tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+                let response = reqwest::blocking::Client::new()
+                    .post(&url)
+                    .bearer_auth(&key)
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .send()
+                    .map_err(|e| format!("请求失败：{e}"))?;
+                if !response.status().is_success() {
+                    return Err(format!(
+                        "HTTP {}：{}",
+                        response.status(),
+                        response.text().unwrap_or_default()
+                    ));
+                }
+                response.text().map_err(|e| format!("读取响应失败：{e}"))
+            })
+            .await
+            .map_err(|e| format!("任务错误：{e}"))?;
         let response_text = match response_result {
             Ok(text) => text,
             Err(error) => {
@@ -4731,18 +6546,26 @@ pub mod commands {
                     Some(&error),
                 );
                 let _ = store.mutate(|data| {
-                    append_log(data, LogEntryDraft {
-                        level: LogLevel::Error,
-                        source: LogSource::AI,
-                        category: "ai_model_test".to_string(),
-                        event_type: "test_error".to_string(),
-                        message: format!("AI 模型测试失败：{}", error),
-                        detail: log,
-                        task_id: None, task_title: None, submit_id: None,
-                        execution_record_id: None, error_detail: Some(error.clone()),
-                        raw_output: None, stdout: None, stderr: None,
-                        module: Some(format!("{}:{}", log_mode, log_model)),
-                    });
+                    append_log(
+                        data,
+                        LogEntryDraft {
+                            level: LogLevel::Error,
+                            source: LogSource::AI,
+                            category: "ai_model_test".to_string(),
+                            event_type: "test_error".to_string(),
+                            message: format!("AI 模型测试失败：{}", error),
+                            detail: log,
+                            task_id: None,
+                            task_title: None,
+                            submit_id: None,
+                            execution_record_id: None,
+                            error_detail: Some(error.clone()),
+                            raw_output: None,
+                            stdout: None,
+                            stderr: None,
+                            module: Some(format!("{}:{}", log_mode, log_model)),
+                        },
+                    );
                     Ok(())
                 });
                 return Err(error);
@@ -4761,19 +6584,26 @@ pub mod commands {
                     Some(&message),
                 );
                 let _ = store.mutate(|data| {
-                    append_log(data, LogEntryDraft {
-                        level: LogLevel::Error,
-                        source: LogSource::AI,
-                        category: "ai_model_test".to_string(),
-                        event_type: "parse_error".to_string(),
-                        message: message.clone(),
-                        detail: log,
-                        task_id: None, task_title: None, submit_id: None,
-                        execution_record_id: None, error_detail: Some(message.clone()),
-                        raw_output: Some(truncate_log_field(&response_text)),
-                        stdout: None, stderr: None,
-                        module: Some(format!("{}:{}", log_mode, log_model)),
-                    });
+                    append_log(
+                        data,
+                        LogEntryDraft {
+                            level: LogLevel::Error,
+                            source: LogSource::AI,
+                            category: "ai_model_test".to_string(),
+                            event_type: "parse_error".to_string(),
+                            message: message.clone(),
+                            detail: log,
+                            task_id: None,
+                            task_title: None,
+                            submit_id: None,
+                            execution_record_id: None,
+                            error_detail: Some(message.clone()),
+                            raw_output: Some(truncate_log_field(&response_text)),
+                            stdout: None,
+                            stderr: None,
+                            module: Some(format!("{}:{}", log_mode, log_model)),
+                        },
+                    );
                     Ok(())
                 });
                 return Err(message);
@@ -4794,20 +6624,33 @@ pub mod commands {
             error,
         );
         let _ = store.mutate(|data| {
-            append_log(data, LogEntryDraft {
-                level: if error.is_some() { LogLevel::Warn } else { LogLevel::Success },
-                source: LogSource::AI,
-                category: "ai_model_test".to_string(),
-                event_type: "test_complete".to_string(),
-                message: format!("AI 模型测试完成：{}", parsed.as_deref().unwrap_or("无文本输出")),
-                detail: log,
-                task_id: None, task_title: None, submit_id: None,
-                execution_record_id: None,
-                error_detail: error.map(|e| e.to_string()),
-                raw_output: Some(truncate_log_field(&response_text)),
-                stdout: None, stderr: None,
-                module: Some(format!("{}:{}", log_mode, log_model)),
-            });
+            append_log(
+                data,
+                LogEntryDraft {
+                    level: if error.is_some() {
+                        LogLevel::Warn
+                    } else {
+                        LogLevel::Success
+                    },
+                    source: LogSource::AI,
+                    category: "ai_model_test".to_string(),
+                    event_type: "test_complete".to_string(),
+                    message: format!(
+                        "AI 模型测试完成：{}",
+                        parsed.as_deref().unwrap_or("无文本输出")
+                    ),
+                    detail: log,
+                    task_id: None,
+                    task_title: None,
+                    submit_id: None,
+                    execution_record_id: None,
+                    error_detail: error.map(|e| e.to_string()),
+                    raw_output: Some(truncate_log_field(&response_text)),
+                    stdout: None,
+                    stderr: None,
+                    module: Some(format!("{}:{}", log_mode, log_model)),
+                },
+            );
             Ok(())
         });
         parsed.ok_or_else(|| format!("模型已响应但未返回文本，原始响应：{response_text}"))
@@ -4847,7 +6690,10 @@ pub mod commands {
             ref_ids
                 .iter()
                 .map(|id| {
-                    let asset = data.assets.iter().find(|a| &a.id == id)
+                    let asset = data
+                        .assets
+                        .iter()
+                        .find(|a| &a.id == id)
                         .ok_or_else(|| format!("素材 {id} 不存在"))?;
                     println!("[generate_image]   ref id={id} path={}", asset.stored_path);
                     let bytes = std::fs::read(&asset.stored_path)
@@ -4863,7 +6709,10 @@ pub mod commands {
             println!("[generate_image]   ref[{}] base64_len={}", i, uri.len());
         }
         let url = format!("{base_url}/images/generations");
-        println!("[generate_image] mode=generations url={url} ref_count={}", ref_data_uris.len());
+        println!(
+            "[generate_image] mode=generations url={url} ref_count={}",
+            ref_data_uris.len()
+        );
         let mut body_value = serde_json::json!({
             "model": model.clone(),
             "prompt": prompt_trimmed.clone(),
@@ -4873,46 +6722,61 @@ pub mod commands {
             "async": true,
         });
         if ref_data_uris.len() == 1 {
-            body_value["image"] = serde_json::Value::String(ref_data_uris.into_iter().next().unwrap());
+            body_value["image"] =
+                serde_json::Value::String(ref_data_uris.into_iter().next().unwrap());
         } else if !ref_data_uris.is_empty() {
             // 多图必须用 images（复数）字段
             body_value["images"] = serde_json::Value::Array(
-                ref_data_uris.into_iter().map(serde_json::Value::String).collect(),
+                ref_data_uris
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
             );
         }
         let body = body_value.to_string();
         println!("[generate_image] request body size={} bytes", body.len());
         let ak = api_key.clone();
         let request_url = url.clone();
-        let response_text: String = tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
-            let client = reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
-                .connect_timeout(std::time::Duration::from_secs(15))
-                .build()
-                .map_err(|e| format!("创建 HTTP 客户端失败：{}", describe_error(&e)))?;
-            let response = client
-                .post(&request_url)
-                .bearer_auth(&ak)
-                .header("content-type", "application/json")
-                .body(body)
-                .send()
-                .map_err(|e| format!("图片生成请求失败：{}", describe_error(&e)))?;
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().unwrap_or_default();
-                let snippet = if body.len() > 500 { format!("{}…", &body[..500]) } else { body };
-                return Err(format!("图片生成失败 HTTP {status}：{snippet}"));
-            }
-            response.text().map_err(|e| format!("读取响应失败：{}", describe_error(&e)))
-        })
-        .await
-        .map_err(|e| format!("任务错误：{e}"))??;
-        println!("[generate_image] async submit response: {}", truncate(&response_text, 500));
+        let response_text: String =
+            tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(IMAGE_SUBMIT_TIMEOUT_SECS))
+                    .connect_timeout(std::time::Duration::from_secs(
+                        IMAGE_SUBMIT_CONNECT_TIMEOUT_SECS,
+                    ))
+                    .build()
+                    .map_err(|e| format!("创建 HTTP 客户端失败：{}", describe_error(&e)))?;
+                let response = client
+                    .post(&request_url)
+                    .bearer_auth(&ak)
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .send()
+                    .map_err(|e| format!("图片生成请求失败：{}", describe_error(&e)))?;
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().unwrap_or_default();
+                    let snippet = if body.len() > 500 {
+                        format!("{}…", &body[..500])
+                    } else {
+                        body
+                    };
+                    return Err(format!("图片生成失败 HTTP {status}：{snippet}"));
+                }
+                response
+                    .text()
+                    .map_err(|e| format!("读取响应失败：{}", describe_error(&e)))
+            })
+            .await
+            .map_err(|e| format!("任务错误：{e}"))??;
+        println!(
+            "[generate_image] async submit response: {}",
+            truncate(&response_text, 500)
+        );
         let payload = parse_imagegen_json_response(&response_text, &url)?;
         // 任务 ID：兼容多种字段名
-        let task_id = extract_task_id(&payload).ok_or_else(|| {
-            format!("提交成功但未找到任务 ID：{}", truncate(&response_text, 300))
-        })?;
+        let task_id = extract_task_id(&payload)
+            .ok_or_else(|| format!("提交成功但未找到任务 ID：{}", truncate(&response_text, 300)))?;
         println!("[generate_image] async task_id={task_id}");
 
         let item = ImageGenHistoryItem {
@@ -4946,14 +6810,18 @@ pub mod commands {
         // 顶层 task_id / id
         for key in ["task_id", "taskId", "id"] {
             if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
-                if !s.is_empty() { return Some(s.to_string()); }
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
             }
         }
         // data.task_id / data.id
         if let Some(d) = v.get("data") {
             for key in ["task_id", "taskId", "id"] {
                 if let Some(s) = d.get(key).and_then(|x| x.as_str()) {
-                    if !s.is_empty() { return Some(s.to_string()); }
+                    if !s.is_empty() {
+                        return Some(s.to_string());
+                    }
                 }
             }
             // data 是数组，第一个元素
@@ -4961,7 +6829,9 @@ pub mod commands {
                 if let Some(first) = arr.first() {
                     for key in ["task_id", "taskId", "id"] {
                         if let Some(s) = first.get(key).and_then(|x| x.as_str()) {
-                            if !s.is_empty() { return Some(s.to_string()); }
+                            if !s.is_empty() {
+                                return Some(s.to_string());
+                            }
                         }
                     }
                 }
@@ -5000,32 +6870,43 @@ pub mod commands {
         let url = format!("{base_url}/images/{task_id}");
         let ak = api_key.clone();
         let request_url = url.clone();
-        let response_text: String = tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
-            let client = reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .connect_timeout(std::time::Duration::from_secs(15))
-                .build()
-                .map_err(|e| format!("创建 HTTP 客户端失败：{}", describe_error(&e)))?;
-            let response = client
-                .get(&request_url)
-                .bearer_auth(&ak)
-                .send()
-                .map_err(|e| format!("查询任务请求失败：{}", describe_error(&e)))?;
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().unwrap_or_default();
-                let snippet = if body.len() > 500 { format!("{}…", &body[..500]) } else { body };
-                return Err(format!("查询任务失败 HTTP {status}：{snippet}"));
-            }
-            response.text().map_err(|e| format!("读取响应失败：{}", describe_error(&e)))
-        })
-        .await
-        .map_err(|e| format!("任务错误：{e}"))??;
-        println!("[query_image_task] {history_id} -> {}", truncate(&response_text, 400));
+        let response_text: String =
+            tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(30))
+                    .connect_timeout(std::time::Duration::from_secs(15))
+                    .build()
+                    .map_err(|e| format!("创建 HTTP 客户端失败：{}", describe_error(&e)))?;
+                let response = client
+                    .get(&request_url)
+                    .bearer_auth(&ak)
+                    .send()
+                    .map_err(|e| format!("查询任务请求失败：{}", describe_error(&e)))?;
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().unwrap_or_default();
+                    let snippet = if body.len() > 500 {
+                        format!("{}…", &body[..500])
+                    } else {
+                        body
+                    };
+                    return Err(format!("查询任务失败 HTTP {status}：{snippet}"));
+                }
+                response
+                    .text()
+                    .map_err(|e| format!("读取响应失败：{}", describe_error(&e)))
+            })
+            .await
+            .map_err(|e| format!("任务错误：{e}"))??;
+        println!(
+            "[query_image_task] {history_id} -> {}",
+            truncate(&response_text, 400)
+        );
         let payload = parse_imagegen_json_response(&response_text, &url)?;
 
         // 解析状态（兼容 status / task_status 字段名）
-        let status_raw = payload.get("status")
+        let status_raw = payload
+            .get("status")
             .or_else(|| payload.get("task_status"))
             .or_else(|| payload.get("data").and_then(|d| d.get("status")))
             .or_else(|| payload.get("data").and_then(|d| d.get("task_status")))
@@ -5036,7 +6917,10 @@ pub mod commands {
             status_raw.as_str(),
             "completed" | "succeeded" | "succeed" | "success" | "finished" | "done"
         );
-        let is_failed = matches!(status_raw.as_str(), "failed" | "error" | "canceled" | "cancelled");
+        let is_failed = matches!(
+            status_raw.as_str(),
+            "failed" | "error" | "canceled" | "cancelled"
+        );
 
         if is_failed {
             let err_msg = payload
@@ -5065,7 +6949,8 @@ pub mod commands {
             .or_else(|| payload.get("data"))
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        let bytes: Vec<u8> = if let Some(b64) = first_data.get("b64_json").and_then(|v| v.as_str()) {
+        let bytes: Vec<u8> = if let Some(b64) = first_data.get("b64_json").and_then(|v| v.as_str())
+        {
             BASE64_STANDARD
                 .decode(b64.as_bytes())
                 .map_err(|e| format!("base64 解码失败：{e}"))?
@@ -5088,7 +6973,8 @@ pub mod commands {
                 if !r.status().is_success() {
                     return Err(format!("下载图片失败 HTTP {}", r.status()));
                 }
-                let bytes = r.bytes()
+                let bytes = r
+                    .bytes()
                     .map(|b| b.to_vec())
                     .map_err(|e| format!("读取图片失败：{}", describe_error(&e)))?;
                 println!("[query_image_task] download ok, {} bytes", bytes.len());
@@ -5097,7 +6983,10 @@ pub mod commands {
             .await
             .map_err(|e| format!("任务错误：{e}"))??
         } else {
-            return Err(format!("响应中未找到图片数据：{}", truncate(&response_text, 300)));
+            return Err(format!(
+                "响应中未找到图片数据：{}",
+                truncate(&response_text, 300)
+            ));
         };
 
         // 落盘
@@ -5232,8 +7121,8 @@ pub mod commands {
             .map_err(|error| format!("读取图片失败：{}", describe_error(&error)))?;
         let (width, height, rgba) = decode_png_rgba(&bytes)
             .map_err(|error| format!("解析图片失败：{}", describe_error(&error)))?;
-        let mut clipboard = arboard::Clipboard::new()
-            .map_err(|error| format!("无法访问系统剪贴板：{error}"))?;
+        let mut clipboard =
+            arboard::Clipboard::new().map_err(|error| format!("无法访问系统剪贴板：{error}"))?;
         clipboard
             .set_image(arboard::ImageData {
                 width,
@@ -5287,7 +7176,11 @@ pub mod commands {
     }
 
     fn truncate(s: &str, max: usize) -> String {
-        if s.len() <= max { s.to_string() } else { format!("{}…", &s[..max]) }
+        if s.len() <= max {
+            s.to_string()
+        } else {
+            format!("{}…", &s[..max])
+        }
     }
 
     #[tauri::command]
@@ -5298,7 +7191,7 @@ pub mod commands {
         store
             .mutate(|data| {
                 let mut settings = SchedulerSettings {
-                    concurrency_limit_policy: input.concurrency_limit_policy,
+                    concurrency_limit_policy: ConcurrencyLimitPolicy::SilentRetry,
                     concurrency_retry_delay_seconds: input.concurrency_retry_delay_seconds,
                     concurrency_retry_max_attempts: input.concurrency_retry_max_attempts,
                     auto_query_enabled: input.auto_query_enabled,
@@ -5315,17 +7208,26 @@ pub mod commands {
                 };
                 normalize_image_model_settings(&mut settings);
                 data.settings = settings;
-                append_log(data, LogEntryDraft {
-                    level: LogLevel::Info,
-                    source: LogSource::Settings,
-                    category: "settings".to_string(),
-                    event_type: "update".to_string(),
-                    message: "更新设置".to_string(),
-                    detail: format_image_model_settings_log(&data.settings),
-                    task_id: None, task_title: None, submit_id: None,
-                    execution_record_id: None, error_detail: None,
-                    raw_output: None, stdout: None, stderr: None, module: None,
-                });
+                append_log(
+                    data,
+                    LogEntryDraft {
+                        level: LogLevel::Info,
+                        source: LogSource::Settings,
+                        category: "settings".to_string(),
+                        event_type: "update".to_string(),
+                        message: "更新设置".to_string(),
+                        detail: format_image_model_settings_log(&data.settings),
+                        task_id: None,
+                        task_title: None,
+                        submit_id: None,
+                        execution_record_id: None,
+                        error_detail: None,
+                        raw_output: None,
+                        stdout: None,
+                        stderr: None,
+                        module: None,
+                    },
+                );
                 Ok(data.settings.clone())
             })
             .map_err(|error| error.to_string())
@@ -5339,17 +7241,27 @@ pub mod commands {
         store
             .mutate(|data| {
                 let task = pause_task(data, &task_id)?;
-                append_task_log(data, &task, LogEntryDraft {
-                    level: LogLevel::Info,
-                    source: LogSource::Scheduler,
-                    category: "task".to_string(),
-                    event_type: "pause".to_string(),
-                    message: format!("暂停任务：{}", task.title),
-                    detail: String::new(),
-                    task_id: None, task_title: None, submit_id: None,
-                    execution_record_id: None, error_detail: None,
-                    raw_output: None, stdout: None, stderr: None, module: None,
-                });
+                append_task_log(
+                    data,
+                    &task,
+                    LogEntryDraft {
+                        level: LogLevel::Info,
+                        source: LogSource::Scheduler,
+                        category: "task".to_string(),
+                        event_type: "pause".to_string(),
+                        message: format!("暂停任务：{}", task.title),
+                        detail: String::new(),
+                        task_id: None,
+                        task_title: None,
+                        submit_id: None,
+                        execution_record_id: None,
+                        error_detail: None,
+                        raw_output: None,
+                        stdout: None,
+                        stderr: None,
+                        module: None,
+                    },
+                );
                 Ok(task)
             })
             .map_err(|error| error.to_string())
@@ -5364,17 +7276,27 @@ pub mod commands {
         store
             .mutate(|data| {
                 let task = resume_task(data, &task_id, &mode)?;
-                append_task_log(data, &task, LogEntryDraft {
-                    level: LogLevel::Info,
-                    source: LogSource::Scheduler,
-                    category: "task".to_string(),
-                    event_type: "resume".to_string(),
-                    message: format!("恢复任务：{} -> {}", task.title, task.status),
-                    detail: String::new(),
-                    task_id: None, task_title: None, submit_id: None,
-                    execution_record_id: None, error_detail: None,
-                    raw_output: None, stdout: None, stderr: None, module: None,
-                });
+                append_task_log(
+                    data,
+                    &task,
+                    LogEntryDraft {
+                        level: LogLevel::Info,
+                        source: LogSource::Scheduler,
+                        category: "task".to_string(),
+                        event_type: "resume".to_string(),
+                        message: format!("恢复任务：{} -> {}", task.title, task.status),
+                        detail: String::new(),
+                        task_id: None,
+                        task_title: None,
+                        submit_id: None,
+                        execution_record_id: None,
+                        error_detail: None,
+                        raw_output: None,
+                        stdout: None,
+                        stderr: None,
+                        module: None,
+                    },
+                );
                 Ok(task)
             })
             .map_err(|error| error.to_string())
@@ -5389,17 +7311,65 @@ pub mod commands {
         store
             .mutate(|data| {
                 let task = reschedule_task(data, &task_id, &new_scheduled_at)?;
-                append_task_log(data, &task, LogEntryDraft {
-                    level: LogLevel::Info,
-                    source: LogSource::Scheduler,
-                    category: "task".to_string(),
-                    event_type: "reschedule".to_string(),
-                    message: format!("重新排期：{} -> {}", task.title, new_scheduled_at),
-                    detail: String::new(),
-                    task_id: None, task_title: None, submit_id: None,
-                    execution_record_id: None, error_detail: None,
-                    raw_output: None, stdout: None, stderr: None, module: None,
-                });
+                append_task_log(
+                    data,
+                    &task,
+                    LogEntryDraft {
+                        level: LogLevel::Info,
+                        source: LogSource::Scheduler,
+                        category: "task".to_string(),
+                        event_type: "reschedule".to_string(),
+                        message: format!("重新排期：{} -> {}", task.title, new_scheduled_at),
+                        detail: String::new(),
+                        task_id: None,
+                        task_title: None,
+                        submit_id: None,
+                        execution_record_id: None,
+                        error_detail: None,
+                        raw_output: None,
+                        stdout: None,
+                        stderr: None,
+                        module: None,
+                    },
+                );
+                Ok(task)
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    #[tauri::command]
+    pub fn set_task_planned_submit_count_command(
+        store: State<'_, AppStore>,
+        task_id: String,
+        planned_submit_count: u32,
+    ) -> Result<ScheduledTask, String> {
+        store
+            .mutate(|data| {
+                let task = set_task_planned_submit_count(data, &task_id, planned_submit_count)?;
+                append_task_log(
+                    data,
+                    &task,
+                    LogEntryDraft {
+                        level: LogLevel::Info,
+                        source: LogSource::Scheduler,
+                        category: "task".to_string(),
+                        event_type: "planned_submit_count".to_string(),
+                        message: format!(
+                            "设置目标成功候选数：{} -> {}",
+                            task.title, task.planned_submit_count
+                        ),
+                        detail: String::new(),
+                        task_id: None,
+                        task_title: None,
+                        submit_id: None,
+                        execution_record_id: None,
+                        error_detail: None,
+                        raw_output: None,
+                        stdout: None,
+                        stderr: None,
+                        module: None,
+                    },
+                );
                 Ok(task)
             })
             .map_err(|error| error.to_string())
@@ -5466,8 +7436,7 @@ pub mod commands {
             };
             let id = format!("result_{}", Uuid::new_v4().simple());
             let local_path = results_dir.join(format!("{id}.{safe_ext}"));
-            let response =
-                reqwest::blocking::get(&url).map_err(|e| format!("下载失败：{e}"))?;
+            let response = reqwest::blocking::get(&url).map_err(|e| format!("下载失败：{e}"))?;
             if !response.status().is_success() {
                 return Err(format!("下载失败：HTTP {}", response.status()));
             }
@@ -5484,10 +7453,10 @@ pub mod commands {
         store: State<'_, AppStore>,
     ) -> Result<String, String> {
         let settings = store.snapshot().settings;
-        let plan = build_install_plan(&settings, std::env::consts::OS)
-            .map_err(|e| e.to_string())?;
-        let (msg, stdout_log, stderr_log) =
-            tauri::async_runtime::spawn_blocking(move || -> Result<(String, String, String), String> {
+        let plan =
+            build_install_plan(&settings, std::env::consts::OS).map_err(|e| e.to_string())?;
+        let (msg, stdout_log, stderr_log) = tauri::async_runtime::spawn_blocking(
+            move || -> Result<(String, String, String), String> {
                 let output = Command::new(&plan.program)
                     .args(&plan.args)
                     .output()
@@ -5504,24 +7473,31 @@ pub mod commands {
                     format!("安装命令已执行，但 CLI 仍不可用：{}", cli.message)
                 };
                 Ok((msg, stdout, stderr))
-            })
-            .await
-            .map_err(|e| format!("任务错误：{e}"))??;
+            },
+        )
+        .await
+        .map_err(|e| format!("任务错误：{e}"))??;
         let _ = store.mutate(|data| {
-            append_log(data, LogEntryDraft {
-                level: LogLevel::Success,
-                source: LogSource::CLI,
-                category: "cli".to_string(),
-                event_type: "install".to_string(),
-                message: format!("CLI 安装：{}", msg),
-                detail: String::new(),
-                task_id: None, task_title: None, submit_id: None,
-                execution_record_id: None, error_detail: None,
-                raw_output: None,
-                stdout: Some(truncate_log_field(&stdout_log)),
-                stderr: Some(truncate_log_field(&stderr_log)),
-                module: None,
-            });
+            append_log(
+                data,
+                LogEntryDraft {
+                    level: LogLevel::Success,
+                    source: LogSource::CLI,
+                    category: "cli".to_string(),
+                    event_type: "install".to_string(),
+                    message: format!("CLI 安装：{}", msg),
+                    detail: String::new(),
+                    task_id: None,
+                    task_title: None,
+                    submit_id: None,
+                    execution_record_id: None,
+                    error_detail: None,
+                    raw_output: None,
+                    stdout: Some(truncate_log_field(&stdout_log)),
+                    stderr: Some(truncate_log_field(&stderr_log)),
+                    module: None,
+                },
+            );
             Ok(())
         });
         Ok(msg)
@@ -5537,8 +7513,8 @@ pub mod commands {
             return Err(cli.message);
         }
         let plan = build_login_plan(&cli.path, headless);
-        let (msg, stdout_log, stderr_log) =
-            tauri::async_runtime::spawn_blocking(move || -> Result<(String, String, String), String> {
+        let (msg, stdout_log, stderr_log) = tauri::async_runtime::spawn_blocking(
+            move || -> Result<(String, String, String), String> {
                 let output = Command::new(&plan.program)
                     .args(&plan.args)
                     .output()
@@ -5553,24 +7529,31 @@ pub mod commands {
                     Err(error) => format!("登录命令已完成，但额度检测失败：{error}"),
                 };
                 Ok((msg, stdout, stderr))
-            })
-            .await
-            .map_err(|e| format!("任务错误：{e}"))??;
+            },
+        )
+        .await
+        .map_err(|e| format!("任务错误：{e}"))??;
         let _ = store.mutate(|data| {
-            append_log(data, LogEntryDraft {
-                level: LogLevel::Success,
-                source: LogSource::CLI,
-                category: "cli".to_string(),
-                event_type: "login".to_string(),
-                message: format!("CLI 登录：{}", msg),
-                detail: String::new(),
-                task_id: None, task_title: None, submit_id: None,
-                execution_record_id: None, error_detail: None,
-                raw_output: None,
-                stdout: Some(truncate_log_field(&stdout_log)),
-                stderr: Some(truncate_log_field(&stderr_log)),
-                module: None,
-            });
+            append_log(
+                data,
+                LogEntryDraft {
+                    level: LogLevel::Success,
+                    source: LogSource::CLI,
+                    category: "cli".to_string(),
+                    event_type: "login".to_string(),
+                    message: format!("CLI 登录：{}", msg),
+                    detail: String::new(),
+                    task_id: None,
+                    task_title: None,
+                    submit_id: None,
+                    execution_record_id: None,
+                    error_detail: None,
+                    raw_output: None,
+                    stdout: Some(truncate_log_field(&stdout_log)),
+                    stderr: Some(truncate_log_field(&stderr_log)),
+                    module: None,
+                },
+            );
             Ok(())
         });
         Ok(msg)
@@ -5585,17 +7568,26 @@ pub mod commands {
                 if data.tasks.len() == before {
                     return Err(SchedulerError::Io(format!("找不到任务：{task_id}")));
                 }
-                append_log(data, LogEntryDraft {
-                    level: LogLevel::Info,
-                    source: LogSource::Scheduler,
-                    category: "task".to_string(),
-                    event_type: "delete".to_string(),
-                    message: format!("删除任务：{task_id}"),
-                    detail: String::new(),
-                    task_id: Some(task_id.clone()), task_title: None, submit_id: None,
-                    execution_record_id: None, error_detail: None,
-                    raw_output: None, stdout: None, stderr: None, module: None,
-                });
+                append_log(
+                    data,
+                    LogEntryDraft {
+                        level: LogLevel::Info,
+                        source: LogSource::Scheduler,
+                        category: "task".to_string(),
+                        event_type: "delete".to_string(),
+                        message: format!("删除任务：{task_id}"),
+                        detail: String::new(),
+                        task_id: Some(task_id.clone()),
+                        task_title: None,
+                        submit_id: None,
+                        execution_record_id: None,
+                        error_detail: None,
+                        raw_output: None,
+                        stdout: None,
+                        stderr: None,
+                        module: None,
+                    },
+                );
                 Ok(())
             })
             .map_err(|e| e.to_string())
@@ -5615,26 +7607,42 @@ pub mod commands {
     #[tauri::command]
     pub fn update_task_command(
         store: State<'_, AppStore>,
+        waker: State<'_, SchedulerWaker>,
         task_id: String,
         draft: TaskDraft,
     ) -> Result<ScheduledTask, String> {
-        store
+        let task = store
             .mutate(|data| {
                 let task = update_task_from_data(data, &task_id, draft, "task")?;
-                append_task_log(data, &task, LogEntryDraft {
-                    level: LogLevel::Info,
-                    source: LogSource::Scheduler,
-                    category: "task".to_string(),
-                    event_type: "update".to_string(),
-                    message: format!("更新任务：{}", task.title),
-                    detail: String::new(),
-                    task_id: None, task_title: None, submit_id: None,
-                    execution_record_id: None, error_detail: None,
-                    raw_output: None, stdout: None, stderr: None, module: None,
-                });
+                append_task_log(
+                    data,
+                    &task,
+                    LogEntryDraft {
+                        level: LogLevel::Info,
+                        source: LogSource::Scheduler,
+                        category: "task".to_string(),
+                        event_type: "update".to_string(),
+                        message: format!("更新任务：{}", task.title),
+                        detail: String::new(),
+                        task_id: None,
+                        task_title: None,
+                        submit_id: None,
+                        execution_record_id: None,
+                        error_detail: None,
+                        raw_output: None,
+                        stdout: None,
+                        stderr: None,
+                        module: None,
+                    },
+                );
                 Ok(task)
             })
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        // 若更新后任务变为活跃（如改期/重新排队），唤醒调度线程；多余唤醒会被空闲短路回收。
+        if has_active_tasks(std::slice::from_ref(&task)) {
+            waker.notify();
+        }
+        Ok(task)
     }
 
     #[tauri::command]
@@ -5646,17 +7654,27 @@ pub mod commands {
         store
             .mutate(|data| {
                 let task = update_task_from_data(data, &task_id, draft, "draft")?;
-                append_task_log(data, &task, LogEntryDraft {
-                    level: LogLevel::Info,
-                    source: LogSource::Scheduler,
-                    category: "task".to_string(),
-                    event_type: "update_draft".to_string(),
-                    message: format!("更新草稿：{}", task.title),
-                    detail: String::new(),
-                    task_id: None, task_title: None, submit_id: None,
-                    execution_record_id: None, error_detail: None,
-                    raw_output: None, stdout: None, stderr: None, module: None,
-                });
+                append_task_log(
+                    data,
+                    &task,
+                    LogEntryDraft {
+                        level: LogLevel::Info,
+                        source: LogSource::Scheduler,
+                        category: "task".to_string(),
+                        event_type: "update_draft".to_string(),
+                        message: format!("更新草稿：{}", task.title),
+                        detail: String::new(),
+                        task_id: None,
+                        task_title: None,
+                        submit_id: None,
+                        execution_record_id: None,
+                        error_detail: None,
+                        raw_output: None,
+                        stdout: None,
+                        stderr: None,
+                        module: None,
+                    },
+                );
                 Ok(task)
             })
             .map_err(|error| error.to_string())
@@ -5706,23 +7724,6 @@ fn collect_json_strings(value: &serde_json::Value, text: &mut String) {
                     text.push_str(": ");
                 }
                 collect_json_strings(value, text);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn collect_json_string_values(value: &serde_json::Value, output: &mut Vec<String>) {
-    match value {
-        serde_json::Value::String(value) => output.push(value.clone()),
-        serde_json::Value::Array(items) => {
-            for item in items {
-                collect_json_string_values(item, output);
-            }
-        }
-        serde_json::Value::Object(map) => {
-            for value in map.values() {
-                collect_json_string_values(value, output);
             }
         }
         _ => {}
@@ -5845,34 +7846,29 @@ mod tests {
             auto_query_stopped: false,
             consecutive_no_result_queries: 0,
             server_error_retry_count: 0,
+            planned_submit_count: 1,
         }
     }
 
     #[test]
-    fn query_specific_execution_record_uses_its_submit_id_without_overwriting_current_task_status() {
+    fn query_specific_execution_record_uses_its_submit_id_without_overwriting_current_task_status()
+    {
         let mut data = AppData {
             tasks: vec![make_task_with_execution_records()],
             ..AppData::default()
         };
 
-        let task = query_task_submit_id_once_with_runner(
-            &mut data,
-            "task-1",
-            "sub-1",
-            |args| {
-                assert_eq!(
-                    args,
-                    &[
-                        "query_result".to_string(),
-                        "--submit_id=sub-1".to_string(),
-                    ]
-                );
-                Ok((
-                    r#"{"gen_status":"SUCCESS","result_urls":["https://example.com/old-new.mp4"]}"#.to_string(),
-                    String::new(),
-                ))
-            },
-        )
+        let task = query_task_submit_id_once_with_runner(&mut data, "task-1", "sub-1", |args| {
+            assert_eq!(
+                args,
+                &["query_result".to_string(), "--submit_id=sub-1".to_string(),]
+            );
+            Ok((
+                r#"{"gen_status":"SUCCESS","result_urls":["https://example.com/old-new.mp4"]}"#
+                    .to_string(),
+                String::new(),
+            ))
+        })
         .expect("指定执行记录查询应成功");
 
         assert_eq!(task.status, "querying");
@@ -5883,7 +7879,10 @@ mod tests {
             .find(|record| record.submit_id == "sub-1")
             .expect("应找到第一次执行记录");
         assert_eq!(old_record.status, "succeeded");
-        assert_eq!(old_record.result_urls, vec!["https://example.com/old-new.mp4"]);
+        assert_eq!(
+            old_record.result_urls,
+            vec!["https://example.com/old-new.mp4"]
+        );
         assert_eq!(old_record.query_records.len(), 1);
 
         let current_record = task
@@ -5943,7 +7942,10 @@ mod tests {
         assert_eq!(settings.active_image_model_id, "default-image-openai");
         assert_eq!(settings.image_model_configs[0].id, "default-image-openai");
         assert_eq!(settings.image_model_configs[0].name, "OpenAI 图片默认");
-        assert_eq!(settings.image_model_configs[0].base_url, "https://legacy.example/v1");
+        assert_eq!(
+            settings.image_model_configs[0].base_url,
+            "https://legacy.example/v1"
+        );
         assert_eq!(settings.image_model_configs[0].api_key, "legacy-key");
         assert_eq!(settings.image_model_configs[0].model, "legacy-image-model");
     }
@@ -5973,6 +7975,38 @@ mod tests {
 
         assert_eq!(selected.id, "image-b");
         assert_eq!(selected.model, "model-b");
+    }
+
+    #[test]
+    fn generate_image_submit_timeouts_are_five_minutes() {
+        let source = std::fs::read_to_string("src/lib.rs").expect("read src/lib.rs");
+        assert!(
+            source.contains("const IMAGE_SUBMIT_TIMEOUT_SECS: u64 = 300;"),
+            "IMAGE_SUBMIT_TIMEOUT_SECS should be 300 seconds"
+        );
+        assert!(
+            source.contains("const IMAGE_SUBMIT_CONNECT_TIMEOUT_SECS: u64 = 300;"),
+            "IMAGE_SUBMIT_CONNECT_TIMEOUT_SECS should be 300 seconds"
+        );
+        let start = source
+            .find("pub async fn generate_image_command(")
+            .expect("generate_image_command exists");
+        let end = source[start..]
+            .find("\"[generate_image] async submit response:")
+            .map(|offset| start + offset)
+            .expect("generate_image_command submit log exists");
+        let function_body = &source[start..end];
+
+        assert!(
+            function_body
+                .contains(".timeout(std::time::Duration::from_secs(IMAGE_SUBMIT_TIMEOUT_SECS))"),
+            "generate_image_command submit timeout should use IMAGE_SUBMIT_TIMEOUT_SECS"
+        );
+        assert!(
+            function_body.contains(".connect_timeout(std::time::Duration::from_secs(")
+                && function_body.contains("IMAGE_SUBMIT_CONNECT_TIMEOUT_SECS"),
+            "generate_image_command connect timeout should use IMAGE_SUBMIT_CONNECT_TIMEOUT_SECS"
+        );
     }
 
     // ── 退避函数辅助 ─────────────────────────────────────────────────────────
@@ -6016,7 +8050,260 @@ mod tests {
             auto_query_stopped: stopped,
             consecutive_no_result_queries: consecutive,
             server_error_retry_count: 0,
+            planned_submit_count: 1,
         }
+    }
+
+    // ── compute_wait_duration ──────────────────────────────────────────────
+
+    fn make_task_with_status(status: &str) -> ScheduledTask {
+        let mut task = make_queued_task_for_submit("wait-test");
+        task.status = status.to_string();
+        task
+    }
+
+    #[test]
+    fn wait_duration_empty_is_idle_60s() {
+        assert_eq!(compute_wait_duration(&[]), StdDuration::from_secs(60));
+    }
+
+    #[test]
+    fn wait_duration_only_inactive_is_idle_60s() {
+        let tasks = vec![
+            make_task_with_status("succeeded"),
+            make_task_with_status("failed"),
+        ];
+        assert_eq!(compute_wait_duration(&tasks), StdDuration::from_secs(60));
+    }
+
+    #[test]
+    fn wait_duration_with_queued_is_active_30s() {
+        let tasks = vec![make_task_with_status("queued")];
+        assert_eq!(compute_wait_duration(&tasks), StdDuration::from_secs(30));
+    }
+
+    #[test]
+    fn wait_duration_with_querying_is_active_30s() {
+        let tasks = vec![make_task_with_status("querying")];
+        assert_eq!(compute_wait_duration(&tasks), StdDuration::from_secs(30));
+    }
+
+    // ── SchedulerWaker ─────────────────────────────────────────────────────
+
+    #[test]
+    fn waker_notify_wakes_waiter_well_before_timeout() {
+        use std::sync::Arc;
+        use std::time::Instant;
+        let waker = Arc::new(SchedulerWaker::new());
+        let w2 = waker.clone();
+        let start = Instant::now();
+        let handle = std::thread::spawn(move || {
+            w2.wait(StdDuration::from_secs(10));
+        });
+        // 让等待线程先进入 wait
+        std::thread::sleep(StdDuration::from_millis(50));
+        waker.notify();
+        handle.join().unwrap();
+        assert!(
+            start.elapsed() < StdDuration::from_secs(2),
+            "notify 应在远小于 10s 超时前唤醒等待线程"
+        );
+    }
+
+    #[test]
+    fn waker_notify_before_wait_is_not_lost() {
+        use std::time::Instant;
+        let waker = SchedulerWaker::new();
+        waker.notify(); // 唤醒先于 wait 发生
+        let start = Instant::now();
+        waker.wait(StdDuration::from_secs(10)); // 必须因 pending 立即返回
+        assert!(
+            start.elapsed() < StdDuration::from_secs(1),
+            "pending 已置位时 wait 应立即返回，不应丢失唤醒"
+        );
+    }
+
+    // ── state_signature（廉价变更签名）─────────────────────────────────────
+
+    #[test]
+    fn state_signature_changes_after_mutate_and_is_stable_when_idle() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = AppStore::load(temp.path().to_path_buf());
+        store
+            .mutate(|data| {
+                data.tasks.push(make_queued_task_for_submit("sig-1"));
+                Ok(())
+            })
+            .expect("mutate");
+        let s1 = store.state_signature();
+        // 再次写入（新增任务改变体积）→ 签名应变化
+        store
+            .mutate(|data| {
+                data.tasks.push(make_queued_task_for_submit("sig-2"));
+                Ok(())
+            })
+            .expect("mutate");
+        let s2 = store.state_signature();
+        assert_ne!(s1, s2, "写入后签名应变化");
+        // 不写入时连续取签名应稳定
+        assert_eq!(store.state_signature(), s2, "空闲时签名应稳定不变");
+    }
+
+    // ── cap_execution_history（历史裁剪）───────────────────────────────────
+
+    fn cap_attempt(id: usize) -> TaskAttempt {
+        TaskAttempt {
+            id: format!("att-{id}"),
+            started_at: String::new(),
+            finished_at: String::new(),
+            status: "queried".to_string(),
+            command_preview: vec![],
+            stdout: String::new(),
+            stderr: String::new(),
+            error_kind: String::new(),
+            duration_seconds: 0.0,
+            error_detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn cap_execution_history_keeps_most_recent_and_reports_removed() {
+        let mut task = make_queued_task_for_submit("cap-1");
+        task.attempts = (0..60).map(cap_attempt).collect();
+        task.execution_records = vec![TaskExecutionRecord {
+            id: "rec".to_string(),
+            submit_id: "s".to_string(),
+            status: "querying".to_string(),
+            started_at: String::new(),
+            finished_at: String::new(),
+            input_snapshot: TaskExecutionInputSnapshot::default(),
+            command_preview: vec![],
+            query_records: (0..45).map(cap_attempt).collect(),
+            result_paths: vec![],
+            result_urls: vec![],
+            error_kind: String::new(),
+            error_detail: String::new(),
+        }];
+        let mut data = AppData {
+            tasks: vec![task],
+            ..AppData::default()
+        };
+        let removed = cap_execution_history(&mut data);
+        // attempts 留最近 50（丢最旧 10）
+        assert_eq!(data.tasks[0].attempts.len(), 50);
+        assert_eq!(data.tasks[0].attempts[0].id, "att-10");
+        // query_records 留最近 30（丢最旧 15）
+        assert_eq!(data.tasks[0].execution_records[0].query_records.len(), 30);
+        assert_eq!(
+            data.tasks[0].execution_records[0].query_records[0].id,
+            "att-15"
+        );
+        assert_eq!(removed, 10 + 15);
+    }
+
+    #[test]
+    fn cap_execution_history_noop_under_cap_returns_zero() {
+        let mut task = make_queued_task_for_submit("cap-2");
+        task.attempts = (0..5).map(cap_attempt).collect();
+        let mut data = AppData {
+            tasks: vec![task],
+            ..AppData::default()
+        };
+        assert_eq!(cap_execution_history(&mut data), 0);
+        assert_eq!(data.tasks[0].attempts.len(), 5);
+    }
+
+    #[test]
+    fn load_compacts_and_trims_oversized_existing_file() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        // 手工写入 pretty + 超额 query_records 的 state.json（绕过 normalize 的裁剪）
+        let mut task = make_queued_task_for_submit("big");
+        task.execution_records = vec![TaskExecutionRecord {
+            id: "rec".to_string(),
+            submit_id: "s".to_string(),
+            status: "querying".to_string(),
+            started_at: String::new(),
+            finished_at: String::new(),
+            input_snapshot: TaskExecutionInputSnapshot::default(),
+            command_preview: vec![],
+            query_records: (0..45).map(cap_attempt).collect(),
+            result_paths: vec![],
+            result_urls: vec![],
+            error_kind: String::new(),
+            error_detail: String::new(),
+        }];
+        let data = AppData {
+            tasks: vec![task],
+            ..AppData::default()
+        };
+        let path = temp.path().join("state.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&data).expect("ser")).expect("write");
+        let big_size = std::fs::metadata(&path).expect("meta").len();
+
+        // load 应触发一次性压实（紧凑 + 裁剪）落盘
+        let _store = AppStore::load(temp.path().to_path_buf());
+
+        let after = std::fs::read_to_string(&path).expect("read");
+        assert!(!after.contains('\n'), "应压成紧凑 JSON");
+        assert!(
+            (after.len() as u64) < big_size,
+            "文件应明显变小：{} -> {}",
+            big_size,
+            after.len()
+        );
+        // 回读确认 query_records 已裁剪到 30
+        let reloaded = AppStore::load(temp.path().to_path_buf()).snapshot();
+        assert_eq!(reloaded.tasks[0].execution_records[0].query_records.len(), 30);
+    }
+
+    // ── persist 紧凑序列化 ─────────────────────────────────────────────────
+
+    #[test]
+    fn persist_writes_compact_json_not_pretty() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = AppStore::load(temp.path().to_path_buf());
+        store
+            .mutate(|data| {
+                data.tasks.push(make_queued_task_for_submit("compact-1"));
+                Ok(())
+            })
+            .expect("mutate");
+        let content =
+            std::fs::read_to_string(temp.path().join("state.json")).expect("read state.json");
+        assert!(
+            !content.contains('\n'),
+            "state.json 应为紧凑 JSON（无换行/缩进），实际包含换行"
+        );
+        // 紧凑写入后仍能正确回读
+        let reloaded = AppStore::load(temp.path().to_path_buf()).snapshot();
+        assert_eq!(reloaded.tasks.len(), 1);
+        assert_eq!(reloaded.tasks[0].id, "compact-1");
+    }
+
+    // ── should_process_now（空闲短路）─────────────────────────────────────
+
+    #[test]
+    fn should_process_now_false_when_fully_idle() {
+        let data = AppData::default();
+        assert!(!should_process_now(&data));
+    }
+
+    #[test]
+    fn should_process_now_false_with_only_finished_tasks() {
+        let data = AppData {
+            tasks: vec![make_task_with_status("succeeded")],
+            ..AppData::default()
+        };
+        assert!(!should_process_now(&data));
+    }
+
+    #[test]
+    fn should_process_now_true_with_active_task() {
+        let data = AppData {
+            tasks: vec![make_task_with_status("queued")],
+            ..AppData::default()
+        };
+        assert!(should_process_now(&data));
     }
 
     // ── backoff_interval_secs ──────────────────────────────────────────────
@@ -6107,24 +8394,36 @@ mod tests {
     #[test]
     fn is_past_max_wait_under_4_hours_returns_false() {
         let recent = (Utc::now() - Duration::hours(2)).to_rfc3339();
-        assert!(!is_past_max_wait(&make_past_max_task(Some(&recent)), Utc::now()));
+        assert!(!is_past_max_wait(
+            &make_past_max_task(Some(&recent)),
+            Utc::now()
+        ));
     }
 
     #[test]
     fn is_past_max_wait_over_4_hours_returns_true() {
         let past = (Utc::now() - Duration::hours(5)).to_rfc3339();
-        assert!(is_past_max_wait(&make_past_max_task(Some(&past)), Utc::now()));
+        assert!(is_past_max_wait(
+            &make_past_max_task(Some(&past)),
+            Utc::now()
+        ));
     }
 
     #[test]
     fn is_past_max_wait_exactly_4_hours_returns_true() {
         let past = (Utc::now() - Duration::hours(4)).to_rfc3339();
-        assert!(is_past_max_wait(&make_past_max_task(Some(&past)), Utc::now()));
+        assert!(is_past_max_wait(
+            &make_past_max_task(Some(&past)),
+            Utc::now()
+        ));
     }
 
     #[test]
     fn is_past_max_wait_malformed_submitted_at_returns_false() {
-        assert!(!is_past_max_wait(&make_past_max_task(Some("invalid-date")), Utc::now()));
+        assert!(!is_past_max_wait(
+            &make_past_max_task(Some("invalid-date")),
+            Utc::now()
+        ));
     }
 
     // ── manual query bypasses 4-hour cap ───────────────────────────────────
@@ -6148,18 +8447,14 @@ mod tests {
             ..AppData::default()
         };
         // 有远端任务状态但已超过 4 小时：停止自动查询，改为手动查询
-        let task = query_task_submit_id_once_with_runner(
-            &mut data,
-            "task-stale",
-            "sub-stale",
-            |_args| {
+        let task =
+            query_task_submit_id_once_with_runner(&mut data, "task-stale", "sub-stale", |_args| {
                 Ok((
                     String::from(r#"{"created":1777777777,"task_status":"running","data":[]}"#),
                     String::new(),
                 ))
-            },
-        )
-        .expect("auto query should succeed");
+            })
+            .expect("auto query should succeed");
         assert_eq!(task.status, "submitted");
         assert!(task.auto_query_stopped);
         assert!(task.last_error.contains("已等待超过"));
@@ -6207,6 +8502,7 @@ mod tests {
             size_bytes: 1024,
             duration_seconds: None,
             created_at: "2026-05-01T00:00:00Z".to_string(),
+            content_hash: None,
         }
     }
 
@@ -6228,6 +8524,7 @@ mod tests {
             attempt_count: 0,
             concurrency_retry_count: 0,
             server_error_retry_count: 0,
+            planned_submit_count: 1,
             last_error: String::new(),
             command_preview: vec![],
             attempts: vec![],
@@ -6254,11 +8551,12 @@ mod tests {
             assets: vec![make_test_image_asset()],
             ..AppData::default()
         };
-        let task = submit_task_once_with_runner(
-            &mut data,
-            "t5xx",
-            |_args| Ok((r#"{"code": 50001, "message": "服务器内部错误"}"#.to_string(), String::new())),
-        )
+        let task = submit_task_once_with_runner(&mut data, "t5xx", |_args| {
+            Ok((
+                r#"{"code": 50001, "message": "服务器内部错误"}"#.to_string(),
+                String::new(),
+            ))
+        })
         .expect("should not Err");
         assert_eq!(task.status, "retry_wait", "第 1 次 5xx 应进入 retry_wait");
         assert_eq!(task.server_error_retry_count, 1);
@@ -6271,14 +8569,15 @@ mod tests {
             assets: vec![make_test_image_asset()],
             ..AppData::default()
         };
-        // 模拟已重试 1 次
+        // 模拟已经历 1 轮并发等待
         data.tasks[0].server_error_retry_count = 1;
         data.tasks[0].status = "queued".to_string();
-        let task = submit_task_once_with_runner(
-            &mut data,
-            "t5xx2",
-            |_args| Ok((r#"{"code": 50001, "message": "服务器内部错误"}"#.to_string(), String::new())),
-        )
+        let task = submit_task_once_with_runner(&mut data, "t5xx2", |_args| {
+            Ok((
+                r#"{"code": 50001, "message": "服务器内部错误"}"#.to_string(),
+                String::new(),
+            ))
+        })
         .expect("should not Err");
         assert_eq!(task.status, "retry_wait", "第 2 次 5xx 仍应 retry_wait");
         assert_eq!(task.server_error_retry_count, 2);
@@ -6291,14 +8590,15 @@ mod tests {
             assets: vec![make_test_image_asset()],
             ..AppData::default()
         };
-        // 模拟已重试 2 次（达上限）
+        // 模拟已经历 2 轮并发等待
         data.tasks[0].server_error_retry_count = 2;
         data.tasks[0].status = "queued".to_string();
-        let task = submit_task_once_with_runner(
-            &mut data,
-            "t5xx3",
-            |_args| Ok((r#"{"code": 50001, "message": "服务器内部错误"}"#.to_string(), String::new())),
-        )
+        let task = submit_task_once_with_runner(&mut data, "t5xx3", |_args| {
+            Ok((
+                r#"{"code": 50001, "message": "服务器内部错误"}"#.to_string(),
+                String::new(),
+            ))
+        })
         .expect("should not Err");
         assert_eq!(task.status, "failed", "第 3 次 5xx 超过上限应标 failed");
         assert_eq!(task.server_error_retry_count, 3);
@@ -6313,14 +8613,55 @@ mod tests {
         };
         data.tasks[0].server_error_retry_count = 1;
         data.tasks[0].status = "queued".to_string();
-        let task = submit_task_once_with_runner(
-            &mut data,
-            "t5xx-ok",
-            |_args| Ok((r#"{"submit_id": "ok-id-123"}"#.to_string(), String::new())),
-        )
+        let task = submit_task_once_with_runner(&mut data, "t5xx-ok", |_args| {
+            Ok((r#"{"submit_id": "ok-id-123"}"#.to_string(), String::new()))
+        })
         .expect("should not Err");
         assert_eq!(task.server_error_retry_count, 0, "成功提交后计数应重置为 0");
         assert_eq!(task.submit_id, "ok-id-123");
+    }
+
+    #[test]
+    fn submit_with_submit_id_and_exceed_concurrency_limit_enters_retry_wait() {
+        let mut data = AppData {
+            tasks: vec![make_queued_task_for_submit("t-concurrency-submit-id")],
+            assets: vec![make_test_image_asset()],
+            ..AppData::default()
+        };
+        let task = submit_task_once_with_runner(
+            &mut data,
+            "t-concurrency-submit-id",
+            |_args| Ok((
+                r#"{"submit_id":"fake-sub-123","gen_status":"fail","fail_reason":"api error: ret=1310, message=ExceedConcurrencyLimit"}"#.to_string(),
+                String::new(),
+            )),
+        )
+        .expect("should not Err");
+        assert_eq!(
+            task.status, "retry_wait",
+            "ExceedConcurrencyLimit should wait for retry even if submit_id is present"
+        );
+        assert_eq!(
+            task.submit_id, "",
+            "failed submit_id should not become current query target"
+        );
+        assert_eq!(
+            task.concurrency_retry_count, 1,
+            "submit-stage ExceedConcurrencyLimit should schedule retry"
+        );
+        assert!(task.next_run_at.is_some());
+        assert!(
+            task.last_error.contains("ExceedConcurrencyLimit"),
+            "failure reason should be preserved: {}",
+            task.last_error
+        );
+        assert_eq!(task.execution_records.len(), 1);
+        assert_eq!(task.execution_records[0].submit_id, "fake-sub-123");
+        assert_eq!(task.execution_records[0].status, "retry_wait");
+        assert!(
+            task.execution_records[0].query_records.is_empty(),
+            "should not enter query loop"
+        );
     }
 
     // ── parse_submit_output: error_code suppresses submit_id ──────────────
@@ -6331,7 +8672,10 @@ mod tests {
         let out = parse_submit_output(
             r#"{"code": 50001, "message": "服务器内部错误", "data": {"submit_id": "fake-id-abc"}}"#,
         );
-        assert_eq!(out.submit_id, None, "submit_id in error response must be suppressed");
+        assert_eq!(
+            out.submit_id, None,
+            "submit_id in error response must be suppressed"
+        );
         assert_eq!(out.error_code, Some(50001));
         assert!(out.fail_reason.is_some());
     }
@@ -6348,6 +8692,24 @@ mod tests {
         let out = parse_submit_output(r#"{"code": 200, "submit_id": "ok-sub-456"}"#);
         assert_eq!(out.submit_id.as_deref(), Some("ok-sub-456"));
         assert_eq!(out.error_code, None);
+    }
+
+    #[test]
+    fn asset_from_path_normalizes_spaces_in_name_for_mentions() {
+        let unique = format!("dreamina-space-name-{}", Uuid::new_v4().simple());
+        let temp_root = std::env::temp_dir().join(unique);
+        let source_dir = temp_root.join("source files");
+        let assets_dir = temp_root.join("role media");
+        fs::create_dir_all(&source_dir).expect("create source dir");
+        let source_path = source_dir.join("hero main shot.png");
+        fs::write(&source_path, b"fake-png").expect("write source image");
+
+        let asset =
+            Asset::from_path(&source_path, &assets_dir, None).expect("asset import should succeed");
+
+        assert_eq!(asset.name, "hero_main_shot");
+
+        let _ = fs::remove_dir_all(&temp_root);
     }
 
     // ── error_code extraction and failed classification ────────────────────
@@ -6394,19 +8756,18 @@ mod tests {
             ..AppData::default()
         };
         // Dreamina returns error code 40004 (task not found)
-        let result = query_task_submit_id_once_with_runner(
-            &mut data,
-            "task-err",
-            "sub-err",
-            |_args| {
+        let result =
+            query_task_submit_id_once_with_runner(&mut data, "task-err", "sub-err", |_args| {
                 Ok((
                     r#"{"code": 40004, "message": "任务不存在或已过期"}"#.to_string(),
                     String::new(),
                 ))
-            },
-        )
-        .expect("query should complete without Rust error");
-        assert_eq!(result.status, "failed", "error code >= 400 should mark task as failed");
+            })
+            .expect("query should complete without Rust error");
+        assert_eq!(
+            result.status, "failed",
+            "error code >= 400 should mark task as failed"
+        );
         assert!(
             result.last_error.contains("任务不存在"),
             "error message should be stored in last_error: {}",
@@ -6474,6 +8835,7 @@ mod tests {
             auto_query_stopped: false,
             consecutive_no_result_queries: 0,
             server_error_retry_count: 0,
+            planned_submit_count: 1,
         }
     }
 
@@ -6540,6 +8902,7 @@ mod tests {
                 auto_query_stopped: false,
                 consecutive_no_result_queries: 0,
                 server_error_retry_count: 0,
+                planned_submit_count: 1,
             }],
             ..AppData::default()
         };

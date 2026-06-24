@@ -8,6 +8,7 @@ import {
   formatPaginationLabel,
   deriveTaskFlowSteps,
   deriveTaskProgress,
+  deriveTaskDispatchInfo,
   getModelOptions,
   deriveQueueStats,
   canDeleteTask,
@@ -376,12 +377,98 @@ test('deriveTaskProgress: failed = 0%', () => {
 });
 
 test('deriveTaskProgress: queued is low percent', () => {
-  assert.ok(deriveTaskProgress(makeTask({ status: 'queued' })).percent < 20);
+  const progress = deriveTaskProgress(makeTask({ status: 'queued' }));
+  assert.ok(progress.percent < 20);
+  assert.equal(progress.stage, '等待调度');
+});
+
+test('deriveTaskProgress: scheduled says it is waiting for schedule time', () => {
+  const progress = deriveTaskProgress(makeTask({ status: 'scheduled' }));
+  assert.equal(progress.stage, '等待预定时间');
 });
 
 test('deriveTaskProgress: retry_wait stage includes attempt count', () => {
   const { stage } = deriveTaskProgress(makeTask({ status: 'retry_wait', attempt_count: 3 }));
   assert.ok(stage.includes('3'));
+});
+
+// ── deriveTaskDispatchInfo ───────────────────────────────────────────────────
+
+test('deriveTaskDispatchInfo: queued exposes attempts and next scheduler check', () => {
+  const info = deriveTaskDispatchInfo(makeTask({ status: 'queued', attempt_count: 2 }), {
+    nowMs: Date.parse('2026-01-01T00:00:00Z'),
+    schedulerTickSeconds: 30,
+  });
+
+  assert.equal(info.attemptCount, 2);
+  assert.equal(info.nextLabel, '下次检查');
+  assert.equal(info.nextText, '30 秒内检查');
+  assert.equal(info.reason, '等待调度器空闲');
+});
+
+test('deriveTaskDispatchInfo: scheduled exposes start time', () => {
+  const scheduledAt = '2026-01-01T01:00:00Z';
+  const info = deriveTaskDispatchInfo(makeTask({ status: 'scheduled', scheduled_at: scheduledAt, next_run_at: scheduledAt }), {
+    nowMs: Date.parse('2026-01-01T00:00:00Z'),
+  });
+
+  assert.equal(info.nextLabel, '开始时间');
+  assert.equal(info.nextAt, scheduledAt);
+  assert.equal(info.reason, '等待预定开始时间');
+});
+
+test('deriveTaskDispatchInfo: retry_wait exposes retry time and counts', () => {
+  const nextRunAt = '2026-01-01T00:10:00Z';
+  const info = deriveTaskDispatchInfo(makeTask({
+    status: 'retry_wait',
+    attempt_count: 3,
+    concurrency_retry_count: 1,
+    next_run_at: nextRunAt,
+  }), {
+    nowMs: Date.parse('2026-01-01T00:00:00Z'),
+  });
+
+  assert.equal(info.nextLabel, '下次重试');
+  assert.equal(info.nextAt, nextRunAt);
+  assert.equal(info.concurrencyRetryCount, 1);
+  assert.equal(info.reason, '等待重试冷却结束');
+  assert.equal(info.concurrencyRetryText, '已等待 1 轮，持续重试');
+});
+
+test('deriveTaskDispatchInfo: due retry can show global concurrency cooldown', () => {
+  const taskNextRunAt = '2026-01-01T00:10:00Z';
+  const globalCooldownUntil = '2026-01-01T00:30:00Z';
+  const info = deriveTaskDispatchInfo(makeTask({
+    status: 'retry_wait',
+    attempt_count: 1,
+    concurrency_retry_count: 1,
+    next_run_at: taskNextRunAt,
+  }), {
+    nowMs: Date.parse('2026-01-01T00:24:00Z'),
+    concurrencyCooldownUntil: globalCooldownUntil,
+  });
+
+  assert.equal(info.nextLabel, '并发冷却');
+  assert.equal(info.nextAt, globalCooldownUntil);
+  assert.equal(info.reason, '其他任务仍在并发冷却，冷却结束后继续调度');
+  assert.equal(info.blockedByConcurrencyCooldown, true);
+});
+
+test('deriveTaskDispatchInfo: due retry does not show stale retry time', () => {
+  const taskNextRunAt = '2026-01-01T00:10:00Z';
+  const info = deriveTaskDispatchInfo(makeTask({
+    status: 'retry_wait',
+    attempt_count: 1,
+    concurrency_retry_count: 1,
+    next_run_at: taskNextRunAt,
+  }), {
+    nowMs: Date.parse('2026-01-01T00:24:00Z'),
+  });
+
+  assert.equal(info.nextLabel, '等待调度');
+  assert.equal(info.nextAt, '');
+  assert.equal(info.nextText, '冷却已结束');
+  assert.equal(info.reason, '重试冷却已结束，等待调度');
 });
 
 // ── deriveQueueStats ──────────────────────────────────────────────────────────

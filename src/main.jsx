@@ -17,7 +17,7 @@ import {
   normalizeImageModelSettingsForm,
   patchImageModelConfig,
   mergeSettingsFormOnStateRefresh,
-  shouldRefreshStateAfterSchedulerTick,
+  findLatestSuccessfulResultPath,
 } from './app-logic.js';
 import { buildMentionItems } from './mention-utils.js';
 import {
@@ -81,7 +81,6 @@ import {
   FolderOpen,
   Gauge,
   Grid,
-  Home,
   Image,
   ImagePlus,
   LayoutList,
@@ -115,6 +114,7 @@ import {
   formatPaginationLabel,
   deriveTaskFlowSteps,
   deriveTaskProgress,
+  deriveTaskDispatchInfo,
   getModelOptions,
   deriveQueueStats,
   canDeleteTask,
@@ -145,6 +145,7 @@ import { SearchBox } from './components/ui/SearchBox.jsx';
 import { FilterSelect } from './components/ui/FilterSelect.jsx';
 import { InlineCopyButton } from './components/ui/InlineCopyButton.jsx';
 import { Pager } from './components/ui/Pager.jsx';
+import { resolveMediaSrc } from './media-src.js';
 import {
   normalizeLogEntry,
   deriveLogStats,
@@ -187,7 +188,6 @@ const defaultImageModelConfig = {
   model: 'gpt-image-1',
 };
 const views = [
-  { id: 'dashboard', label: '仪表盘', icon: Home },
   { id: 'roles', label: '角色库', icon: User },
   { id: 'queue', label: '任务中心', icon: ListChecks },
   { id: 'imagegen', label: '生图', icon: Image },
@@ -218,8 +218,10 @@ const emptyState = {
   logs: [],
 };
 
+const tauriRuntimeAvailable = typeof window !== 'undefined' && Boolean(window.__TAURI_INTERNALS__?.metadata?.currentWindow);
+
 function App() {
-  const [activeView, setActiveView] = useState('dashboard');
+  const [activeView, setActiveView] = useState('queue');
   const [state, setState] = useState(emptyState);
   const [cli, setCli] = useState({ available: false, path: '', message: '等待检测', version: '', commit: '', build_time: '', version_raw: '', installed_release_version: '', installed_release_date: '', installed_release_notes: '', installed_release_path: '' });
   const [cliUpdate, setCliUpdate] = useState(null);
@@ -250,6 +252,8 @@ function App() {
   const [pendingExecutionOps, setPendingExecutionOps] = useState({});
   const tickLockRef = useRef(false);
   const refreshStateRef = useRef(null);
+  // 记录上次拉取的状态签名，空闲时签名不变即跳过整份 get_app_state，省去大文件读解析。
+  const lastStateSignatureRef = useRef('');
   const [lastTickAt, setLastTickAt] = useState(null);
   const [selectedTaskId, setSelectedTaskId] = useState('');
   const [selectedRoleId, setSelectedRoleId] = useState('');
@@ -260,7 +264,10 @@ function App() {
   const [dragActive, setDragActive] = useState(false);
   const [confirmModal, setConfirmModal] = useState(null);
   const [appVersion, setAppVersion] = useState('');
-  useEffect(() => { getVersion().then(setAppVersion).catch(() => {}); }, []);
+  useEffect(() => {
+    if (!tauriRuntimeAvailable) return;
+    getVersion().then(setAppVersion).catch(() => {});
+  }, []);
   const [creditInfo, setCreditInfo] = useState({ available: false, total: '', used: '', remaining: '', raw_text: '' });
   const [creditModalOpen, setCreditModalOpen] = useState(false);
   const [settingsForm, setSettingsForm] = useState(emptyState.settings);
@@ -288,6 +295,16 @@ function App() {
     try {
       const next = await invoke('get_app_state');
       setState(next);
+      // 记录本次状态对应的签名，供空闲轮询比对（失败不影响刷新本身）。
+      try {
+        lastStateSignatureRef.current = await invoke('get_state_signature');
+      } catch {
+        // 忽略：拿不到签名时下次轮询会照常全量刷新
+      }
+      const latestTick = [...(next.logs || [])]
+        .reverse()
+        .find((log) => log.category === 'scheduler_tick' && (log.eventType || log.event_type) === 'tick');
+      if (latestTick?.timestamp) setLastTickAt(new Date(latestTick.timestamp));
       setSettingsForm((current) => mergeSettingsFormOnStateRefresh({
         activeView,
         settingsDirty: options.forceSettingsSync ? false : settingsDirtyRef.current,
@@ -350,6 +367,7 @@ function App() {
   }, [activeView, selectedRoleId, roleEditor]);
 
   useEffect(() => {
+    if (!tauriRuntimeAvailable) return undefined;
     let disposed = false;
     let unlisten = null;
     getCurrentWebview().onDragDropEvent((event) => {
@@ -378,57 +396,57 @@ function App() {
     };
   }, []);
 
-  // T003：应用启动后立即执行调度检查，随后每 30 秒轮询一次，无用户开关
+  // 后端 Rust 线程负责调度；前端只刷新状态用于展示最新 tick 和任务状态。
+  // 空闲优化：先取廉价签名（仅 stat 文件，不读整份状态），签名未变则跳过 get_app_state，
+  // 避免空闲时每 30s 读+解析整份大状态文件。
   useEffect(() => {
-    let cancelled = false;
-    async function tick() {
-      if (tickLockRef.current) return;
-      tickLockRef.current = true;
+    const timer = window.setInterval(async () => {
       try {
-        await invoke('process_queue_command');
-        if (!cancelled) {
-          setLastTickAt(new Date());
-          if (shouldRefreshStateAfterSchedulerTick(dropContextRef.current)) {
-            await refreshStateRef.current?.();
-          }
-        }
-      } catch (_e) {
-        // 内部调度静默处理，不干扰用户操作
-      } finally {
-        tickLockRef.current = false;
+        const sig = await invoke('get_state_signature');
+        if (sig === lastStateSignatureRef.current) return; // 无变化，跳过整份刷新
+      } catch {
+        // 取签名失败则退化为照常全量刷新
       }
-    }
-    tick();
-    const timer = window.setInterval(tick, 30000);
+      refreshStateRef.current?.();
+    }, 30000);
     return () => {
-      cancelled = true;
       window.clearInterval(timer);
     };
   }, []);
 
-  // T004：窗口重新获得焦点或系统休眠恢复后立即触发一次补偿检查
+  // 记录前端生命周期，辅助判断是进程退出、WebView 暂停，还是后端调度仍在运行。
   useEffect(() => {
-    async function onWake() {
-      if (tickLockRef.current) return;
-      tickLockRef.current = true;
-      try {
-        await invoke('process_queue_command');
-        setLastTickAt(new Date());
-        if (shouldRefreshStateAfterSchedulerTick(dropContextRef.current)) {
-          await refreshStateRef.current?.();
-        }
-      } catch (_e) {
-        // 静默处理
-      } finally {
-        tickLockRef.current = false;
+    if (!tauriRuntimeAvailable) return undefined;
+    const logLifecycle = (eventType, message) => {
+      invoke('record_lifecycle_event_command', {
+        eventType,
+        message,
+        detail: `visibility=${document.visibilityState}`,
+      }).catch(() => {});
+    };
+    logLifecycle('frontend_ready', '前端页面就绪');
+    const handleFocus = () => {
+      logLifecycle('frontend_focus', '窗口聚焦');
+      refreshStateRef.current?.();
+    };
+    const handleBlur = () => logLifecycle('frontend_blur', '窗口失焦');
+    const handleVisibility = () => {
+      if (document.hidden) {
+        logLifecycle('frontend_hidden', '页面隐藏');
+      } else {
+        logLifecycle('frontend_visible', '页面恢复可见');
+        refreshStateRef.current?.();
       }
-    }
-    const handleFocus = () => onWake();
-    const handleVisibility = () => { if (!document.hidden) onWake(); };
+    };
+    const handlePageHide = () => logLifecycle('frontend_pagehide', '页面卸载或进入缓存');
     window.addEventListener('focus', handleFocus);
+    window.addEventListener('blur', handleBlur);
+    window.addEventListener('pagehide', handlePageHide);
     document.addEventListener('visibilitychange', handleVisibility);
     return () => {
       window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('blur', handleBlur);
+      window.removeEventListener('pagehide', handlePageHide);
       document.removeEventListener('visibilitychange', handleVisibility);
     };
   }, []);
@@ -440,6 +458,10 @@ function App() {
   );
   const selectedRoleMedia = useMemo(() => getRoleMedia(selectedRole, assetById), [assetById, selectedRole]);
   const queueStats = useMemo(() => buildQueueStats(state.tasks), [state.tasks]);
+  const latestSuccessfulResultPath = useMemo(
+    () => findLatestSuccessfulResultPath(state.tasks),
+    [state.tasks],
+  );
 
   useEffect(() => {
     if (activeView === 'roles' && !roleEditor && !selectedRoleId && state.roles.length) {
@@ -926,7 +948,7 @@ function App() {
       const imageSettings = normalizeImageModelSettingsForm(settingsForm);
       const savedSettings = await invoke('update_settings_command', {
         input: {
-          concurrency_limit_policy: settingsForm.concurrency_limit_policy,
+          concurrency_limit_policy: 'SilentRetry',
           concurrency_retry_delay_seconds: Number(settingsForm.concurrency_retry_delay_seconds) || 300,
           concurrency_retry_max_attempts: Number(settingsForm.concurrency_retry_max_attempts) || 8,
           auto_query_enabled: settingsForm.auto_query_enabled ?? true,
@@ -957,7 +979,18 @@ function App() {
     }
   }
 
+  async function openLatestOutputFolder() {
+    if (!latestSuccessfulResultPath) return;
+    try {
+      await invoke('open_result_dir_command', { path: latestSuccessfulResultPath });
+      setFeedback('已打开最近产出目录');
+    } catch (error) {
+      setFeedback(String(error));
+    }
+  }
+
   function startWindowDrag(event) {
+    if (!tauriRuntimeAvailable) return;
     if (event.button !== 0) return;
     if (event.target.closest('button, input, select, textarea, a')) return;
     getCurrentWindow().startDragging().catch(() => {});
@@ -987,6 +1020,16 @@ function App() {
             );
           })}
         </nav>
+        <button
+          type="button"
+          className="sidebar-output-button"
+          disabled={!latestSuccessfulResultPath}
+          onClick={openLatestOutputFolder}
+          title={latestSuccessfulResultPath ? `打开最近产出目录：${latestSuccessfulResultPath}` : '暂无成功视频'}
+        >
+          <FolderOpen size={17} />
+          <span>产出文件夹</span>
+        </button>
         {appVersion ? <span className="version">v{appVersion}</span> : null}
       </aside>
 
@@ -1029,21 +1072,6 @@ function App() {
           </section>
         ) : null}
 
-        {activeView === 'dashboard' ? (
-          <Dashboard
-            state={state}
-            cli={cli}
-            queueStats={queueStats}
-            submitTask={submitTask}
-            queryTask={queryTask}
-            hostPlatform={hostPlatform}
-            processQueueOnce={processQueueOnce}
-            selectedTaskId={selectedTaskId}
-            setSelectedTaskId={setSelectedTaskId}
-            setActiveView={setActiveView}
-            pendingTaskOps={pendingTaskOps}
-          />
-        ) : null}
         {activeView === 'create' ? (
           <CreateTaskView
             state={state}
@@ -1167,75 +1195,6 @@ function App() {
   );
 }
 
-function Dashboard({ state, cli, hostPlatform, queueStats, submitTask, queryTask, processQueueOnce, selectedTaskId, setSelectedTaskId, setActiveView, pendingTaskOps = {} }) {
-  const selectedTask = state.tasks.find((task) => task.id === selectedTaskId) || state.tasks[0] || null;
-  return (
-    <div className="dashboard-view">
-      <section className="metric-grid">
-        <Metric title="平台" value={hostPlatform?.label || 'Desktop'} />
-        <Metric title="CLI 检测" value={cli.available ? (cli.version || '检测正常') : '待处理'} tone={cli.available ? 'good' : 'warn'} />
-        <Metric title="并发数" value="1" sub="固定并发，顺序执行" />
-        <Metric title="默认模型" value="seedance2.0" />
-        <div className="notice-card">
-          <div>
-            <strong>执行策略（并发上限检测）</strong>
-            <p>检测到并发上限错误时，自动静默重试；任务状态全程可追溯。</p>
-          </div>
-          <ShieldCheck size={34} />
-        </div>
-      </section>
-
-      <section className="dashboard-main">
-        <div className="panel queue-table-panel">
-          <PanelHeading
-            title={`任务中心（并发数：1）`}
-            action={(
-              <div className="button-cluster">
-                <button onClick={processQueueOnce}>运行一次</button>
-                <button onClick={() => setActiveView('create')}>新建任务</button>
-              </div>
-            )}
-          />
-          <table className="queue-table">
-            <thead>
-              <tr>
-                <th>任务名</th>
-                <th>状态</th>
-                <th>模型</th>
-                <th>宽高比</th>
-                <th>submit_id</th>
-                <th>重试</th>
-              </tr>
-            </thead>
-            <tbody>
-              {state.tasks.map((task, index) => (
-                <tr
-                  key={task.id}
-                  className={selectedTask?.id === task.id ? 'selected-row' : ''}
-                  onClick={() => setSelectedTaskId(task.id)}
-                >
-                  <td>{index + 1}. {task.title || '未命名任务'}</td>
-                  <td><StatusBadge status={task.status} task={task} /></td>
-                  <td>{task.params?.model_version || 'seedance2.0'}</td>
-                  <td>{task.params?.ratio || '9:16'}</td>
-                  <td>{task.submit_id || '-'}</td>
-                  <td>{task.concurrency_retry_count || 0}/8</td>
-                </tr>
-              ))}
-              {!state.tasks.length ? (
-                <tr><td colSpan="6" className="empty-cell">暂无任务，先创建一个 multimodal2video 任务。</td></tr>
-              ) : null}
-            </tbody>
-          </table>
-          <footer>共 {state.tasks.length} 条 · 等待 {queueStats.waiting} · 运行 {queueStats.running} · 成功 {queueStats.done}</footer>
-        </div>
-
-        <TaskDetail task={selectedTask} submitTask={submitTask} queryTask={queryTask} pendingTaskOps={pendingTaskOps} />
-      </section>
-    </div>
-  );
-}
-
 function CreateTaskView({ state, assetById, taskForm, setTaskForm, setActiveView, saveTaskDraft, editingTaskId, cli, addTempImage, removeTempImage, previewCommand, generateTaskTitle, savingTaskDraft, savingTaskDraftPhase, pasteClipboardImage, pasteSystemClipboardImage }) {
   const [previewSrc, setPreviewSrc] = useState(null);
   const [previewAlt, setPreviewAlt] = useState('');
@@ -1243,7 +1202,7 @@ function CreateTaskView({ state, assetById, taskForm, setTaskForm, setActiveView
   const [aiModal, setAiModal] = useState({ open: false, label: '', description: '', error: '' });
   const openImagePreview = (path, alt) => {
     if (!path) return;
-    setPreviewSrc(convertFileSrc(path));
+    setPreviewSrc(resolveMediaSrc(path));
     setPreviewAlt(alt || '');
   };
 
@@ -1456,6 +1415,7 @@ function CreateTaskView({ state, assetById, taskForm, setTaskForm, setActiveView
                       </div>
                       <button type="button" className="temp-image-remove" onClick={() => removeTempImage(index)}>×</button>
                       <button type="button" className="temp-image-preview" title="预览" onClick={() => openImagePreview(path, path.split('/').pop())}><ZoomIn size={12} /></button>
+                      <button type="button" className="temp-image-save-role" title="保存为角色" onClick={() => handleSaveAsRole(path)}><User size={12} /></button>
                     </div>
                   ))}
                 </div>
@@ -1588,6 +1548,14 @@ function RolesView({
   const handleNewRole = () => {
     setSelectedRoleId('');
     setRoleEditor(createRoleEditor('create'));
+  };
+
+  const handleSaveAsRole = (imagePath, suggestedName = '') => {
+    setActiveView('roles');
+    const editor = createRoleEditor('create');
+    if (imagePath) editor.form.imagePath = imagePath;
+    if (suggestedName) editor.form.name = suggestedName;
+    setRoleEditor(editor);
   };
 
   const handleEditRole = () => {
@@ -1796,6 +1764,7 @@ const TaskCard = React.memo(function TaskCard({ task, index, selected, selectedF
     return null;
   }, [task, assetById, roles]);
 
+  const dispatchInfo = useMemo(() => deriveTaskDispatchInfo(task), [task]);
   const handleClick = useCallback(() => onSelect(task.id), [onSelect, task.id]);
 
   return (
@@ -1816,7 +1785,7 @@ const TaskCard = React.memo(function TaskCard({ task, index, selected, selectedF
       <span className="qc-task-index">{index}</span>
       <div className="qc-task-thumb">
         {thumbPath ? (
-          <img src={convertFileSrc(thumbPath)} alt="" className="qc-thumb-img" />
+          <img src={resolveMediaSrc(thumbPath)} alt="" className="qc-thumb-img" />
         ) : (
           <div className="qc-thumb-placeholder"><Image size={14} /></div>
         )}
@@ -1824,6 +1793,9 @@ const TaskCard = React.memo(function TaskCard({ task, index, selected, selectedF
       <div className="qc-task-info">
         <span className="qc-task-title">{task.title || '未命名任务'}</span>
         <span className="qc-task-sub">{task.params?.model_version || ''}{task.params?.ratio ? ` · ${task.params.ratio}` : ''}</span>
+        {['queued', 'scheduled', 'retry_wait'].includes(task.status) ? (
+          <span className="qc-task-dispatch-sub">{dispatchInfo.compactText}</span>
+        ) : null}
       </div>
       <div className="qc-task-right">
         <StatusBadge status={task.status} />
@@ -1857,6 +1829,17 @@ function RingProgress({ percent, status }) {
       </text>
     </svg>
   );
+}
+
+function isConcurrencyLimitMessage(message = '') {
+  const original = String(message || '');
+  const text = original.toLowerCase();
+  return text.includes('exceedconcurrencylimit')
+    || text.includes('concurrencylimit')
+    || text.includes('ret=1310')
+    || text.includes('ret = 1310')
+    || original.includes('并发上限')
+    || original.includes('并发限制');
 }
 
 // ── QueueView ────────────────────────────────────────────────────────────────
@@ -1923,6 +1906,9 @@ function QueueView({
     () => deriveCurrentExecutionRecord(selectedTask, selectedExecutionId),
     [selectedTask, selectedExecutionId]
   );
+  const plannedCandidateCount = Math.max(1, Number(selectedTask?.planned_submit_count || 1));
+  const successfulCandidateCount = (selectedTask?.execution_records || [])
+    .filter((record) => record.status === 'succeeded').length;
   const executionView = useMemo(() => {
     if (!selectedTask || !currentExecution) return selectedTask;
     const isCurrentTaskSubmit = currentExecution.submit_id && currentExecution.submit_id === selectedTask.submit_id;
@@ -1946,6 +1932,20 @@ function QueueView({
   }, [selectedTask, currentExecution]);
   const flowSteps = useMemo(() => deriveTaskFlowSteps(executionView), [executionView]);
   const progress = useMemo(() => deriveTaskProgress(executionView), [executionView]);
+  const concurrencyCooldownUntil = useMemo(() => {
+    const now = Date.now();
+    return tasks
+      .filter((item) => item.status === 'retry_wait'
+        && isConcurrencyLimitMessage(item.last_error)
+        && item.next_run_at
+        && new Date(item.next_run_at).getTime() > now)
+      .map((item) => item.next_run_at)
+      .sort()[0] || '';
+  }, [tasks]);
+  const dispatchInfo = useMemo(
+    () => deriveTaskDispatchInfo(selectedTask, { concurrencyCooldownUntil }),
+    [selectedTask, concurrencyCooldownUntil]
+  );
   const allAttempts = useMemo(
     () => deriveCurrentQueryRecords(selectedTask, selectedExecutionId).slice().reverse(),
     [selectedTask, selectedExecutionId]
@@ -2051,18 +2051,47 @@ function QueueView({
     }
     setScheduleModal({ mode: 'batch', taskIds, title: `批量排布 ${taskIds.length} 个任务` });
   };
-  const applySchedulePlan = async ({ scheduledAt, intervalMinutes }) => {
+  const openQueueMode = () => {
+    const taskIds = selectedBatchTasks.filter(canScheduleTask).map((task) => task.id);
+    if (!taskIds.length) {
+      setFeedback('请先选择可排队的任务');
+      return;
+    }
+    setScheduleModal({ mode: 'queue', taskIds, title: `排队模式 ${taskIds.length} 个任务` });
+  };
+  const applySchedulePlan = async ({ scheduledAt, intervalMinutes, plannedSubmitCount }) => {
     if (!scheduleModal?.taskIds?.length) return;
     try {
+      const submitCount = Math.max(1, Math.min(10, Number(plannedSubmitCount || 1)));
       if (scheduleModal.mode === 'batch') {
         const startAt = scheduledAt || new Date().toISOString();
         const plan = buildBatchSchedulePlan(scheduleModal.taskIds, { startAt, intervalMinutes });
         for (const item of plan) {
+          await invoke('set_task_planned_submit_count_command', {
+            taskId: item.taskId,
+            plannedSubmitCount: submitCount,
+          });
           await rescheduleTask(item.taskId, item.scheduledAt);
         }
         setFeedback(`已排布：${formatSchedulePlanSummary(plan)}`);
         setSelectedBatchIds([]);
+      } else if (scheduleModal.mode === 'queue') {
+        for (const taskId of scheduleModal.taskIds) {
+          await invoke('set_task_planned_submit_count_command', {
+            taskId,
+            plannedSubmitCount: submitCount,
+          });
+          await rescheduleTask(taskId, scheduledAt || '');
+        }
+        setFeedback(scheduledAt
+          ? `已设置排队：${scheduleModal.taskIds.length} 个任务 · 起始 ${formatDate(scheduledAt)}`
+          : `已设为立即排队：${scheduleModal.taskIds.length} 个任务`);
+        setSelectedBatchIds([]);
       } else if (scheduleModal.mode === 'prepare') {
+        await invoke('set_task_planned_submit_count_command', {
+          taskId: scheduleModal.taskIds[0],
+          plannedSubmitCount: submitCount,
+        });
         const operation = resolvePrepareGenerateOperation({ scheduledAt });
         if (operation.type === 'submit') {
           await submitTask(scheduleModal.taskIds[0]);
@@ -2072,6 +2101,10 @@ function QueueView({
           setFeedback('已设置定时生成');
         }
       } else {
+        await invoke('set_task_planned_submit_count_command', {
+          taskId: scheduleModal.taskIds[0],
+          plannedSubmitCount: submitCount,
+        });
         await rescheduleTask(scheduleModal.taskIds[0], scheduledAt);
         setFeedback(scheduledAt ? '任务已重新排期' : '任务已设为立即提交');
       }
@@ -2160,6 +2193,9 @@ function QueueView({
         </button>
         <button type="button" className="qc-btn" onClick={openBatchSchedule} disabled={!selectedBatchTasks.length}>
           <CalendarClock size={13} /> 批量排布{selectedBatchTasks.length ? `（${selectedBatchTasks.length}）` : ''}
+        </button>
+        <button type="button" className="qc-btn" onClick={openQueueMode} disabled={!selectedBatchTasks.length}>
+          <ListChecks size={13} /> 排队模式{selectedBatchTasks.length ? `（${selectedBatchTasks.length}）` : ''}
         </button>
         <button type="button" className="qc-btn" onClick={() => setActiveView('settings')}><Settings size={13} /> 执行策略</button>
         <div className="qc-toolbar-end">
@@ -2260,6 +2296,8 @@ function QueueView({
                   <span className="qc-meta-value">{selectedTask.params?.model_version || '-'}</span>
                   <span className="qc-meta-label">宽高比</span>
                   <span className="qc-meta-value">{selectedTask.params?.ratio || '-'}</span>
+                  <span className="qc-meta-label">成功候选</span>
+                  <span className="qc-meta-value">{successfulCandidateCount} / {plannedCandidateCount}</span>
                   <span className="qc-meta-label">计划时间</span>
                   <span className="qc-meta-value">
                     {selectedTask.status === 'scheduled' && selectedTask.scheduled_at
@@ -2270,6 +2308,18 @@ function QueueView({
                         </span>
                       : '未定时'}
                   </span>
+                  {['queued', 'scheduled', 'retry_wait'].includes(selectedTask.status) ? (
+                    <>
+                      <span className="qc-meta-label">提交尝试</span>
+                      <span className="qc-meta-value">{dispatchInfo.attemptCount} 次 / 目标 {dispatchInfo.plannedSubmitCount} 个候选</span>
+                      <span className="qc-meta-label">{dispatchInfo.nextLabel}</span>
+                      <span className="qc-meta-value">
+                        {dispatchInfo.nextAt ? formatDate(dispatchInfo.nextAt) : dispatchInfo.nextText}
+                      </span>
+                      <span className="qc-meta-label">等待原因</span>
+                      <span className="qc-meta-value">{dispatchInfo.reason || '-'}</span>
+                    </>
+                  ) : null}
                   <span className="qc-meta-label">更新时间</span>
                   <span className="qc-meta-value">{formatDate(selectedTask.updated_at) || '-'}</span>
                   {currentExecution?.submit_id ? (
@@ -2334,7 +2384,7 @@ function QueueView({
                         onClick={() => setResourcePreview({ type, displayType, asset })}
                       >
                         {type === 'image' && asset.stored_path ? (
-                          <img src={convertFileSrc(asset.stored_path)} alt="" className="qc-resource-thumb" />
+                          <img src={resolveMediaSrc(asset.stored_path)} alt="" className="qc-resource-thumb" />
                         ) : (
                           <div className="qc-resource-icon">{type === 'audio' ? <FileAudio size={16} /> : <Image size={16} />}</div>
                         )}
@@ -2553,10 +2603,22 @@ function QueueView({
                       <div className="qc-progress-bar-fill" style={{ width: `${progress.percent}%` }} />
                     </div>
                     {selectedTask.status !== 'succeeded' && (
-                    <div className="qc-monitor-meta-row">
-                      <span>重试</span>
-                      <span>{selectedTask.attempt_count || 0} / {settings?.concurrency_retry_max_attempts || 8}</span>
-                    </div>
+                      <>
+                        <div className="qc-monitor-meta-row">
+                          <span>提交尝试</span>
+                          <span>{dispatchInfo.attemptCount} 次</span>
+                        </div>
+                        <div className="qc-monitor-meta-row">
+                          <span>并发等待</span>
+                          <span>{dispatchInfo.concurrencyRetryText}</span>
+                        </div>
+                        {['queued', 'scheduled', 'retry_wait'].includes(selectedTask.status) ? (
+                          <div className="qc-monitor-meta-row">
+                            <span>{dispatchInfo.nextLabel}</span>
+                            <span>{dispatchInfo.nextAt ? formatDatePart(dispatchInfo.nextAt, 'time') : dispatchInfo.nextText}</span>
+                          </div>
+                        ) : null}
+                      </>
                     )}
                     {executionView?.status === 'querying' && executionView.queue_info ? (
                     <div className="qc-queue-progress">
@@ -2613,10 +2675,10 @@ function QueueView({
                   <p className="qc-error-text">{executionView.last_error}</p>
                 ) : null}
                 <div className="qc-retry-grid">
-                  <span>重试条件</span><span>并发上限错误</span>
-                  <span>重试方式</span><span>静默重试</span>
-                  <span>最大重试</span><span>{settings?.concurrency_retry_max_attempts || 8} 次</span>
-                  <span>最终策略</span><span>标记失败</span>
+                  <span>等待条件</span><span>远端并发已满</span>
+                  <span>处理方式</span><span>持续静默等待并重试</span>
+                  <span>停止条件</span><span>提交成功或手动停止任务</span>
+                  <span>临时上传错误</span><span>最多自动重试 3 次</span>
                 </div>
               </section>
 
@@ -2634,7 +2696,11 @@ function QueueView({
                 ) : executionView?.status === 'submitting' ? (
                   <span className="qc-health running"><Loader2 size={12} className="spin" /> 提交中</span>
                 ) : executionView?.status === 'retry_wait' ? (
-                  <span className="qc-health retry"><RefreshCcw size={12} /> 等待重试</span>
+                  <span className="qc-health retry"><RefreshCcw size={12} /> {dispatchInfo.reason || '等待重试'}</span>
+                ) : executionView?.status === 'queued' ? (
+                  <span className="qc-health idle"><Clock3 size={12} /> {dispatchInfo.reason || '等待调度器空闲'}</span>
+                ) : executionView?.status === 'scheduled' ? (
+                  <span className="qc-health idle"><Clock3 size={12} /> {dispatchInfo.reason || '等待预定开始时间'}</span>
                 ) : (
                   <span className="qc-health idle"><Clock3 size={12} /> 等待调度</span>
                 )}
@@ -2650,7 +2716,7 @@ function QueueView({
       </div>
       {resourcePreview?.type === 'image' && resourcePreview.asset?.stored_path ? (
         <ImageModal
-          src={convertFileSrc(resourcePreview.asset.stored_path)}
+          src={resolveMediaSrc(resourcePreview.asset.stored_path)}
           alt={resourcePreview.asset.name || ''}
           onClose={() => setResourcePreview(null)}
         />
@@ -2966,24 +3032,27 @@ function LogsView({ logs, tasks, settings, clearLogs, setActiveView, setSelected
 
 function SchedulePickerModal({ title, mode = 'single', taskCount = 1, onClose, onApply }) {
   const isBatch = mode === 'batch';
+  const isQueue = mode === 'queue';
   const isPrepare = mode === 'prepare';
+  const isMultiTask = isBatch || isQueue;
   const today = formatDateInputValue(new Date());
   const tomorrowDate = new Date();
   tomorrowDate.setDate(tomorrowDate.getDate() + 1);
-  const [scheduleMode, setScheduleMode] = useState(isBatch ? 'relative' : 'immediate');
+  const [scheduleMode, setScheduleMode] = useState(isMultiTask ? 'relative' : 'immediate');
   const [relativeHours, setRelativeHours] = useState(2);
   const [day, setDay] = useState('tomorrow');
   const [quietTime, setQuietTime] = useState('02:00');
   const [customDate, setCustomDate] = useState(formatDateInputValue(tomorrowDate));
   const [customTime, setCustomTime] = useState('02:00');
-  const [intervalMinutes, setIntervalMinutes] = useState(30);
+  const [intervalMinutes, setIntervalMinutes] = useState(0);
+  const [plannedSubmitCount, setPlannedSubmitCount] = useState(1);
   const [error, setError] = useState('');
 
   const scheduleOptions = [
     {
       key: 'immediate',
-      label: isPrepare ? '立即生成' : '立即提交',
-      hint: isBatch ? '第一条现在开始，其余按间隔排布' : isPrepare ? '现在提交到即梦生成' : '移除计划时间，回到待提交',
+      label: isQueue ? '马上排队' : isBatch ? '排队模式' : isPrepare ? '立即生成' : '立即提交',
+      hint: isQueue ? '清掉预定时间，立刻进入连续队列' : isBatch ? '全部进入同一开始时间，按队列连续执行' : isPrepare ? '现在提交到即梦生成' : '移除计划时间，回到待提交',
     },
     { key: 'relative', label: '几小时后', hint: '适合临时错峰提交' },
     { key: 'dayTime', label: '今天 / 明天凌晨', hint: '常用夜间批量提交' },
@@ -3000,7 +3069,7 @@ function SchedulePickerModal({ title, mode = 'single', taskCount = 1, onClose, o
     if (scheduleMode === 'custom') {
       return resolveScheduleAt({ mode: 'custom', customValue: `${customDate}T${customTime}` });
     }
-    return isBatch ? new Date(Date.now() + 1000).toISOString() : null;
+    return isBatch ? new Date(Date.now() + 10000).toISOString() : null;
   };
 
   const [applying, setApplying] = useState(false);
@@ -3019,7 +3088,7 @@ function SchedulePickerModal({ title, mode = 'single', taskCount = 1, onClose, o
     }
     setApplying(true);
     try {
-      await onApply?.({ scheduledAt, intervalMinutes });
+      await onApply?.({ scheduledAt, intervalMinutes, plannedSubmitCount });
     } finally {
       setApplying(false);
     }
@@ -3030,7 +3099,7 @@ function SchedulePickerModal({ title, mode = 'single', taskCount = 1, onClose, o
       <section className="schedule-modal" role="dialog" aria-modal="true" onMouseDown={(e) => e.stopPropagation()}>
         <header className="schedule-modal-head">
           <div>
-            <span>{isBatch ? `批量排布 ${taskCount} 个任务` : isPrepare ? '准备生成' : '单个任务排期'}</span>
+            <span>{isQueue ? `排队模式 ${taskCount} 个任务` : isBatch ? `批量排布 ${taskCount} 个任务` : isPrepare ? '准备生成' : '单个任务排期'}</span>
             <h3>{title || '安排提交时间'}</h3>
           </div>
           <button type="button" className="icon-ghost" onClick={onClose}><X size={16} /></button>
@@ -3086,8 +3155,9 @@ function SchedulePickerModal({ title, mode = 'single', taskCount = 1, onClose, o
           ) : null}
           {isBatch ? (
             <label>
-              <span>每隔</span>
+              <span>排布间隔</span>
               <select value={intervalMinutes} onChange={(e) => setIntervalMinutes(Number(e.target.value))}>
+                <option value={0}>连续排队</option>
                 <option value={15}>15 分钟</option>
                 <option value={30}>30 分钟</option>
                 <option value={45}>45 分钟</option>
@@ -3096,6 +3166,16 @@ function SchedulePickerModal({ title, mode = 'single', taskCount = 1, onClose, o
               </select>
             </label>
           ) : null}
+          <label>
+            <span>成功候选</span>
+            <input
+              type="number"
+              min="1"
+              max="10"
+              value={plannedSubmitCount}
+              onChange={(e) => setPlannedSubmitCount(e.target.value)}
+            />
+          </label>
         </div>
 
         {error ? <p className="schedule-error">{error}</p> : null}
@@ -3103,7 +3183,7 @@ function SchedulePickerModal({ title, mode = 'single', taskCount = 1, onClose, o
         <footer className="schedule-modal-actions">
           <button type="button" className="outline-button" onClick={onClose}>取消</button>
           <button type="button" className="gradient-button" onClick={handleApply} disabled={applying}>
-            {applying ? <><Loader2 size={14} className="spin" /> 处理中...</> : <><CalendarClock size={14} /> {isBatch ? '确认排布' : isPrepare ? (scheduleMode === 'immediate' ? '立即生成' : '确认定时生成') : '确认安排'}</>}
+            {applying ? <><Loader2 size={14} className="spin" /> 处理中...</> : <><CalendarClock size={14} /> {isQueue ? '确认排队' : isBatch ? '确认排布' : isPrepare ? (scheduleMode === 'immediate' ? '立即生成' : '确认定时生成') : '确认安排'}</>}
           </button>
         </footer>
       </section>
@@ -3338,24 +3418,8 @@ function SettingsView({ cli, settingsForm, setSettingsForm, checkCli, checkCliUp
           />
         </NumberedSection>
 
-        {/* 4 并发限制策略 */}
-        <NumberedSection number={4} title="并发限制策略">
-          <label>
-            并发限制策略
-            <select value={settingsForm.concurrency_limit_policy || 'SilentRetry'}
-              onChange={(e) => setSettingsForm({ ...settingsForm, concurrency_limit_policy: e.target.value })}>
-              <option value="SilentRetry">静默重试</option>
-              <option value="SilentFail">静默失败</option>
-            </select>
-          </label>
-          <label>
-            最大重试次数
-            <div className="settings-input-hint-row">
-              <input type="number" min="0" value={settingsForm.concurrency_retry_max_attempts || 8}
-                onChange={(e) => setSettingsForm({ ...settingsForm, concurrency_retry_max_attempts: e.target.value })} />
-              <span className="settings-range-hint">0-20</span>
-            </div>
-          </label>
+        {/* 4 并发等待策略 */}
+        <NumberedSection number={4} title="并发等待策略">
           <label>
             并发重试间隔（秒）
             <div className="settings-input-hint-row">
@@ -3426,16 +3490,6 @@ function SettingsView({ cli, settingsForm, setSettingsForm, checkCli, checkCliUp
   );
 }
 
-function Metric({ title, value, sub, tone }) {
-  return (
-    <div className={`metric-card ${tone || ''}`}>
-      <span>{title}</span>
-      <strong>{value}</strong>
-      {sub ? <em>{sub}</em> : null}
-    </div>
-  );
-}
-
 function PanelHeading({ title, action }) {
   return (
     <div className="panel-heading">
@@ -3456,81 +3510,6 @@ function SecondaryPageHeader({ title, backLabel, onBack, actions }) {
       </div>
       {actions ? <div className="secondary-page-actions">{actions}</div> : null}
     </div>
-  );
-}
-
-function TaskDetail({ task, submitTask, queryTask, pendingTaskOps = {} }) {
-  if (!task) {
-    return (
-      <aside className="panel task-detail">
-        <PanelHeading title="任务详情" />
-        <p className="empty-cell">暂无任务。</p>
-      </aside>
-    );
-  }
-  return (
-    <aside className="panel task-detail">
-      <div className="task-detail-head">
-        <div>
-          <h2>任务详情：{task.title || '未命名任务'}</h2>
-          <StatusBadge task={task} />
-        </div>
-        <div className="button-cluster">
-          <button type="button" onClick={() => submitTask(task.id)} disabled={pendingTaskOps[task.id]?.submit}>{pendingTaskOps[task.id]?.submit ? <><Loader2 size={15} className="spin" />提交中...</> : <><Play size={15} />立即生成</>}</button>
-          <button type="button" onClick={() => queryTask(task.id)} disabled={!task.submit_id || pendingTaskOps[task.id]?.query}>{pendingTaskOps[task.id]?.query ? <><Loader2 size={15} className="spin" />查询中...</> : <><RefreshCcw size={15} />查询结果</>}</button>
-        </div>
-      </div>
-      <dl>
-        <dt>模型</dt><dd>{task.params?.model_version}</dd>
-        <dt>宽高比</dt><dd>{task.params?.ratio}</dd>
-        <dt>计划时间</dt><dd>{formatDate(task.scheduled_at) || '-'}</dd>
-        <dt>下次执行</dt><dd>{formatDate(task.next_run_at) || '-'}</dd>
-        <dt>submit_id</dt><dd>{task.submit_id || '-'}</dd>
-        <dt>attempt</dt><dd>{task.attempt_count || 0}</dd>
-      </dl>
-      <h3>命令预览</h3>
-      <code>{task.command_preview?.join(' \\\n  ') || '暂无命令预览：需要提示词和至少 1 张图片素材。'}</code>
-      {task.result_urls?.length || task.result_paths?.length ? (
-        <section className="result-list">
-          <h3>生成结果</h3>
-          {task.result_urls?.map((url) => <p key={url}>{url}</p>)}
-          {task.result_paths?.map((path) => <p key={path}>{path}</p>)}
-        </section>
-      ) : null}
-      {task.last_error ? <p className="error-text">{task.last_error}</p> : null}
-      {(() => {
-        const qRecords = deriveCurrentQueryRecords(task).slice().reverse();
-        return qRecords.length ? (
-          <section className="attempt-list">
-            <h3>查询记录</h3>
-            {qRecords.map((attempt) => (
-              <article key={attempt.id}>
-                <strong>{statusLabel(attempt.status)} · {formatDate(attempt.finished_at)}</strong>
-                {attempt.error_kind ? <span>{attempt.error_kind}</span> : null}
-                {attempt.stderr ? <p>{attempt.stderr}</p> : null}
-              </article>
-            ))}
-          </section>
-        ) : null;
-      })()}
-    </aside>
-  );
-}
-
-function TaskRow({ task, submitTask, queryTask, pendingTaskOps = {} }) {
-  return (
-    <article className="task-row">
-      <div>
-        <strong>{task.title || '未命名任务'}</strong>
-        <p>{task.prompt}</p>
-        {task.last_error ? <p className="error-text">{task.last_error}</p> : null}
-      </div>
-        <StatusBadge task={task} />
-        <div className="row-actions">
-        <button type="button" title="立即生成" onClick={() => submitTask(task.id)} disabled={pendingTaskOps[task.id]?.submit}>{pendingTaskOps[task.id]?.submit ? <Loader2 size={14} className="spin" /> : <Play size={14} />}</button>
-        <button type="button" title="查询结果" disabled={!task.submit_id || pendingTaskOps[task.id]?.query} onClick={() => queryTask(task.id)}>{pendingTaskOps[task.id]?.query ? <Loader2 size={14} className="spin" /> : <RefreshCcw size={14} />}</button>
-      </div>
-    </article>
   );
 }
 
@@ -3753,7 +3732,7 @@ function RoleDetailImageSection({ images, chooseFilesForSelectedRole, removeRole
       <div className="role-detail-thumb-row">
         {images.map((asset, index) => (
           <div className="role-detail-thumb" key={asset.id}>
-            <Thumb asset={asset} label={asset.name || `图片 ${index + 1}`} onClick={() => { setPreviewSrc(convertFileSrc(asset.stored_path)); setPreviewAlt(asset.name); }} />
+            <Thumb asset={asset} label={asset.name || `图片 ${index + 1}`} onClick={() => { setPreviewSrc(resolveMediaSrc(asset.stored_path)); setPreviewAlt(asset.name); }} />
             {renamingId === asset.id ? (
               <div className="thumb-rename-row">
                 <input value={renameValue} onChange={(e) => setRenameValue(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); confirmRename(asset.id); } if (e.key === 'Escape') setRenamingId(null); }} autoFocus />
@@ -3944,7 +3923,7 @@ function RoleEditPage({
 
   const openPreview = (path, alt) => {
     if (!path) return;
-    setPreviewSrc(convertFileSrc(path));
+    setPreviewSrc(resolveMediaSrc(path));
     setPreviewAlt(alt || '');
   };
 
@@ -4287,7 +4266,7 @@ function MediaImageManager({ images, dragActive, chooseFilesForSelectedRole, rem
       <div className="image-manager-grid">
         {images.map((asset, index) => (
           <article className="managed-image-card" key={asset.id}>
-            <Thumb asset={asset} label={asset.name} onClick={() => { setPreviewSrc(convertFileSrc(asset.stored_path)); setPreviewAlt(asset.name); }} />
+            <Thumb asset={asset} label={asset.name} onClick={() => { setPreviewSrc(resolveMediaSrc(asset.stored_path)); setPreviewAlt(asset.name); }} />
             <div>
               {renamingId === asset.id ? (
                 <div className="thumb-rename-row">
@@ -4564,7 +4543,7 @@ const IMAGE_SIZE_OPTIONS = [
 
 function imageGenItemSrc(item) {
   if (!item?.storedPath) return '';
-  return convertFileSrc(item.storedPath);
+  return resolveMediaSrc(item.storedPath);
 }
 
 function imageGenQueryMetaText(item) {
@@ -4834,7 +4813,7 @@ function ImageGenView({
                 {referenceAssets.map((asset, idx) => (
                   <div key={asset.id} className="imagegen-ref-thumb-wrap">
                     <img
-                      src={convertFileSrc(asset.stored_path)}
+                      src={resolveMediaSrc(asset.stored_path)}
                       alt={asset.name}
                       className="imagegen-ref-thumb"
                     />
@@ -4979,7 +4958,7 @@ function ImageGenView({
                       if (!asset) return null;
                       return (
                         <div key={id} className="imagegen-ref-thumb-wrap">
-                          <img src={convertFileSrc(asset.stored_path)} alt={asset.name} className="imagegen-ref-thumb" />
+                          <img src={resolveMediaSrc(asset.stored_path)} alt={asset.name} className="imagegen-ref-thumb" />
                         </div>
                       );
                     })}
@@ -5045,6 +5024,9 @@ function ImageGenView({
                     </button>
                     <button type="button" className="icon-ghost mini" title="重新生成" disabled={regeneratingImageIds[item.id]} onClick={(e) => { e.preventDefault(); e.stopPropagation(); regenerateItem(item); }}>
                       {regeneratingImageIds[item.id] ? <Loader2 size={12} className="spin" /> : <Sparkles size={12} />}
+                    </button>
+                    <button type="button" className="icon-ghost mini" title="保存为角色" onClick={(e) => { e.preventDefault(); e.stopPropagation(); handleSaveAsRole(item.storedPath); }}>
+                      <User size={12} />
                     </button>
                   </>
                 )}

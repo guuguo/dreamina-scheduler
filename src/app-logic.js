@@ -107,6 +107,33 @@ export function shouldRefreshStateAfterSchedulerTick({ activeView, roleEditor } 
   return true;
 }
 
+export function findLatestSuccessfulResultPath(tasks = []) {
+  const candidates = [];
+  for (const task of tasks || []) {
+    if (task?.status === 'succeeded' && task.result_paths?.[0]) {
+      candidates.push({
+        path: task.result_paths[0],
+        at: task.finished_at || task.updated_at || task.created_at || '',
+      });
+    }
+    for (const record of task?.execution_records || []) {
+      if (record?.status === 'succeeded' && record.result_paths?.[0]) {
+        candidates.push({
+          path: record.result_paths[0],
+          at: record.finished_at || record.started_at || task.updated_at || task.created_at || '',
+        });
+      }
+    }
+  }
+  candidates.sort((a, b) => timestampValue(b.at) - timestampValue(a.at));
+  return candidates[0]?.path || '';
+}
+
+function timestampValue(value) {
+  const time = new Date(value || 0).getTime();
+  return Number.isNaN(time) ? 0 : time;
+}
+
 /**
  * 拖拽文件分发逻辑 — 这是历史高频 bug 区：
  * - 从 A 角色详情进入新建角色再拖入音频，不应修改 A 角色

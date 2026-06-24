@@ -316,8 +316,8 @@ export default function PromptMentionEditor({
 
   const insertTempImageMention = useCallback((asset) => {
     if (!editor) return;
-    const nextIndex = tempImagePathsRef.current.length + 1;
-    const label = `图片${nextIndex}`;
+    const existingLabels = new Set((mentionItems || []).filter((item) => item.type === 'temp_image').map((item) => item.label));
+    const label = createUniqueTempImageLabel(existingLabels);
     editor.chain().focus().insertContent({
       type: 'mention',
       attrs: {
@@ -329,7 +329,7 @@ export default function PromptMentionEditor({
       },
     }).run();
     editor.chain().focus().insertContent(' ').run();
-  }, [editor]);
+  }, [editor, mentionItems]);
 
   const handleImagePaste = useCallback(async (file) => {
     if (!onPasteImage || !editor) return;
@@ -380,4 +380,13 @@ export default function PromptMentionEditor({
       ) : null}
     </div>
   );
+}
+
+function createUniqueTempImageLabel(existingLabels = new Set()) {
+  for (let i = 0; i < 20; i += 1) {
+    const suffix = Math.floor(100000 + Math.random() * 900000);
+    const label = `图片${suffix}`;
+    if (!existingLabels.has(label)) return label;
+  }
+  return `图片${Date.now().toString().slice(-6)}`;
 }

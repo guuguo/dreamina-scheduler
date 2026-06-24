@@ -13,6 +13,7 @@ import {
   patchImageModelConfig,
   mergeSettingsFormOnStateRefresh,
   shouldRefreshStateAfterSchedulerTick,
+  findLatestSuccessfulResultPath,
 } from './app-logic.js';
 
 // ─── getRoleMedia ───
@@ -119,7 +120,6 @@ test('mergeSettingsFormOnStateRefresh preserves dirty settings draft while setti
 });
 
 test('shouldRefreshStateAfterSchedulerTick refreshes only live status pages', () => {
-  assert.equal(shouldRefreshStateAfterSchedulerTick({ activeView: 'dashboard' }), true);
   assert.equal(shouldRefreshStateAfterSchedulerTick({ activeView: 'queue' }), true);
   assert.equal(shouldRefreshStateAfterSchedulerTick({ activeView: 'logs' }), true);
   assert.equal(shouldRefreshStateAfterSchedulerTick({ activeView: 'imagegen' }), true);
@@ -127,6 +127,47 @@ test('shouldRefreshStateAfterSchedulerTick refreshes only live status pages', ()
   assert.equal(shouldRefreshStateAfterSchedulerTick({ activeView: 'roles', roleEditor: { mode: 'edit' } }), false);
   assert.equal(shouldRefreshStateAfterSchedulerTick({ activeView: 'create' }), false);
   assert.equal(shouldRefreshStateAfterSchedulerTick({ activeView: 'settings' }), false);
+});
+
+test('findLatestSuccessfulResultPath returns newest local successful result path', () => {
+  const result = findLatestSuccessfulResultPath([
+    {
+      id: 'older-top-level',
+      status: 'succeeded',
+      finished_at: '2026-05-15T08:00:00Z',
+      result_paths: ['/tmp/older.mp4'],
+    },
+    {
+      id: 'newer-record',
+      status: 'queued',
+      execution_records: [
+        {
+          id: 'rec-new',
+          status: 'succeeded',
+          finished_at: '2026-05-15T10:00:00Z',
+          result_paths: ['/tmp/newer.mp4'],
+        },
+      ],
+    },
+    {
+      id: 'remote-only',
+      status: 'succeeded',
+      finished_at: '2026-05-15T11:00:00Z',
+      result_paths: [],
+      result_urls: ['https://example.com/video.mp4'],
+    },
+  ]);
+
+  assert.equal(result, '/tmp/newer.mp4');
+});
+
+test('findLatestSuccessfulResultPath returns empty when no local successful result exists', () => {
+  const result = findLatestSuccessfulResultPath([
+    { id: 'failed', status: 'failed', finished_at: '2026-05-15T08:00:00Z', result_paths: ['/tmp/failed.mp4'] },
+    { id: 'remote', status: 'succeeded', finished_at: '2026-05-15T09:00:00Z', result_urls: ['https://example.com/video.mp4'] },
+  ]);
+
+  assert.equal(result, '');
 });
 
 // ─── resolveDropTarget ─── 历史高频 bug：角色串素材
