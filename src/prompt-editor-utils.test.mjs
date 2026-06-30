@@ -4,6 +4,7 @@ import {
   tiptapDocToPromptText,
   extractMentionRefsFromTiptapDoc,
   applyMentionRefsToTaskForm,
+  applyEditorUpdate,
   promptTextToTiptapDoc,
   getPromptTextFromTiptapEditor,
   shouldBlockPromptTextInput,
@@ -186,6 +187,28 @@ test('applyMentionRefsToTaskForm preserves other form fields', () => {
   assert.equal(result.prompt, 'hello');
   assert.deepEqual(result.params, { model_version: 'seedance2.0' });
   assert.deepEqual(result.temp_image_paths, ['/tmp/a.png']);
+});
+
+// ── applyEditorUpdate (doc-first persistence) ──
+
+test('applyEditorUpdate stores plain prompt, prompt_doc and mention bindings', () => {
+  const doc = makeDocWithMentions([
+    { key: 'img:img-1', label: '女主日常服', type: 'image', assetId: 'img-1' },
+  ]);
+  const refs = extractMentionRefsFromTiptapDoc(doc);
+  const form = { prompt: '', role_ids: [], manual_mention_ids: [], temp_image_asset_ids: [] };
+  const result = applyEditorUpdate(form, { plainText: '@女主日常服', refs, doc });
+  assert.equal(result.prompt, '@女主日常服');
+  assert.deepEqual(result.prompt_doc, doc);
+  assert.deepEqual(result.image_asset_ids, ['img-1']);
+});
+
+test('applyEditorUpdate sets prompt_doc to null when doc is empty/absent', () => {
+  const refs = { roleIds: [], imageAssetIds: [], audioAssetIds: [], tempImageAssetIds: [] };
+  const form = { prompt: 'old', role_ids: [], manual_mention_ids: [], temp_image_asset_ids: [] };
+  const result = applyEditorUpdate(form, { plainText: '', refs, doc: null });
+  assert.equal(result.prompt, '');
+  assert.equal(result.prompt_doc, null);
 });
 
 // ── promptTextToTiptapDoc ──

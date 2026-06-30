@@ -115,6 +115,18 @@ export function applyMentionRefsToTaskForm(form, refs) {
 }
 
 /**
+ * Doc-first editor update: persist the Tiptap JSON doc as the source of truth
+ * alongside the derived plain prompt text and mention-based bindings.
+ *
+ * prompt_doc is what the editor reloads from (stable highlight, no label-guessing),
+ * while prompt + *_asset_ids stay derived for downstream (MCP, scheduler).
+ */
+export function applyEditorUpdate(form, { plainText, refs, doc }) {
+  const withRefs = applyMentionRefsToTaskForm({ ...form, prompt: plainText }, refs);
+  return { ...withRefs, prompt_doc: doc || null };
+}
+
+/**
  * Convert a plain prompt text + mentionItems into a Tiptap JSON doc.
  * Recognised @label patterns become mention nodes; everything else is plain text.
  */
