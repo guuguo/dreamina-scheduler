@@ -42,8 +42,6 @@ const IMAGE_SUBMIT_CONNECT_TIMEOUT_SECS: u64 = 300;
 const SCHEDULER_TICK_INTERVAL_SECS: u64 = 30;
 static PROCESS_QUEUE_RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// 退避间隔阶梯（秒），index = consecutive_no_result_queries 的次数映射
-const BACKOFF_INTERVALS_SECS: &[u64] = &[0, 60, 120, 300, 600];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1895,26 +1893,40 @@ impl Default for SchedulerWaker {
     }
 }
 
-/// 根据连续无结果查询次数返回退避间隔秒数
-pub fn backoff_interval_secs(consecutive_count: u32) -> u64 {
-    let idx = consecutive_count as usize;
-    if idx >= BACKOFF_INTERVALS_SECS.len() {
-        *BACKOFF_INTERVALS_SECS.last().unwrap_or(&600)
-    } else {
-        BACKOFF_INTERVALS_SECS[idx]
+/// 根据远端队列状态/位置自适应的自动查询间隔（秒）。
+/// 越接近完成查得越勤，不再随查询次数退避增长：
+/// - 生成中 Generating         → 60s
+/// - 排队中 位置 ≤ 100         → 180s
+/// - 排队中 位置 101–1000      → 600s
+/// - 排队中 位置 > 1000        → 1200s
+/// - 尚无队列信息（刚提交）     → 60s（尽快探到队列位置）
+pub fn query_interval_secs(task: &ScheduledTask) -> u64 {
+    let Some(qi) = task.queue_info.as_ref() else {
+        return 60;
+    };
+    let is_generating = qi
+        .queue_status
+        .as_deref()
+        .map(|s| s.eq_ignore_ascii_case("generating"))
+        .unwrap_or(false);
+    if is_generating {
+        return 60;
+    }
+    match qi.queue_idx {
+        Some(idx) if idx <= 100 => 180,
+        Some(idx) if idx <= 1000 => 600,
+        Some(_) => 1200,
+        // 排队中但拿不到位置 → 保守 3 分钟
+        None => 180,
     }
 }
 
-/// 判断任务是否到了退避允许的查询时间
-pub fn is_backoff_due(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
-    if task.consecutive_no_result_queries == 0 {
-        return true;
-    }
+/// 判断任务是否到了下一次自动查询时间（按 `query_interval_secs` 的自适应间隔）。
+pub fn is_query_due(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
     let Some(ref last_at) = task.last_auto_query_at else {
         return true;
     };
-    let interval =
-        Duration::seconds(backoff_interval_secs(task.consecutive_no_result_queries) as i64);
+    let interval = Duration::seconds(query_interval_secs(task) as i64);
     DateTime::parse_from_rfc3339(last_at)
         .map(|t| now.signed_duration_since(t.with_timezone(&Utc)) >= interval)
         .unwrap_or(true)
@@ -3840,7 +3852,7 @@ where
                 && !task.auto_query_stopped
         })
         .map(|task| {
-            if is_backoff_due(task, now) {
+            if is_query_due(task, now) {
                 Some(task.id.clone())
             } else {
                 None
@@ -4132,7 +4144,7 @@ pub fn peek_due_task_cli(data: &AppData) -> Result<Option<DueTaskCli>, DueTaskBu
             && !t.submit_id.trim().is_empty()
             && !t.auto_query_stopped
     }) {
-        if !is_backoff_due(task, now) {
+        if !is_query_due(task, now) {
             return Ok(None);
         }
         // 对于 querying 状态且超过 4 小时的任务，标记停止（不在 peek 中修改数据，返回 None）
@@ -5635,32 +5647,46 @@ fn start_background_scheduler(app_handle: tauri::AppHandle) {
         let snapshot = store.snapshot();
 
         // 完全空闲时跳过重函数：不写 started/no_due_task 噪音日志、不整份序列化落盘。
+        // 若这次 tick 刚让某任务到达终态（成功/失败），说明队列腾出来了——不进入等待，
+        // 立刻再跑一轮把后续任务马上提交，避免白白浪费一个查询间隔。
+        let mut task_just_finished = false;
         if should_process_now(&snapshot) {
-            if let Err(error) = process_queue_for_store_blocking(&store, "background") {
-                let _ = store.mutate(|data| {
-                    append_log(
-                        data,
-                        LogEntryDraft {
-                            level: LogLevel::Error,
-                            source: LogSource::Scheduler,
-                            category: "scheduler_tick".to_string(),
-                            event_type: "tick_error".to_string(),
-                            message: "后台调度 tick 失败".to_string(),
-                            detail: String::new(),
-                            task_id: None,
-                            task_title: None,
-                            submit_id: None,
-                            execution_record_id: None,
-                            error_detail: Some(error),
-                            raw_output: None,
-                            stdout: None,
-                            stderr: None,
-                            module: None,
-                        },
-                    );
-                    Ok(())
-                });
+            match process_queue_for_store_blocking(&store, "background") {
+                Ok(Some(task)) if task.status == "succeeded" || task.status == "failed" => {
+                    task_just_finished = true;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = store.mutate(|data| {
+                        append_log(
+                            data,
+                            LogEntryDraft {
+                                level: LogLevel::Error,
+                                source: LogSource::Scheduler,
+                                category: "scheduler_tick".to_string(),
+                                event_type: "tick_error".to_string(),
+                                message: "后台调度 tick 失败".to_string(),
+                                detail: String::new(),
+                                task_id: None,
+                                task_title: None,
+                                submit_id: None,
+                                execution_record_id: None,
+                                error_detail: Some(error),
+                                raw_output: None,
+                                stdout: None,
+                                stderr: None,
+                                module: None,
+                            },
+                        );
+                        Ok(())
+                    });
+                }
             }
+        }
+
+        // 刚有任务完成 → 立即进入下一轮提交后续任务，不等待。
+        if task_just_finished {
+            continue;
         }
 
         // 自适应等待：有活跃任务 30s，完全空闲 60s；入队 notify 可提前唤醒。
@@ -8444,71 +8470,82 @@ mod tests {
         assert!(should_process_now(&data));
     }
 
-    // ── backoff_interval_secs ──────────────────────────────────────────────
-
-    #[test]
-    fn backoff_interval_0_returns_0() {
-        assert_eq!(backoff_interval_secs(0), 0);
+    // ── query_interval_secs（按队列状态/位置自适应，无退避增长）─────────────
+    fn make_queue_task(queue_status: &str, queue_idx: Option<u64>) -> ScheduledTask {
+        let mut task = make_backoff_task(0, None, false);
+        task.queue_info = Some(QueueInfo {
+            queue_idx,
+            priority: Some(1),
+            queue_status: Some(queue_status.to_string()),
+            queue_length: Some(304_151),
+        });
+        task
     }
 
     #[test]
-    fn backoff_interval_1_returns_60() {
-        assert_eq!(backoff_interval_secs(1), 60);
+    fn query_interval_generating_is_60s() {
+        assert_eq!(query_interval_secs(&make_queue_task("Generating", Some(0))), 60);
     }
 
     #[test]
-    fn backoff_interval_2_returns_120() {
-        assert_eq!(backoff_interval_secs(2), 120);
+    fn query_interval_queueing_within_100_is_180s() {
+        assert_eq!(query_interval_secs(&make_queue_task("Queueing", Some(50))), 180);
+        assert_eq!(query_interval_secs(&make_queue_task("Queueing", Some(100))), 180);
     }
 
     #[test]
-    fn backoff_interval_3_returns_300() {
-        assert_eq!(backoff_interval_secs(3), 300);
+    fn query_interval_queueing_101_to_1000_is_600s() {
+        assert_eq!(query_interval_secs(&make_queue_task("Queueing", Some(101))), 600);
+        assert_eq!(query_interval_secs(&make_queue_task("Queueing", Some(1000))), 600);
     }
 
     #[test]
-    fn backoff_interval_4_returns_600() {
-        assert_eq!(backoff_interval_secs(4), 600);
+    fn query_interval_queueing_over_1000_is_1200s() {
+        assert_eq!(query_interval_secs(&make_queue_task("Queueing", Some(1001))), 1200);
+        assert_eq!(query_interval_secs(&make_queue_task("Queueing", Some(5_000))), 1200);
     }
 
     #[test]
-    fn backoff_interval_5_or_more_returns_600() {
-        assert_eq!(backoff_interval_secs(5), 600);
-        assert_eq!(backoff_interval_secs(100), 600);
+    fn query_interval_no_queue_info_is_60s() {
+        let task = make_backoff_task(0, None, false); // queue_info: None
+        assert_eq!(query_interval_secs(&task), 60);
     }
 
-    // ── is_backoff_due ─────────────────────────────────────────────────────
-
+    // ── is_query_due（固定/自适应间隔，命中即查，不随次数退避）──────────────
     #[test]
-    fn is_backoff_due_consecutive_zero_returns_true() {
-        let task = make_backoff_task(0, None, false);
-        assert!(is_backoff_due(&task, Utc::now()));
-    }
-
-    #[test]
-    fn is_backoff_due_no_last_auto_query_at_returns_true() {
-        let task = make_backoff_task(1, None, false);
-        assert!(is_backoff_due(&task, Utc::now()));
+    fn is_query_due_no_last_query_returns_true() {
+        let task = make_queue_task("Generating", Some(0));
+        assert!(is_query_due(&task, Utc::now()));
     }
 
     #[test]
-    fn is_backoff_due_interval_elapsed_returns_true() {
-        let past = (Utc::now() - Duration::minutes(5)).to_rfc3339();
-        let task = make_backoff_task(2, Some(&past), false); // 2→120s
-        assert!(is_backoff_due(&task, Utc::now()));
+    fn is_query_due_generating_interval_not_elapsed_returns_false() {
+        let mut task = make_queue_task("Generating", Some(0));
+        task.last_auto_query_at = Some((Utc::now() - Duration::seconds(30)).to_rfc3339());
+        assert!(!is_query_due(&task, Utc::now()));
     }
 
     #[test]
-    fn is_backoff_due_interval_not_elapsed_returns_false() {
-        let recent = Utc::now().to_rfc3339();
-        let task = make_backoff_task(2, Some(&recent), false); // 2→120s, just now
-        assert!(!is_backoff_due(&task, Utc::now()));
+    fn is_query_due_generating_interval_elapsed_returns_true() {
+        let mut task = make_queue_task("Generating", Some(0));
+        task.last_auto_query_at = Some((Utc::now() - Duration::seconds(61)).to_rfc3339());
+        assert!(is_query_due(&task, Utc::now()));
     }
 
     #[test]
-    fn is_backoff_due_with_malformed_timestamp_returns_true() {
-        let task = make_backoff_task(1, Some("not-a-timestamp"), false);
-        assert!(is_backoff_due(&task, Utc::now()));
+    fn is_query_due_does_not_grow_with_consecutive_count() {
+        // 退避已废除：间隔只取决于队列状态/位置，不随查询次数增长。
+        let mut task = make_queue_task("Generating", Some(0));
+        task.consecutive_no_result_queries = 50; // 旧退避会膨胀到 600s
+        task.last_auto_query_at = Some((Utc::now() - Duration::seconds(61)).to_rfc3339());
+        assert!(is_query_due(&task, Utc::now()));
+    }
+
+    #[test]
+    fn is_query_due_with_malformed_timestamp_returns_true() {
+        let mut task = make_queue_task("Queueing", Some(50));
+        task.last_auto_query_at = Some("not-a-timestamp".to_string());
+        assert!(is_query_due(&task, Utc::now()));
     }
 
     // ── is_past_max_wait ───────────────────────────────────────────────────
