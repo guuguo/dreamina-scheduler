@@ -446,6 +446,7 @@ fn concurrency_limit_legacy_silent_fail_policy_still_waits() {
         auto_query_enabled: true,
         poll_interval_seconds: 60,
         log_retention_count: 500,
+        log_retention_days: 3,
         mac_install_command: default_data().settings.mac_install_command,
         windows_install_command: default_data().settings.windows_install_command,
         ai_model_configs: SchedulerSettings::default().ai_model_configs,

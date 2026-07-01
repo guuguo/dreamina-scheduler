@@ -1295,6 +1295,8 @@ pub struct UpdateSettingsInput {
     pub auto_query_enabled: bool,
     pub poll_interval_seconds: u64,
     pub log_retention_count: u32,
+    #[serde(default)]
+    pub log_retention_days: Option<u32>,
     pub mac_install_command: String,
     pub windows_install_command: String,
     #[serde(default = "default_ai_model_configs")]
@@ -1472,6 +1474,8 @@ fn normalize_loaded_app_data(data: &mut AppData) {
     normalize_image_model_settings(&mut data.settings);
     backfill_execution_records_from_attempts(data);
     compact_retry_execution_records_for_display(data);
+    // Sort query_records chronologically before capping (cap drains oldest from front)
+    sort_all_query_records(data);
     recover_tasks_on_load(data);
     backfill_draft_command_previews(data);
     apply_log_retention(data);
@@ -1783,6 +1787,8 @@ pub struct SchedulerSettings {
     pub poll_interval_seconds: u64,
     #[serde(default = "default_log_retention")]
     pub log_retention_count: u32,
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: u32,
     #[serde(default = "default_mac_install_command")]
     pub mac_install_command: String,
     #[serde(default)]
@@ -1810,6 +1816,9 @@ fn default_poll_interval() -> u64 {
 fn default_log_retention() -> u32 {
     500
 }
+fn default_log_retention_days() -> u32 {
+    3
+}
 fn default_mac_install_command() -> String {
     "curl -fsSL https://jimeng.jianying.com/cli | bash".to_string()
 }
@@ -1823,6 +1832,7 @@ impl Default for SchedulerSettings {
             auto_query_enabled: true,
             poll_interval_seconds: 60,
             log_retention_count: 500,
+            log_retention_days: 3,
             mac_install_command: default_mac_install_command(),
             windows_install_command: String::new(),
             ai_model_configs: default_ai_model_configs(),
@@ -4322,6 +4332,7 @@ where
                     duration_seconds: 0.0,
                     error_detail: message,
                 });
+                sort_query_records_by_time(&mut rec.query_records);
             }
             return Ok(data.tasks[task_index].clone());
         }
@@ -4446,6 +4457,7 @@ where
         .find(|r| r.submit_id == submit_id)
     {
         rec.query_records.push(query_record);
+        sort_query_records_by_time(&mut rec.query_records);
         rec.status = final_status.clone();
         if final_status == "succeeded" {
             rec.result_paths = final_result_paths;
@@ -5429,6 +5441,19 @@ const MAX_QUERY_RECORDS_PER_EXECUTION: usize = 30;
 /// 每个任务保留的 attempts（尝试历史）上限。
 const MAX_ATTEMPTS_PER_TASK: usize = 50;
 
+/// Sort a task's execution record query_records by started_at (chronological).
+fn sort_query_records_by_time(records: &mut Vec<TaskAttempt>) {
+    records.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+}
+
+fn sort_all_query_records(data: &mut AppData) {
+    for task in &mut data.tasks {
+        for rec in &mut task.execution_records {
+            sort_query_records_by_time(&mut rec.query_records);
+        }
+    }
+}
+
 /// 丢弃 `v` 中最旧的若干项，仅保留最近 `max` 个；返回移除数量。
 fn cap_history_vec<T>(v: &mut Vec<T>, max: usize) -> usize {
     if v.len() > max {
@@ -5453,11 +5478,21 @@ pub fn cap_execution_history(data: &mut AppData) -> usize {
     removed
 }
 
-/// Trim old log entries to respect `settings.log_retention_count`.
+/// Trim log entries older than `log_retention_days` (default 3 days).
+/// Logs are chronologically ordered (always appended), so binary search is used.
 fn apply_log_retention(data: &mut AppData) {
-    let max_logs = data.settings.log_retention_count as usize;
-    if max_logs > 0 && data.logs.len() > max_logs {
-        let drain = data.logs.len() - max_logs;
+    let max_days = data.settings.log_retention_days.max(1);
+    let cutoff = Utc::now() - chrono::Duration::days(max_days as i64);
+    let cutoff_str = cutoff.to_rfc3339();
+
+    let idx = data.logs.partition_point(|e| e.timestamp < cutoff_str);
+    if idx > 0 {
+        data.logs.drain(0..idx);
+    }
+    // Hard cap: prevent unbounded growth in edge cases
+    const MAX_LOG_ENTRIES: usize = 10000;
+    if data.logs.len() > MAX_LOG_ENTRIES {
+        let drain = data.logs.len() - MAX_LOG_ENTRIES;
         data.logs.drain(0..drain);
     }
 }
@@ -6415,6 +6450,15 @@ pub mod commands {
         if submit_id.trim().is_empty() {
             return Err("任务没有 submit_id，无法查询".to_string());
         }
+        // 如果后台已在自动查询同一个 submit_id，跳过手动查询避免记录交叉
+        {
+            let snapshot = store.snapshot();
+            if let Some(t) = snapshot.tasks.iter().find(|t| t.id == task_id) {
+                if t.status == "querying" && t.submit_id == submit_id {
+                    return Ok(t.clone());
+                }
+            }
+        }
         // 锁外：运行 CLI
         let args = vec![
             "query_result".to_string(),
@@ -7289,6 +7333,7 @@ pub mod commands {
                     auto_query_enabled: input.auto_query_enabled,
                     poll_interval_seconds: input.poll_interval_seconds,
                     log_retention_count: input.log_retention_count,
+                    log_retention_days: input.log_retention_days.unwrap_or(3),
                     mac_install_command: input.mac_install_command,
                     windows_install_command: input.windows_install_command,
                     ai_model_configs: input.ai_model_configs,

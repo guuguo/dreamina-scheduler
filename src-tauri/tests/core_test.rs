@@ -870,6 +870,7 @@ fn classifies_concurrency_limit_for_silent_retry_policy() {
         auto_query_enabled: true,
         poll_interval_seconds: 60,
         log_retention_count: 500,
+        log_retention_days: 3,
         mac_install_command: "curl -fsSL https://jimeng.jianying.com/cli | bash".to_string(),
         windows_install_command: String::new(),
         ai_model_configs: SchedulerSettings::default().ai_model_configs,
