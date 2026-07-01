@@ -400,6 +400,8 @@ pub struct TaskDraft {
     pub temp_image_asset_ids: Vec<String>,
     #[serde(default)]
     pub temp_image_paths: Vec<String>,
+    #[serde(default)]
+    pub prompt_doc: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -521,6 +523,8 @@ pub struct ScheduledTask {
     pub server_error_retry_count: u32,
     #[serde(default = "default_planned_submit_count")]
     pub planned_submit_count: u32,
+    #[serde(default)]
+    pub prompt_doc: Option<serde_json::Value>,
 }
 
 impl From<TaskDraft> for ScheduledTask {
@@ -566,6 +570,7 @@ impl From<TaskDraft> for ScheduledTask {
             consecutive_no_result_queries: 0,
             server_error_retry_count: 0,
             planned_submit_count: default_planned_submit_count(),
+            prompt_doc: value.prompt_doc,
         }
     }
 }
@@ -3041,6 +3046,7 @@ pub fn queue_mcp_video_task(
         scheduled_at: input.start_at.filter(|value| !value.trim().is_empty()),
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+        prompt_doc: None,
     };
     let mut preview_data = data.clone();
     preview_data.assets.extend(imported_assets.clone());
@@ -3567,6 +3573,7 @@ fn draft_from_task(task: &ScheduledTask) -> TaskDraft {
         scheduled_at: task.scheduled_at.clone(),
         temp_image_asset_ids: task.temp_image_asset_ids.clone(),
         temp_image_paths: task.temp_image_paths.clone(),
+        prompt_doc: task.prompt_doc.clone(),
     }
 }
 
@@ -4046,6 +4053,7 @@ pub fn update_task_from_data(
     task.params = draft.params;
     task.temp_image_asset_ids = draft.temp_image_asset_ids;
     task.temp_image_paths = draft.temp_image_paths;
+    task.prompt_doc = draft.prompt_doc.clone();
     task.updated_at = now_rfc3339();
     task.command_preview = new_command_preview;
     // draft 模式：若任务已处于有效执行状态则保留，不强制回退为 draft
@@ -4181,6 +4189,7 @@ pub fn peek_due_task_cli(data: &AppData) -> Result<Option<DueTaskCli>, DueTaskBu
         scheduled_at: task.scheduled_at.clone(),
         temp_image_asset_ids: task.temp_image_asset_ids.clone(),
         temp_image_paths: task.temp_image_paths.clone(),
+        prompt_doc: task.prompt_doc.clone(),
     };
     let resolved = resolve_task_inputs(&draft, &data.assets, &data.roles).map_err(|error| {
         DueTaskBuildError {
@@ -4468,6 +4477,7 @@ where
         scheduled_at: task.scheduled_at.clone(),
         temp_image_asset_ids: task.temp_image_asset_ids.clone(),
         temp_image_paths: task.temp_image_paths.clone(),
+        prompt_doc: task.prompt_doc.clone(),
     };
     let resolved = resolve_task_inputs(&draft, &data.assets, &data.roles)?;
     let args = build_multimodal2video_args(&draft, &resolved)?;
@@ -6285,6 +6295,7 @@ pub mod commands {
                 scheduled_at: task.scheduled_at.clone(),
                 temp_image_asset_ids: task.temp_image_asset_ids.clone(),
                 temp_image_paths: task.temp_image_paths.clone(),
+                prompt_doc: task.prompt_doc.clone(),
             };
             let resolved = resolve_task_inputs(&draft, &data.assets, &data.roles)
                 .map_err(|e| e.to_string())?;
@@ -7909,6 +7920,7 @@ mod tests {
             consecutive_no_result_queries: 0,
             server_error_retry_count: 0,
             planned_submit_count: 1,
+            prompt_doc: None,
         }
     }
 
@@ -8113,6 +8125,7 @@ mod tests {
             consecutive_no_result_queries: consecutive,
             server_error_retry_count: 0,
             planned_submit_count: 1,
+            prompt_doc: None,
         }
     }
 
@@ -8716,6 +8729,7 @@ mod tests {
             last_auto_query_at: None,
             auto_query_stopped: false,
             consecutive_no_result_queries: 0,
+            prompt_doc: None,
         }
     }
 
@@ -9011,6 +9025,7 @@ mod tests {
             consecutive_no_result_queries: 0,
             server_error_retry_count: 0,
             planned_submit_count: 1,
+            prompt_doc: None,
         }
     }
 
@@ -9078,6 +9093,7 @@ mod tests {
                 consecutive_no_result_queries: 0,
                 server_error_retry_count: 0,
                 planned_submit_count: 1,
+                prompt_doc: None,
             }],
             ..AppData::default()
         };

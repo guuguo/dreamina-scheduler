@@ -97,6 +97,7 @@ fn queued_task(id: &str) -> ScheduledTask {
         consecutive_no_result_queries: 0,
         server_error_retry_count: 0,
         planned_submit_count: 1,
+        prompt_doc: None,
     }
 }
 
@@ -152,6 +153,7 @@ fn rejects_scheduled_at_in_past() {
         scheduled_at: Some(past),
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+        prompt_doc: None,
     };
     let result = create_task_with_preview(&data, draft);
     assert!(result.is_err());
@@ -178,6 +180,7 @@ fn accepts_future_scheduled_at() {
         scheduled_at: Some(future),
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+        prompt_doc: None,
     };
     let result = create_task_with_preview(&data, draft);
     assert!(result.is_ok());
@@ -200,6 +203,7 @@ fn draft_task_is_saved_without_entering_queue() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+        prompt_doc: None,
     };
 
     let task = create_draft_task(&data, draft).expect("draft");
@@ -263,6 +267,7 @@ fn create_task_generates_short_title_when_title_is_empty() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+        prompt_doc: None,
     };
 
     let task = create_task_with_preview(&data, draft).expect("task");
@@ -310,6 +315,7 @@ fn pasted_clipboard_image_is_saved_as_temp_asset_and_can_build_task_preview() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+        prompt_doc: None,
     };
     let task = create_task_with_preview(&data, draft).expect("task preview");
     assert!(task
@@ -641,6 +647,7 @@ fn process_queue_skips_future_scheduled_task() {
         scheduled_at: Some(future),
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+        prompt_doc: None,
     };
     data.tasks
         .push(create_task_with_preview(&data, draft).expect("task"));
@@ -679,6 +686,7 @@ fn process_queue_submits_due_task_with_mock_runner_and_records_attempt() {
         scheduled_at: Some(future),
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+        prompt_doc: None,
     };
     let mut task = create_task_with_preview(&data, draft).expect("task");
     task.status = "scheduled".to_string();
@@ -728,6 +736,7 @@ fn process_queue_handles_concurrency_limit_with_silent_retry_policy() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+        prompt_doc: None,
     };
     data.tasks
         .push(create_task_with_preview(&data, draft).expect("task"));
@@ -1434,6 +1443,7 @@ fn draft_task_is_not_selected_by_process_queue() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+        prompt_doc: None,
     };
     let task = create_draft_task(&data, draft).expect("draft");
     data.tasks.push(task);
@@ -1549,6 +1559,7 @@ fn concurrency_retry_exceeds_configured_count_still_waits() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+        prompt_doc: None,
     };
     let mut task = create_task_with_preview(&data, draft).expect("task");
     task.concurrency_retry_count = 1;
@@ -1580,6 +1591,7 @@ fn transient_error_triggers_retry_wait() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+        prompt_doc: None,
     };
     data.tasks
         .push(create_task_with_preview(&data, draft).expect("task"));
@@ -1881,6 +1893,7 @@ fn draft_task_backfills_prompt_mentioned_role_image_and_audio_assets() {
         scheduled_at: None,
         temp_image_asset_ids: vec!["tmp-1".to_string()],
         temp_image_paths: vec!["/tmp/storyboard.png".to_string()],
+            prompt_doc: None,
     };
 
     let task = create_draft_task(&data, draft).expect("draft should save");
@@ -1915,6 +1928,7 @@ fn draft_with_invalid_asset_id_rejected() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+        prompt_doc: None,
     };
     let result = create_draft_task(&data, draft);
     assert!(result.is_err());
@@ -1936,6 +1950,7 @@ fn draft_with_invalid_role_id_rejected() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+        prompt_doc: None,
     };
     let result = create_draft_task(&data, draft);
     assert!(result.is_err());
@@ -2011,6 +2026,7 @@ fn draft_with_new_prompt(prompt: &str) -> TaskDraft {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+        prompt_doc: None,
     }
 }
 

@@ -103,6 +103,7 @@ fn persistence_test_task(title: &str) -> ScheduledTask {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+        prompt_doc: None,
     })
 }
 
@@ -430,6 +431,7 @@ fn command_uses_only_prompt_mentioned_assets_and_rewrites_mentions_inline() {
         scheduled_at: None,
         temp_image_asset_ids: vec!["temp-1".to_string()],
         temp_image_paths: vec!["/tmp/shot.png".to_string()],
+            prompt_doc: None,
     };
     let assets = vec![
         image_asset("temp-1", "粘贴图片", "/tmp/shot.png"),
@@ -573,6 +575,7 @@ fn multimodal_command_uses_only_images_and_audio_for_mvp() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+            prompt_doc: None,
     };
     let assets = vec![
         image_asset("img-1", "警车威威", "/tmp/role.png"),
@@ -604,6 +607,7 @@ fn multimodal_prompt_rewrites_image_mentions_inline() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+            prompt_doc: None,
     };
     let assets = vec![
         image_asset("img-1", "女主小雅", "/tmp/xiaoya.png"),
@@ -637,6 +641,7 @@ fn multimodal_prompt_rewrites_ordered_image_and_audio_mentions_inline() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+            prompt_doc: None,
     };
     let assets = vec![
         image_asset("img-1", "素材名A", "/tmp/a.png"),
@@ -674,6 +679,7 @@ fn storyboard_mentions_use_temp_images_not_role_image_order() {
         scheduled_at: None,
         temp_image_asset_ids: vec!["storyboard-temp".to_string()],
         temp_image_paths: vec!["/tmp/storyboard.png".to_string()],
+            prompt_doc: None,
     };
     let assets = vec![
         image_asset("storyboard-temp", "粘贴图片", "/tmp/storyboard.png"),
@@ -731,6 +737,7 @@ fn picture_number_mentions_use_temp_images_as_command_inputs() {
         scheduled_at: None,
         temp_image_asset_ids: vec!["temp-digger".to_string()],
         temp_image_paths: vec!["/tmp/digger.png".to_string()],
+            prompt_doc: None,
     };
     let assets = vec![image_asset(
         "temp-digger",
@@ -769,6 +776,7 @@ fn rejects_unsupported_ratio_before_command_build() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+            prompt_doc: None,
     };
     let assets = vec![image_asset("img-1", "角色图", "/tmp/role.png")];
     let resolved = resolve_task_inputs(&task, &assets, &[]).expect("inputs resolve");
@@ -791,6 +799,7 @@ fn auto_match_does_not_add_unmentioned_role_media_to_command_inputs() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+            prompt_doc: None,
     };
     let assets = vec![image_asset("img-wewei", "威威正面", "/tmp/wewei.png")];
     let roles = vec![Role {
@@ -827,6 +836,7 @@ fn manual_role_mentions_do_not_bind_assets_without_asset_reference() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+            prompt_doc: None,
     };
     let assets = vec![image_asset("img-wewei", "威威正面", "/tmp/wewei.png")];
     let roles = vec![Role {
@@ -904,6 +914,7 @@ fn rejects_video_asset_type() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+            prompt_doc: None,
     };
     let video_asset = Asset {
         id: "vid-1".to_string(),
@@ -938,6 +949,7 @@ fn missing_asset_id_returns_error() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+            prompt_doc: None,
     };
     let result = resolve_task_inputs(&task, &[], &[]);
     assert!(result.is_err());
@@ -958,6 +970,7 @@ fn role_ids_are_ignored_by_command_input_resolution() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+            prompt_doc: None,
     };
     let assets = vec![image_asset("img-1", "角色图", "/tmp/role.png")];
     let result = resolve_task_inputs(&task, &assets, &[]);
@@ -979,6 +992,7 @@ fn no_image_input_returns_error() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+            prompt_doc: None,
     };
     let result = resolve_task_inputs(&task, &[], &[]);
     assert!(result.is_err());
@@ -1013,6 +1027,7 @@ fn too_many_images_returns_error() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+            prompt_doc: None,
     };
     let result = resolve_task_inputs(&task, &assets, &[]);
     assert!(result.is_err());
@@ -1044,6 +1059,7 @@ fn too_many_audio_returns_error() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+            prompt_doc: None,
     };
     let result = resolve_task_inputs(&task, &assets, &[]);
     assert!(result.is_err());
@@ -1069,6 +1085,7 @@ fn rejects_unsupported_model_version() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+            prompt_doc: None,
     };
     let assets = vec![image_asset("img-1", "角色图", "/tmp/role.png")];
     let resolved = resolve_task_inputs(&task, &assets, &[]).expect("inputs resolve");
@@ -1095,6 +1112,7 @@ fn rejects_unsupported_duration() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+            prompt_doc: None,
     };
     let assets = vec![image_asset("img-1", "角色图", "/tmp/role.png")];
     let resolved = resolve_task_inputs(&task, &assets, &[]).expect("inputs resolve");
@@ -1121,6 +1139,7 @@ fn rejects_unsupported_resolution() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+            prompt_doc: None,
     };
     let assets = vec![image_asset("img-1", "角色图", "/tmp/role.png")];
     let resolved = resolve_task_inputs(&task, &assets, &[]).expect("inputs resolve");
@@ -1142,6 +1161,7 @@ fn duplicate_at_mentions_do_not_produce_duplicate_asset_ids() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+            prompt_doc: None,
     };
     let assets = vec![image_asset("img-wewei", "威威正面", "/tmp/wewei.png")];
     let roles = vec![Role {
@@ -1174,6 +1194,7 @@ fn auto_match_off_does_not_bind_role_media() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
+            prompt_doc: None,
     };
     let assets = vec![
         image_asset("img-1", "角色图", "/tmp/role.png"),
