@@ -5,6 +5,7 @@ import {
   deriveRoleChips,
   filterItems,
   moveGridFocus,
+  sortByFrecency,
   CATEGORIES,
   CATEGORY_LABELS,
 } from '../material-mention-picker-utils.js';
@@ -29,7 +30,7 @@ const MaterialMentionPicker = React.forwardRef(function MaterialMentionPicker(
   ref,
 ) {
   const [search, setSearch] = useState(query);
-  const [activeCategory, setActiveCategory] = useState('all');
+  const [activeCategory, setActiveCategory] = useState('recent');
   const [activeRoleId, setActiveRoleId] = useState('all');
   const [selectedKey, setSelectedKey] = useState(null);
   const [playingKey, setPlayingKey] = useState(null);
@@ -44,20 +45,25 @@ const MaterialMentionPicker = React.forwardRef(function MaterialMentionPicker(
     [normalizedItems, search, activeCategory, activeRoleId],
   );
 
+  const sortedFiltered = useMemo(
+    () => sortByFrecency(filtered),
+    [filtered],
+  );
+
   const selectedItem = useMemo(() => {
     if (selectedKey) {
-      const found = filtered.find((i) => i.key === selectedKey);
+      const found = sortedFiltered.find((i) => i.key === selectedKey);
       if (found) return found;
     }
-    return filtered[0] || null;
-  }, [filtered, selectedKey]);
+    return sortedFiltered[0] || null;
+  }, [sortedFiltered, selectedKey]);
 
   // 过滤结果变化时重置选中
   useEffect(() => {
-    if (!filtered.find((i) => i.key === selectedKey)) {
-      setSelectedKey(filtered[0]?.key || null);
+    if (!sortedFiltered.find((i) => i.key === selectedKey)) {
+      setSelectedKey(sortedFiltered[0]?.key || null);
     }
-  }, [filtered]);
+  }, [sortedFiltered]);
 
   // 同步外部 query → 内部 search
   useEffect(() => {
@@ -113,15 +119,15 @@ const MaterialMentionPicker = React.forwardRef(function MaterialMentionPicker(
         return false;
       }
       if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(event.key)) {
-        const currentIdx = filtered.findIndex((i) => i.key === selectedItem?.key);
+        const currentIdx = sortedFiltered.findIndex((i) => i.key === selectedItem?.key);
         const cols = activeCategory === 'role_audio' ? 1 : GRID_COLS;
-        const newIdx = moveGridFocus(currentIdx, event.key, cols, filtered.length);
-        if (filtered[newIdx]) setSelectedKey(filtered[newIdx].key);
+        const newIdx = moveGridFocus(currentIdx, event.key, cols, sortedFiltered.length);
+        if (sortedFiltered[newIdx]) setSelectedKey(sortedFiltered[newIdx].key);
         return true;
       }
       return false;
     },
-  }), [selectedItem, filtered, handleInsert, handleClose, activeCategory]);
+  }), [selectedItem, sortedFiltered, handleInsert, handleClose, activeCategory]);
 
   const panelStyle = panelWidth ? { width: Math.min(panelWidth, 1220) } : undefined;
 
@@ -183,14 +189,14 @@ const MaterialMentionPicker = React.forwardRef(function MaterialMentionPicker(
 
         {/* 素材网格 */}
         <div className="mmp-grid-scroll">
-          {filtered.length === 0 ? (
+          {sortedFiltered.length === 0 ? (
             <div className="mmp-empty">
               <span>未找到匹配的素材</span>
-              {(search || activeCategory !== 'all' || activeRoleId !== 'all') ? (
+              {(search || activeRoleId !== 'all') ? (
                 <button
                   type="button"
                   className="mmp-clear-filter"
-                  onClick={() => { setSearch(''); setActiveCategory('all'); setActiveRoleId('all'); }}
+                  onClick={() => { setSearch(''); setActiveCategory('recent'); setActiveRoleId('all'); }}
                 >
                   清除筛选
                 </button>
@@ -198,7 +204,7 @@ const MaterialMentionPicker = React.forwardRef(function MaterialMentionPicker(
             </div>
           ) : (
             <div className={`mmp-grid${activeCategory === 'role_audio' ? ' mmp-grid-audio' : ''}`}>
-              {filtered.map((item) => {
+              {sortedFiltered.map((item) => {
                 const isSelected = selectedItem?.key === item.key;
                 const isPlaying = playingKey === item.key;
 

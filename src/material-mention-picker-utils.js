@@ -3,14 +3,13 @@
  * 素材候选归一化、分类过滤、角色 chip 派生、键盘网格移动等纯函数。
  */
 
-export const CATEGORIES = ['all', 'role_image', 'role_audio', 'temp_image', 'recent'];
+export const CATEGORIES = ['recent', 'role_image', 'role_audio', 'temp_image'];
 
 export const CATEGORY_LABELS = {
-  all: '全部',
+  recent: '最近使用',
   role_image: '角色图片',
   role_audio: '角色音频',
   temp_image: '临时图片',
-  recent: '最近使用',
 };
 
 /**
@@ -45,6 +44,7 @@ export function normalizeMentionItems(mentionItems = []) {
         assetName: item.assetName || item.label,
         searchText,
         isRecent: item.isRecent || false,
+        lastUsedAt: item.lastUsedAt || '',
         mime: item.mime || '',
         createdAt: item.createdAt || '',
         sourceHint: item.sourceHint || '',
@@ -88,9 +88,8 @@ export function filterItems(normalizedItems, { query = '', category = 'all', rol
     result = result.filter((i) => i.displayType === 'role_audio');
   } else if (category === 'temp_image') {
     result = result.filter((i) => i.displayType === 'temp_image');
-  } else if (category === 'recent') {
-    result = result.filter((i) => i.isRecent);
   }
+  // 'recent' shows all items sorted by frecency (handled separately via sortByFrecency)
 
   if (roleId === 'other') {
     result = result.filter((i) => !i.roleId);
@@ -131,7 +130,25 @@ export function moveGridFocus(currentIndex, direction, cols, total) {
 }
 
 /**
- * 把最近使用的素材排到前面（基于 assetId 列表）。
+ * 基于 frecency（频率+新近度）排序：优先按 last_used_at 倒序，
+ * 从未使用过的回落 created_at；再按 isRecent 标志微调。
+ */
+export function sortByFrecency(normalizedItems) {
+  const now = Date.now();
+  return [...normalizedItems].sort((a, b) => {
+    const aLast = a.lastUsedAt ? new Date(a.lastUsedAt).getTime() : 0;
+    const bLast = b.lastUsedAt ? new Date(b.lastUsedAt).getTime() : 0;
+    // 优先：最近使用时间（倒序）
+    if (aLast !== bLast) return bLast - aLast;
+    // 次优：创建时间（倒序）
+    const aCreated = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+    const bCreated = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+    return bCreated - aCreated;
+  });
+}
+
+/**
+ * 把最近使用的素材排到前面（基于 assetId 列表）。保留向后兼容。
  */
 export function sortByRecent(normalizedItems, recentAssetIds = []) {
   if (!recentAssetIds.length) return normalizedItems;

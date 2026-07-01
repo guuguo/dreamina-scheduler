@@ -132,11 +132,10 @@ test('filterItems category + roleId combination works', () => {
   assert.equal(result.length, 2);
 });
 
-test('filterItems recent category only returns isRecent items', () => {
+test('filterItems recent category shows all items (no isRecent filter)', () => {
   const items = normalizeMentionItems(sampleItems).map((i, idx) => ({ ...i, isRecent: idx === 0 }));
   const result = filterItems(items, { category: 'recent' });
-  assert.equal(result.length, 1);
-  assert.ok(result[0].isRecent);
+  assert.equal(result.length, items.length);
 });
 
 // ── moveGridFocus ─────────────────────────────────────────────────────────

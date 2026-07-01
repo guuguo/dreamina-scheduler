@@ -35,6 +35,7 @@ export function buildMentionItems({ roles = [], assetById = new Map(), tempImage
         storedPath: asset.stored_path,
         mime: asset.mime || '',
         createdAt: asset.created_at || '',
+        lastUsedAt: asset.last_used_at || '',
         isRecent: isRecentlyUsed(asset),
         sourceHint: `角色库 / ${role.name}`,
       });
@@ -53,6 +54,7 @@ export function buildMentionItems({ roles = [], assetById = new Map(), tempImage
         duration_seconds: asset.duration_seconds || null,
         mime: asset.mime || '',
         createdAt: asset.created_at || '',
+        lastUsedAt: asset.last_used_at || '',
         isRecent: isRecentlyUsed(asset),
         sourceHint: `角色库 / ${role.name}`,
       });
@@ -95,6 +97,7 @@ export function buildMentionItems({ roles = [], assetById = new Map(), tempImage
           isRecent: isRecentlyUsed(asset),
           mime: asset.mime || '',
           createdAt: asset.created_at || '',
+          lastUsedAt: asset.last_used_at || '',
           sourceHint: '临时图库',
         });
       }
