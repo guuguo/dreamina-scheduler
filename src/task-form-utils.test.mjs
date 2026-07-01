@@ -22,6 +22,12 @@ test('createEmptyTaskForm defaults new video tasks to 15 seconds', () => {
   assert.equal(form.params.ratio, '9:16');
 });
 
+test('createEmptyTaskForm includes prompt_doc as null', () => {
+  const form = createEmptyTaskForm();
+  assert.equal(form.prompt_doc, null);
+  assert.ok('prompt_doc' in form);
+});
+
 test('TASK_PROMPT_MAX_LENGTH allows editing full video scripts', () => {
   assert.ok(TASK_PROMPT_MAX_LENGTH >= 10000);
 });

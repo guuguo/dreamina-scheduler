@@ -191,6 +191,7 @@ export function buildTaskFormFromTaskForEdit(task, assetById = new Map()) {
     scheduled_at: '',
     temp_image_paths: tempImagePaths,
     temp_image_asset_ids: tempImageAssetIds,
+    prompt_doc: task?.prompt_doc || null,
     params: {
       model_version: task?.params?.model_version || 'seedance2.0',
       ratio: task?.params?.ratio || '9:16',

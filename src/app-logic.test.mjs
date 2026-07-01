@@ -302,6 +302,19 @@ test('editing an older task without duration falls back to 15 seconds', () => {
   assert.equal(form.params.duration, 15);
 });
 
+test('buildTaskFormFromTaskForEdit preserves prompt_doc from task', () => {
+  const doc = { type: 'doc', content: [{ type: 'paragraph' }] };
+  const task = { prompt: 'hello', prompt_doc: doc };
+  const form = buildTaskFormFromTaskForEdit(task);
+  assert.deepEqual(form.prompt_doc, doc);
+});
+
+test('buildTaskFormFromTaskForEdit sets prompt_doc to null when absent', () => {
+  const task = { prompt: 'hello' };
+  const form = buildTaskFormFromTaskForEdit(task);
+  assert.equal(form.prompt_doc, null);
+});
+
 test('duplicating a task creates a new unscheduled draft form with copied content', () => {
   const task = {
     prompt: '@图片1 生成视频',

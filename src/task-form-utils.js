@@ -48,6 +48,7 @@ export function createEmptyTaskForm() {
     scheduled_at: '',
     temp_image_paths: [],
     temp_image_asset_ids: [],
+    prompt_doc: null,
     params: {
       model_version: 'seedance2.0',
       ratio: '9:16',
