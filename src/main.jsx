@@ -30,7 +30,7 @@ import {
   IMAGEGEN_MAX_REFERENCES,
 } from './imagegen-utils.js';
 import PromptMentionEditor from './components/PromptMentionEditor.jsx';
-import { applyMentionRefsToTaskForm } from './prompt-editor-utils.js';
+import { applyEditorUpdate, applyMentionRefsToTaskForm } from './prompt-editor-utils.js';
 import {
   deriveCurrentExecutionRecord,
   deriveCurrentQueryRecords,
@@ -1247,11 +1247,10 @@ function CreateTaskView({ state, assetById, taskForm, setTaskForm, setActiveView
     });
   }, [mentionItems, setTaskForm, taskForm.prompt]);
 
-  // Single atomic update: merges plain text + mention-derived bindings in one setTaskForm call.
-  // Preserves role_ids added via role picker by only overwriting the mention-derived subset.
-  const handleEditorUpdate = useCallback((plainText, refs) => {
+  // Doc-first editor update: persists prompt_doc alongside derived prompt + mention bindings.
+  const handleEditorUpdate = useCallback(({ plainText, refs, doc }) => {
     setTaskForm((current) => {
-      return applyMentionRefsToTaskForm({ ...current, prompt: plainText }, refs);
+      return applyEditorUpdate(current, { plainText, refs, doc });
     });
   }, []);
 
@@ -1376,6 +1375,7 @@ function CreateTaskView({ state, assetById, taskForm, setTaskForm, setActiveView
                 ) : null}
                 <PromptMentionEditor
                   value={taskForm.prompt}
+                  promptDoc={taskForm.prompt_doc}
                   mentionItems={mentionItems}
                   maxLength={TASK_PROMPT_MAX_LENGTH}
                   placeholder="@女主日常服 在海边漫步，阳光照在身上，海浪轻轻打沙滩，微风拂动长发，画面唯美治愈。"
@@ -4835,6 +4835,7 @@ function ImageGenView({
               </div>
               <PromptMentionEditor
                 value={imagegenForm.prompt}
+                promptDoc={imagegenForm.prompt_doc}
                 mentionItems={mentionItems}
                 maxLength={8000}
                 placeholder="描述想要生成的图片，输入 @ 可引用素材图…"

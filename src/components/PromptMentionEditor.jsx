@@ -31,6 +31,7 @@ import { convertFileSrc } from '@tauri-apps/api/core';
  */
 export default function PromptMentionEditor({
   value,
+  promptDoc,
   mentionItems,
   maxLength = 1000,
   placeholder = '',
@@ -270,7 +271,7 @@ export default function PromptMentionEditor({
       setPromptText(text);
       textLengthRef.current = text.length;
       const refs = extractMentionRefsFromTiptapDoc(json);
-      onUpdate?.(text, refs);
+      onUpdate?.({ plainText: text, refs, doc: json });
     },
   });
 
@@ -278,7 +279,16 @@ export default function PromptMentionEditor({
 
   useEffect(() => {
     if (!editor || editorInitializedRef.current) return;
-    if (value) {
+    if (promptDoc) {
+      // Doc-first: load from stored TipTap JSON for stable mentions
+      isInternalUpdateRef.current = true;
+      editor.commands.setContent(promptDoc);
+      isInternalUpdateRef.current = false;
+      const text = getPromptTextFromTiptapEditor(editor);
+      lastSyncedValueRef.current = text;
+      setPromptText(text);
+      textLengthRef.current = text.length;
+    } else if (value) {
       const doc = promptTextToTiptapDoc(value, mentionItems);
       isInternalUpdateRef.current = true;
       editor.commands.setContent(doc);
@@ -289,10 +299,21 @@ export default function PromptMentionEditor({
       textLengthRef.current = text.length;
     }
     editorInitializedRef.current = true;
-  }, [editor, value, mentionItems]);
+  }, [editor, value, promptDoc, mentionItems]);
 
   useEffect(() => {
     if (!editor || !editorInitializedRef.current) return;
+    if (promptDoc) {
+      // Doc-first sync: load from stored doc when switching tasks
+      isInternalUpdateRef.current = true;
+      editor.commands.setContent(promptDoc);
+      isInternalUpdateRef.current = false;
+      const text = getPromptTextFromTiptapEditor(editor);
+      lastSyncedValueRef.current = text;
+      setPromptText(text);
+      textLengthRef.current = text.length;
+      return;
+    }
     const externalValue = value || '';
     if (!shouldSyncExternalPromptValue({
       editorText: getPromptTextFromTiptapEditor(editor),
@@ -310,7 +331,7 @@ export default function PromptMentionEditor({
     const text = getPromptTextFromTiptapEditor(editor);
     setPromptText(text);
     textLengthRef.current = text.length;
-  }, [editor, value, mentionItems]);
+  }, [editor, value, promptDoc, mentionItems]);
 
   // ── Clipboard image paste handlers ──
 
