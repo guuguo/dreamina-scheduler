@@ -1,3 +1,15 @@
+import { getRoleMedia } from './app-logic.js';
+
+const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
+
+function isRecentlyUsed(asset) {
+  const now = Date.now();
+  const lastUsedMs = asset.last_used_at ? new Date(asset.last_used_at).getTime() : 0;
+  const createdMs = asset.created_at ? new Date(asset.created_at).getTime() : 0;
+  const referenceMs = lastUsedMs || createdMs;
+  return referenceMs > 0 && (now - referenceMs <= THREE_DAYS_MS);
+}
+
 export function buildMentionItems({ roles = [], assetById = new Map(), tempImagePaths = [], tempImageAssetIds = [] }) {
   const items = [];
   for (const role of roles) {
@@ -23,6 +35,7 @@ export function buildMentionItems({ roles = [], assetById = new Map(), tempImage
         storedPath: asset.stored_path,
         mime: asset.mime || '',
         createdAt: asset.created_at || '',
+        isRecent: isRecentlyUsed(asset),
         sourceHint: `角色库 / ${role.name}`,
       });
     });
@@ -40,6 +53,7 @@ export function buildMentionItems({ roles = [], assetById = new Map(), tempImage
         duration_seconds: asset.duration_seconds || null,
         mime: asset.mime || '',
         createdAt: asset.created_at || '',
+        isRecent: isRecentlyUsed(asset),
         sourceHint: `角色库 / ${role.name}`,
       });
     });
@@ -58,7 +72,6 @@ export function buildMentionItems({ roles = [], assetById = new Map(), tempImage
   const currentTempIds = new Set(tempImageAssetIds.filter(Boolean));
   const usedLabels = new Set(items.filter((item) => item.type === 'temp_image').map((item) => item.label));
   const TEN_DAYS_MS = 10 * 24 * 60 * 60 * 1000;
-  const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
   const now = Date.now();
 
   assetById.forEach((asset, id) => {
@@ -79,7 +92,7 @@ export function buildMentionItems({ roles = [], assetById = new Map(), tempImage
           assetId: asset.id,
           path: asset.stored_path,
           storedPath: asset.stored_path,
-          isRecent: now - createdMs <= THREE_DAYS_MS,
+          isRecent: isRecentlyUsed(asset),
           mime: asset.mime || '',
           createdAt: asset.created_at || '',
           sourceHint: '临时图库',

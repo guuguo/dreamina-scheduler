@@ -23,6 +23,7 @@ fn image_asset(id: &str, name: &str, path: &str) -> Asset {
         duration_seconds: None,
         created_at: String::new(),
         content_hash: None,
+    last_used_at: None,
     }
 }
 
@@ -87,6 +88,7 @@ fn audio_asset(id: &str, name: &str, path: &str) -> Asset {
         duration_seconds: Some(4.0),
         created_at: String::new(),
         content_hash: None,
+    last_used_at: None,
     }
 }
 
@@ -929,6 +931,7 @@ fn rejects_video_asset_type() {
         duration_seconds: Some(5.0),
         created_at: String::new(),
         content_hash: None,
+    last_used_at: None,
     };
     let assets = vec![image_asset("img-1", "角色图", "/tmp/role.png"), video_asset];
     let result = resolve_task_inputs(&task, &assets, &[]);

@@ -30,6 +30,7 @@ fn image_asset(id: &str, name: &str, path: &str) -> Asset {
         duration_seconds: None,
         created_at: String::new(),
         content_hash: None,
+    last_used_at: None,
     }
 }
 
@@ -47,6 +48,7 @@ fn audio_asset(id: &str, name: &str, path: &str) -> Asset {
         duration_seconds: Some(3.0),
         created_at: String::new(),
         content_hash: None,
+    last_used_at: None,
     }
 }
 

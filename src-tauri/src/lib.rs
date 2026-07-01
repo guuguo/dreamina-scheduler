@@ -66,6 +66,8 @@ pub struct Asset {
     pub created_at: String,
     #[serde(default)]
     pub content_hash: Option<String>,
+    #[serde(default)]
+    pub last_used_at: Option<String>,
 }
 
 impl Asset {
@@ -125,6 +127,7 @@ impl Asset {
             duration_seconds: None,
             created_at: now_rfc3339(),
             content_hash: None,
+            last_used_at: None,
         })
     }
 }
@@ -244,6 +247,7 @@ pub fn save_clipboard_image_asset(
         duration_seconds: None,
         created_at: now_rfc3339(),
         content_hash: Some(content_hash.clone()),
+        last_used_at: None,
     };
     data.asset_hash_index.insert(content_hash, asset.id.clone());
     data.assets.push(asset.clone());
@@ -3577,6 +3581,15 @@ fn draft_from_task(task: &ScheduledTask) -> TaskDraft {
     }
 }
 
+fn touch_asset_last_used(data: &mut AppData, image_ids: &[String], audio_ids: &[String]) {
+    let now = now_rfc3339();
+    for asset in &mut data.assets {
+        if image_ids.contains(&asset.id) || audio_ids.contains(&asset.id) {
+            asset.last_used_at = Some(now.clone());
+        }
+    }
+}
+
 fn validate_draft_references(data: &AppData, draft: &TaskDraft) -> Result<(), SchedulerError> {
     for asset_id in draft
         .image_asset_ids
@@ -6225,6 +6238,7 @@ pub mod commands {
                     },
                 );
                 data.tasks.push(task.clone());
+                touch_asset_last_used(data, &task.image_asset_ids, &task.audio_asset_ids);
                 Ok(task)
             })
             .map_err(|error| error.to_string())
@@ -7748,6 +7762,7 @@ pub mod commands {
                         module: None,
                     },
                 );
+                touch_asset_last_used(data, &task.image_asset_ids, &task.audio_asset_ids);
                 Ok(task)
             })
             .map_err(|error| error.to_string())
@@ -8691,6 +8706,7 @@ mod tests {
             duration_seconds: None,
             created_at: "2026-05-01T00:00:00Z".to_string(),
             content_hash: None,
+            last_used_at: None,
         }
     }
 
