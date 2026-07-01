@@ -1318,9 +1318,8 @@ function CreateTaskView({ state, assetById, taskForm, setTaskForm, setActiveView
       ...current,
       audio_asset_ids: [...(current.audio_asset_ids || []), asset.id],
     }));
-    await refreshState();
     return asset;
-  }, [pasteClipboardImage, refreshState]);
+  }, [pasteClipboardImage]);
 
   const canSaveDraft = canSaveTaskDraft(taskForm);
   const canApplyPreset = canApplyCreateTaskPreset(taskForm);
@@ -4696,7 +4695,7 @@ function ImageGenView({
     [imagegenForm.image_asset_ids, assetById],
   );
 
-  const handleEditorUpdate = useCallback((plainText, refs) => {
+  const handleEditorUpdate = useCallback(({ plainText, refs }) => {
     if (refs?.imageAssetIds?.length) {
       console.log('[imagegen] @mention imageAssetIds:', refs.imageAssetIds);
     }
