@@ -1312,6 +1312,16 @@ function CreateTaskView({ state, assetById, taskForm, setTaskForm, setActiveView
     return asset;
   }, [pasteSystemClipboardImage]);
 
+  const handlePasteAudioForEditor = useCallback(async (file) => {
+    const asset = await pasteClipboardImage(file);
+    setTaskForm((current) => ({
+      ...current,
+      audio_asset_ids: [...(current.audio_asset_ids || []), asset.id],
+    }));
+    await refreshState();
+    return asset;
+  }, [pasteClipboardImage, refreshState]);
+
   const canSaveDraft = canSaveTaskDraft(taskForm);
   const canApplyPreset = canApplyCreateTaskPreset(taskForm);
   const isEditingTask = Boolean(editingTaskId);
@@ -1419,6 +1429,7 @@ function CreateTaskView({ state, assetById, taskForm, setTaskForm, setActiveView
                   onUpdate={handleEditorUpdate}
                   onPasteImage={handlePasteImageForEditor}
                   onPasteSystemImage={handlePasteSystemImageForEditor}
+                  onPasteAudio={handlePasteAudioForEditor}
                   onMentionClick={handleMentionClick}
                   tempImagePaths={taskForm.temp_image_paths}
                 />

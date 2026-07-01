@@ -224,22 +224,27 @@ pub fn save_clipboard_image_asset(
         match extension.as_str() {
             "jpg" | "jpeg" => "image/jpeg",
             "webp" => "image/webp",
+            "mp3" => "audio/mpeg",
+            "wav" => "audio/wav",
+            "m4a" => "audio/mp4",
+            "aac" => "audio/aac",
             _ => "image/png",
         }
         .to_string()
     } else {
         input.mime
     };
+    let is_audio = mime.starts_with("audio/");
     let asset = Asset {
         id,
-        kind: AssetKind::Image,
-        name: "粘贴图片".to_string(),
+        kind: if is_audio { AssetKind::Audio } else { AssetKind::Image },
+        name: if is_audio { "粘贴音频".to_string() } else { "粘贴图片".to_string() },
         aliases: vec![],
-        tags: vec![
-            "clipboard".to_string(),
-            "temporary".to_string(),
-            "temp_image".to_string(),
-        ],
+        tags: if is_audio {
+            vec!["clipboard".to_string(), "temporary".to_string(), "temp_audio".to_string()]
+        } else {
+            vec!["clipboard".to_string(), "temporary".to_string(), "temp_image".to_string()]
+        },
         stored_path: stored_path.to_string_lossy().to_string(),
         source_path: "clipboard".to_string(),
         mime,

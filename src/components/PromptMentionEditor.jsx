@@ -233,7 +233,19 @@ export default function PromptMentionEditor({
           }
         }
 
-        if (!imageItem && onPasteSystemImage) {
+        const audioItem = items.find(
+          (item) => item.kind === 'file' && item.type.startsWith('audio/')
+        );
+        if (audioItem && onPasteAudio) {
+          const file = audioItem.getAsFile();
+          if (file) {
+            event.preventDefault();
+            handleAudioPaste(file);
+            return true;
+          }
+        }
+
+        if (!imageItem && !audioItem && onPasteSystemImage) {
           const hasText = (event.clipboardData?.getData('text') || '') !== '';
           if (!hasText) {
             event.preventDefault();
@@ -354,6 +366,22 @@ export default function PromptMentionEditor({
     editor.chain().focus().insertContent(' ').run();
   }, [editor, mentionItems]);
 
+  const insertTempAudioMention = useCallback((asset) => {
+    if (!editor) return;
+    const label = `音频${Date.now().toString(36)}`;
+    editor.chain().focus().insertContent({
+      type: 'mention',
+      attrs: {
+        id: `temp_audio:${asset.id}`,
+        label,
+        type: 'audio',
+        roleId: '',
+        assetId: asset.id,
+      },
+    }).run();
+    editor.chain().focus().insertContent(' ').run();
+  }, [editor]);
+
   const handleImagePaste = useCallback(async (file) => {
     if (!onPasteImage || !editor) return;
     try {
@@ -363,6 +391,16 @@ export default function PromptMentionEditor({
       console.error('Clipboard image paste failed:', err);
     }
   }, [onPasteImage, editor, insertTempImageMention]);
+
+  const handleAudioPaste = useCallback(async (file) => {
+    if (!onPasteAudio || !editor) return;
+    try {
+      const asset = await onPasteAudio(file);
+      if (asset) insertTempAudioMention(asset);
+    } catch (err) {
+      console.error('Clipboard audio paste failed:', err);
+    }
+  }, [onPasteAudio, editor, insertTempAudioMention]);
 
   const handleSystemImagePaste = useCallback(async () => {
     if (!onPasteSystemImage || !editor) return;
