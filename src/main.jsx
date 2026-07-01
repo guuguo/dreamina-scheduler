@@ -1254,6 +1254,18 @@ function CreateTaskView({ state, assetById, taskForm, setTaskForm, setActiveView
     });
   }, []);
 
+  // Mention click: open image preview or audio playback
+  const handleMentionClick = useCallback(({ type, assetId }) => {
+    if (!assetId) return;
+    const asset = assetById.get(assetId);
+    if (!asset?.stored_path) return;
+    if (type === 'image' || type === 'temp_image') {
+      openImagePreview(asset.stored_path, asset.name);
+    } else if (type === 'audio') {
+      setAudioPreviewAsset(asset);
+    }
+  }, [assetById, openImagePreview, setAudioPreviewAsset]);
+
   // Paste wrappers that atomically add temp image state before returning the asset.
   const handlePasteImageForEditor = useCallback(async (file) => {
     const asset = await pasteClipboardImage(file);
@@ -1382,6 +1394,7 @@ function CreateTaskView({ state, assetById, taskForm, setTaskForm, setActiveView
                   onUpdate={handleEditorUpdate}
                   onPasteImage={handlePasteImageForEditor}
                   onPasteSystemImage={handlePasteSystemImageForEditor}
+                  onMentionClick={handleMentionClick}
                   tempImagePaths={taskForm.temp_image_paths}
                 />
                 <div className="info-strip">

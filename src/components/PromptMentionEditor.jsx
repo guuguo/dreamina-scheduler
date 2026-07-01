@@ -38,6 +38,8 @@ export default function PromptMentionEditor({
   onUpdate,
   onPasteImage,
   onPasteSystemImage,
+  onPasteAudio,
+  onMentionClick,
   tempImagePaths,
 }) {
   const editorInitializedRef = useRef(false);
@@ -379,10 +381,22 @@ export default function PromptMentionEditor({
     [promptText, mentionItems]
   );
 
+  // ── Mention click handler ──
+
+  const handleEditorClick = useCallback((event) => {
+    const mentionEl = event.target.closest?.('.prompt-mention-node');
+    if (!mentionEl || !onMentionClick) return;
+    onMentionClick({
+      type: mentionEl.dataset.type,
+      assetId: mentionEl.dataset.assetId,
+      roleId: mentionEl.dataset.roleId,
+    });
+  }, [onMentionClick]);
+
   // ── Render ──
 
   return (
-    <div className="prompt-editor">
+    <div className="prompt-editor" onClick={handleEditorClick}>
       <EditorContent editor={editor} className="prompt-tiptap-editor" />
       <span className="field-count">{promptText.length}/{maxLength}</span>
       {promptMentions.length ? (
