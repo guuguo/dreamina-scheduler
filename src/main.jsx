@@ -1206,15 +1206,40 @@ function CreateTaskView({ state, assetById, taskForm, setTaskForm, setActiveView
     setPreviewAlt(alt || '');
   };
 
-  const boundResources = useMemo(() => getTaskHitResources({
-    image_asset_ids: taskForm.image_asset_ids || [],
-    temp_image_asset_ids: taskForm.temp_image_asset_ids || [],
-    audio_asset_ids: taskForm.audio_asset_ids || [],
-  }, assetById), [
+  // Extract mention labels from prompt_doc for displayName alignment
+  const mentionAttrsByAssetId = useMemo(() => {
+    const doc = taskForm.prompt_doc;
+    if (!doc) return new Map();
+    const map = new Map();
+    const walk = (node) => {
+      if (node.type === 'mention' && node.attrs?.assetId) {
+        if (!map.has(node.attrs.assetId)) {
+          map.set(node.attrs.assetId, { label: node.attrs.label, type: node.attrs.type });
+        }
+      }
+      (node.content || []).forEach(walk);
+    };
+    walk(doc);
+    return map;
+  }, [taskForm.prompt_doc]);
+
+  const boundResources = useMemo(() => {
+    const resources = getTaskHitResources({
+      image_asset_ids: taskForm.image_asset_ids || [],
+      temp_image_asset_ids: taskForm.temp_image_asset_ids || [],
+      audio_asset_ids: taskForm.audio_asset_ids || [],
+    }, assetById);
+    // Override displayName with mention label from prompt_doc when available
+    return resources.map((item) => ({
+      ...item,
+      displayName: mentionAttrsByAssetId.get(item.asset.id)?.label || item.displayName,
+    }));
+  }, [
     assetById,
     taskForm.image_asset_ids,
     taskForm.temp_image_asset_ids,
     taskForm.audio_asset_ids,
+    mentionAttrsByAssetId,
   ]);
   const boundRoleImages = boundResources.filter((item) => item.displayType === 'role_image');
   const boundTempImages = boundResources.filter((item) => item.displayType === 'temp_image');
@@ -1454,12 +1479,13 @@ function CreateTaskView({ state, assetById, taskForm, setTaskForm, setActiveView
               </div>
               {boundRoleImages.length ? (
                 <div className="resource-thumb-row">
-                  {boundRoleImages.map(({ asset }) => (
+                  {boundRoleImages.map((item) => (
                     <Thumb
-                      key={asset.id}
-                      asset={asset}
-                      label={asset.name}
-                      onClick={() => openImagePreview(asset.stored_path, asset.name)}
+                      key={item.asset.id}
+                      asset={item.asset}
+                      label={item.displayName}
+                      subLabel={item.subName !== item.displayName ? item.subName : null}
+                      onClick={() => openImagePreview(item.asset.stored_path, item.displayName)}
                     />
                   ))}
                 </div>
@@ -1492,12 +1518,13 @@ function CreateTaskView({ state, assetById, taskForm, setTaskForm, setActiveView
               </div>
               {boundTempImages.length ? (
                 <div className="resource-thumb-row">
-                  {boundTempImages.map(({ asset }) => (
+                  {boundTempImages.map((item) => (
                     <Thumb
-                      key={asset.id}
-                      asset={asset}
-                      label={asset.name}
-                      onClick={() => openImagePreview(asset.stored_path, asset.name)}
+                      key={item.asset.id}
+                      asset={item.asset}
+                      label={item.displayName}
+                      subLabel={item.subName !== item.displayName ? item.subName : null}
+                      onClick={() => openImagePreview(item.asset.stored_path, item.displayName)}
                     />
                   ))}
                 </div>

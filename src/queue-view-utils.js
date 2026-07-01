@@ -142,6 +142,7 @@ export function getTaskResultItems(task) {
 export function getTaskHitResources(task, assetById) {
   if (!task || !assetById) return [];
   const resources = [];
+  let index = 0;
   for (const id of task.image_asset_ids || []) {
     const asset = assetById.get(id);
     if (asset) {
@@ -151,6 +152,9 @@ export function getTaskHitResources(task, assetById) {
         displayType: isTempImage ? 'temp_image' : 'role_image',
         label: isTempImage ? '临时参考图' : '角色图片',
         asset,
+        displayName: asset.name || '',
+        subName: asset.name || '',
+        mentionIndex: ++index,
       });
     }
   }
@@ -162,6 +166,9 @@ export function getTaskHitResources(task, assetById) {
         displayType: 'role_audio',
         label: '音频素材',
         asset,
+        displayName: asset.name || '',
+        subName: asset.name || '',
+        mentionIndex: ++index,
       });
     }
   }
@@ -171,6 +178,14 @@ export function getTaskHitResources(task, assetById) {
 function isTemporaryImageAsset(asset) {
   const tags = new Set(asset?.tags || []);
   return tags.has('temp_image') || tags.has('temporary') || tags.has('clipboard');
+}
+
+/**
+ * Derive a user-facing display name for a resource.
+ * Prefers mention label (from prompt_doc mention attrs) over asset name.
+ */
+export function displayName(asset, mentionAttrs) {
+  return mentionAttrs?.label || asset?.name || '';
 }
 
 export function getCommandPreviewPresentation(commandText) {

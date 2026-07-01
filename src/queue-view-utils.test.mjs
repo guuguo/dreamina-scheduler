@@ -281,10 +281,10 @@ test('getTaskHitResources: returns image resources before audio resources in tas
   ]);
 
   assert.deepEqual(getTaskHitResources(task, assets), [
-    { type: 'image', displayType: 'role_image', label: '角色图片', asset: assets.get('img-2') },
-    { type: 'image', displayType: 'role_image', label: '角色图片', asset: assets.get('img-1') },
-    { type: 'audio', displayType: 'role_audio', label: '音频素材', asset: assets.get('aud-1') },
-    { type: 'audio', displayType: 'role_audio', label: '音频素材', asset: assets.get('aud-2') },
+    { type: 'image', displayType: 'role_image', label: '角色图片', asset: assets.get('img-2'), displayName: '图片 2', subName: '图片 2', mentionIndex: 1 },
+    { type: 'image', displayType: 'role_image', label: '角色图片', asset: assets.get('img-1'), displayName: '图片 1', subName: '图片 1', mentionIndex: 2 },
+    { type: 'audio', displayType: 'role_audio', label: '音频素材', asset: assets.get('aud-1'), displayName: '音频 1', subName: '音频 1', mentionIndex: 3 },
+    { type: 'audio', displayType: 'role_audio', label: '音频素材', asset: assets.get('aud-2'), displayName: '音频 2', subName: '音频 2', mentionIndex: 4 },
   ]);
 });
 
@@ -297,7 +297,7 @@ test('getTaskHitResources: filters missing assets and handles empty task', () =>
     image_asset_ids: ['missing-img', 'img-1'],
     audio_asset_ids: ['missing-audio'],
   }), assets), [
-    { type: 'image', displayType: 'role_image', label: '角色图片', asset: assets.get('img-1') },
+    { type: 'image', displayType: 'role_image', label: '角色图片', asset: assets.get('img-1'), displayName: '图片 1', subName: '图片 1', mentionIndex: 1 },
   ]);
   assert.deepEqual(getTaskHitResources(null, assets), []);
 });
@@ -315,9 +315,9 @@ test('getTaskHitResources: distinguishes role images from temp images', () => {
   ]);
 
   assert.deepEqual(getTaskHitResources(task, assets), [
-    { type: 'image', displayType: 'role_image', label: '角色图片', asset: assets.get('img-role') },
-    { type: 'image', displayType: 'temp_image', label: '临时参考图', asset: assets.get('img-temp') },
-    { type: 'audio', displayType: 'role_audio', label: '音频素材', asset: assets.get('aud-1') },
+    { type: 'image', displayType: 'role_image', label: '角色图片', asset: assets.get('img-role'), displayName: '女主厨师服', subName: '女主厨师服', mentionIndex: 1 },
+    { type: 'image', displayType: 'temp_image', label: '临时参考图', asset: assets.get('img-temp'), displayName: '分镜图 1', subName: '分镜图 1', mentionIndex: 2 },
+    { type: 'audio', displayType: 'role_audio', label: '音频素材', asset: assets.get('aud-1'), displayName: '女主声音', subName: '女主声音', mentionIndex: 3 },
   ]);
 });
 
@@ -332,8 +332,8 @@ test('getTaskHitResources: does not mark role image as temp when temp ids contai
   ]);
 
   assert.deepEqual(getTaskHitResources(task, assets), [
-    { type: 'image', displayType: 'role_image', label: '角色图片', asset: assets.get('img-role') },
-    { type: 'image', displayType: 'temp_image', label: '临时参考图', asset: assets.get('img-temp') },
+    { type: 'image', displayType: 'role_image', label: '角色图片', asset: assets.get('img-role'), displayName: '厨师服', subName: '厨师服', mentionIndex: 1 },
+    { type: 'image', displayType: 'temp_image', label: '临时参考图', asset: assets.get('img-temp'), displayName: '分镜图 1', subName: '分镜图 1', mentionIndex: 2 },
   ]);
 });
 
@@ -347,7 +347,7 @@ test('getTaskHitResources: marks tagged temp image as temp even when task temp i
   ]);
 
   assert.deepEqual(getTaskHitResources(task, assets), [
-    { type: 'image', displayType: 'temp_image', label: '临时参考图', asset: assets.get('img-temp') },
+    { type: 'image', displayType: 'temp_image', label: '临时参考图', asset: assets.get('img-temp'), displayName: '粘贴图片', subName: '粘贴图片', mentionIndex: 1 },
   ]);
 });
 
