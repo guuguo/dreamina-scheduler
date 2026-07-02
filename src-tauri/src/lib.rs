@@ -6472,7 +6472,8 @@ pub mod commands {
             .mutate(|data| {
                 // 手动查询：重置退避状态，允许重新进入自动轮询
                 if let Some(t) = data.tasks.iter_mut().find(|t| t.id == task_id) {
-                    if t.submit_id == submit_id {
+                    if t.submit_id == submit_id && t.auto_query_stopped {
+                        // 仅在自动查询已停止时重置退避，避免干扰正在运行的自适应间隔
                         reset_query_backoff(t);
                     }
                 }
