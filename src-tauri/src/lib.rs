@@ -25,7 +25,7 @@ const SUPPORTED_MODELS: &[&str] = &["seedance2.0", "seedance2.0fast"];
 const MAX_IMAGES: usize = 9;
 const MAX_AUDIO: usize = 3;
 /// 自动查询最长等待时间（4小时），超过后停止自动查询，改为手动
-const MAX_WAIT_HOURS: i64 = 4;
+const MAX_WAIT_HOURS: i64 = 6;
 const MAX_NO_REMOTE_QUEUE_INFO_MINUTES: i64 = 5;
 /// 5xx 服务器错误自动重试上限次数
 const MAX_SERVER_ERROR_RETRIES: u32 = 2;
@@ -3487,6 +3487,27 @@ pub fn delete_execution_record_from_data(
         }
     }
     // remaining_has_current：当前 submit_id 对应记录仍在，顶层字段无需变更
+
+    // 清理 task.attempts 中关联被删记录的 entry，防止 backfill 重建
+    let remaining_submit_ids: Vec<String> = data.tasks[task_index]
+        .execution_records
+        .iter()
+        .map(|r| r.submit_id.clone())
+        .collect();
+    data.tasks[task_index].attempts.retain(|a| {
+        let cmd = a.command_preview.first().map(|s| s.as_str()).unwrap_or("");
+        if cmd == "multimodal2video" {
+            let raw = format!("{}\n{}", a.stdout, a.stderr);
+            let parsed = parse_submit_output(&raw);
+            let sid = parsed.submit_id.unwrap_or_default();
+            remaining_submit_ids.contains(&sid)
+        } else if cmd == "query_result" {
+            let sid = query_submit_id_from_attempt(a);
+            remaining_submit_ids.contains(&sid)
+        } else {
+            true
+        }
+    });
 
     data.tasks[task_index].updated_at = now_rfc3339();
     Ok(data.tasks[task_index].clone())
@@ -8655,8 +8676,8 @@ mod tests {
     }
 
     #[test]
-    fn is_past_max_wait_over_4_hours_returns_true() {
-        let past = (Utc::now() - Duration::hours(5)).to_rfc3339();
+    fn is_past_max_wait_over_6_hours_returns_true() {
+        let past = (Utc::now() - Duration::hours(7)).to_rfc3339();
         assert!(is_past_max_wait(
             &make_past_max_task(Some(&past)),
             Utc::now()
@@ -8664,8 +8685,8 @@ mod tests {
     }
 
     #[test]
-    fn is_past_max_wait_exactly_4_hours_returns_true() {
-        let past = (Utc::now() - Duration::hours(4)).to_rfc3339();
+    fn is_past_max_wait_exactly_6_hours_returns_true() {
+        let past = (Utc::now() - Duration::hours(6)).to_rfc3339();
         assert!(is_past_max_wait(
             &make_past_max_task(Some(&past)),
             Utc::now()
