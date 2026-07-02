@@ -134,7 +134,6 @@ export function moveGridFocus(currentIndex, direction, cols, total) {
  * 从未使用过的回落 created_at；再按 isRecent 标志微调。
  */
 export function sortByFrecency(normalizedItems) {
-  const now = Date.now();
   return [...normalizedItems].sort((a, b) => {
     const aLast = a.lastUsedAt ? new Date(a.lastUsedAt).getTime() : 0;
     const bLast = b.lastUsedAt ? new Date(b.lastUsedAt).getTime() : 0;

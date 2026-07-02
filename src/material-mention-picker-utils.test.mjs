@@ -6,6 +6,7 @@ import {
   filterItems,
   moveGridFocus,
   sortByRecent,
+  sortByFrecency,
 } from './material-mention-picker-utils.js';
 
 const sampleItems = [
@@ -189,4 +190,54 @@ test('sortByRecent marks only matched items as isRecent', () => {
   const recentItems = sorted.filter((i) => i.isRecent);
   assert.equal(recentItems.length, 1);
   assert.equal(recentItems[0].assetId, 'a1');
+});
+
+// ── sortByFrecency ──────────────────────────────────────────────────────────
+
+test('sortByFrecency puts recently used items first', () => {
+  const items = normalizeMentionItems([
+    { key: 'img:old', label: '旧图', type: 'image', assetId: 'old1', assetName: 'old', storedPath: '/old.jpg' },
+    { key: 'img:new', label: '新图', type: 'image', assetId: 'new1', assetName: 'new', storedPath: '/new.jpg' },
+  ]);
+  // Manually attach lastUsedAt to simulate persisted data
+  items[0].lastUsedAt = '2026-01-01T00:00:00Z';
+  items[1].lastUsedAt = '2026-07-01T00:00:00Z';
+  const sorted = sortByFrecency(items);
+  assert.equal(sorted[0].assetId, 'new1');
+  assert.equal(sorted[1].assetId, 'old1');
+});
+
+test('sortByFrecency falls back to created_at when lastUsedAt absent', () => {
+  const items = normalizeMentionItems([
+    { key: 'img:older', label: '旧创建', type: 'image', assetId: 'c1', assetName: 'c1', storedPath: '/c1.jpg' },
+    { key: 'img:newer', label: '新创建', type: 'image', assetId: 'c2', assetName: 'c2', storedPath: '/c2.jpg' },
+  ]);
+  items[0].lastUsedAt = '';
+  items[0].createdAt = '2026-01-01T00:00:00Z';
+  items[1].lastUsedAt = '';
+  items[1].createdAt = '2026-07-01T00:00:00Z';
+  const sorted = sortByFrecency(items);
+  assert.equal(sorted[0].assetId, 'c2');
+  assert.equal(sorted[1].assetId, 'c1');
+});
+
+test('sortByFrecency does not mutate input array', () => {
+  const items = normalizeMentionItems([
+    { key: 'img:a', label: 'A', type: 'image', assetId: 'a', assetName: 'a', storedPath: '/a.jpg' },
+    { key: 'img:b', label: 'B', type: 'image', assetId: 'b', assetName: 'b', storedPath: '/b.jpg' },
+  ]);
+  items[0].lastUsedAt = '2026-06-01T00:00:00Z';
+  items[1].lastUsedAt = '2026-07-01T00:00:00Z';
+  const sorted = sortByFrecency(items);
+  assert.equal(sorted[0].assetId, 'b');
+  assert.equal(items[0].assetId, 'a'); // original order unchanged
+});
+
+test('sortByFrecency handles empty and single-item arrays', () => {
+  assert.deepEqual(sortByFrecency([]), []);
+  const single = normalizeMentionItems([
+    { key: 'img:x', label: 'X', type: 'image', assetId: 'x', assetName: 'x', storedPath: '/x.jpg' },
+  ]);
+  single[0].lastUsedAt = '2026-07-01T00:00:00Z';
+  assert.deepEqual(sortByFrecency(single), single);
 });

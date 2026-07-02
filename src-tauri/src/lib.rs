@@ -6335,6 +6335,7 @@ pub mod commands {
                     },
                 );
                 data.tasks.push(task.clone());
+                touch_asset_last_used(data, &task.image_asset_ids, &task.audio_asset_ids);
                 Ok(task)
             })
             .map_err(|error| error.to_string())?;
@@ -9189,5 +9190,148 @@ mod tests {
         let task = &data.tasks[0];
         assert_eq!(task.status, "succeeded");
         assert!(!task.auto_query_stopped);
+    }
+
+    // ── delete_execution_record cleans up task.attempts ──────────────────
+
+    #[test]
+    fn delete_execution_record_removes_matching_attempts() {
+        let mut task = make_queued_task_for_submit("del-attempt");
+        task.submit_id = "sid-abc".to_string();
+        task.execution_records = vec![
+            TaskExecutionRecord {
+                id: "rec-1".to_string(),
+                submit_id: "sid-abc".to_string(),
+                status: "failed".to_string(),
+                started_at: "2026-07-01T00:00:00Z".to_string(),
+                finished_at: "2026-07-01T01:00:00Z".to_string(),
+                input_snapshot: TaskExecutionInputSnapshot::default(),
+                command_preview: vec!["multimodal2video".to_string()],
+                query_records: vec![],
+                result_paths: vec![],
+                result_urls: vec![],
+                error_kind: "Transient".to_string(),
+                error_detail: "network error".to_string(),
+            },
+            TaskExecutionRecord {
+                id: "rec-2".to_string(),
+                submit_id: "sid-other".to_string(),
+                status: "succeeded".to_string(),
+                started_at: "2026-07-02T00:00:00Z".to_string(),
+                finished_at: "2026-07-02T01:00:00Z".to_string(),
+                input_snapshot: TaskExecutionInputSnapshot::default(),
+                command_preview: vec!["multimodal2video".to_string()],
+                query_records: vec![],
+                result_paths: vec![],
+                result_urls: vec![],
+                error_kind: String::new(),
+                error_detail: String::new(),
+            },
+        ];
+        task.attempts = vec![
+            TaskAttempt {
+                id: "att-submit".to_string(),
+                started_at: "2026-07-01T00:00:00Z".to_string(),
+                finished_at: "2026-07-01T00:01:00Z".to_string(),
+                status: "failed".to_string(),
+                command_preview: vec!["multimodal2video".to_string()],
+                stdout: r#"{"submit_id":"sid-abc"}"#.to_string(),
+                stderr: String::new(),
+                error_kind: String::new(),
+                duration_seconds: 0.0,
+                error_detail: String::new(),
+            },
+            TaskAttempt {
+                id: "att-query".to_string(),
+                started_at: "2026-07-01T00:05:00Z".to_string(),
+                finished_at: "2026-07-01T00:06:00Z".to_string(),
+                status: "querying".to_string(),
+                command_preview: vec![
+                    "query_result".to_string(),
+                    "--submit_id=sid-abc".to_string(),
+                ],
+                stdout: String::new(),
+                stderr: String::new(),
+                error_kind: String::new(),
+                duration_seconds: 0.0,
+                error_detail: String::new(),
+            },
+            TaskAttempt {
+                id: "att-other".to_string(),
+                started_at: "2026-07-02T00:00:00Z".to_string(),
+                finished_at: "2026-07-02T01:00:00Z".to_string(),
+                status: "succeeded".to_string(),
+                command_preview: vec!["multimodal2video".to_string()],
+                stdout: r#"{"submit_id":"sid-other"}"#.to_string(),
+                stderr: String::new(),
+                error_kind: String::new(),
+                duration_seconds: 0.0,
+                error_detail: String::new(),
+            },
+        ];
+        let mut data = AppData {
+            tasks: vec![task],
+            ..AppData::default()
+        };
+        let result = delete_execution_record_from_data(&mut data, "del-attempt", "rec-1");
+        assert!(result.is_ok(), "delete should succeed: {:?}", result.err());
+        let task = &data.tasks[0];
+        // att-submit and att-query have sid-abc → removed; att-other has sid-other → kept
+        assert_eq!(task.attempts.len(), 1, "only unrelated attempt (sid-other) should remain");
+        assert_eq!(task.attempts[0].id, "att-other");
+        // rec-1 removed, rec-2 still there
+        assert_eq!(task.execution_records.len(), 1);
+        assert_eq!(task.execution_records[0].id, "rec-2");
+    }
+
+    // ── touch_asset_last_used ────────────────────────────────────────────
+
+    #[test]
+    fn touch_asset_last_used_updates_only_targeted_assets() {
+        let mut data = AppData {
+            assets: vec![
+                Asset {
+                    id: "img-1".to_string(),
+                    kind: AssetKind::Image,
+                    name: "a.png".to_string(),
+                    aliases: vec![],
+                    tags: vec![],
+                    stored_path: "/a.png".to_string(),
+                    source_path: "/a.png".to_string(),
+                    mime: "image/png".to_string(),
+                    size_bytes: 100,
+                    duration_seconds: None,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    content_hash: None,
+                    last_used_at: None,
+                },
+                Asset {
+                    id: "img-2".to_string(),
+                    kind: AssetKind::Image,
+                    name: "b.png".to_string(),
+                    aliases: vec![],
+                    tags: vec![],
+                    stored_path: "/b.png".to_string(),
+                    source_path: "/b.png".to_string(),
+                    mime: "image/png".to_string(),
+                    size_bytes: 200,
+                    duration_seconds: None,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    content_hash: None,
+                    last_used_at: None,
+                },
+            ],
+            ..AppData::default()
+        };
+        touch_asset_last_used(&mut data, &["img-1".to_string()], &[]);
+        assert!(data.assets[0].last_used_at.is_some(), "img-1 should be touched");
+        assert!(data.assets[1].last_used_at.is_none(), "img-2 should be untouched");
+    }
+
+    #[test]
+    fn touch_asset_last_used_empty_lists_are_noop() {
+        let mut data = AppData::default();
+        touch_asset_last_used(&mut data, &[], &[]);
+        // no panic
     }
 }
