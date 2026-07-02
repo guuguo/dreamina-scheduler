@@ -5437,7 +5437,7 @@ fn try_acquire_store_queue_lock(store: &AppStore, origin: &str) -> Option<StoreQ
 }
 
 /// 每条执行记录保留的 query_records（自动轮询历史）上限。
-const MAX_QUERY_RECORDS_PER_EXECUTION: usize = 30;
+const MAX_QUERY_RECORDS_PER_EXECUTION: usize = 500;
 /// 每个任务保留的 attempts（尝试历史）上限。
 const MAX_ATTEMPTS_PER_TASK: usize = 50;
 
@@ -8434,13 +8434,13 @@ mod tests {
         // attempts 留最近 50（丢最旧 10）
         assert_eq!(data.tasks[0].attempts.len(), 50);
         assert_eq!(data.tasks[0].attempts[0].id, "att-10");
-        // query_records 留最近 30（丢最旧 15）
-        assert_eq!(data.tasks[0].execution_records[0].query_records.len(), 30);
+        // query_records 上限 500，45 条不触发裁剪
+        assert_eq!(data.tasks[0].execution_records[0].query_records.len(), 45);
         assert_eq!(
             data.tasks[0].execution_records[0].query_records[0].id,
-            "att-15"
+            "att-0"
         );
-        assert_eq!(removed, 10 + 15);
+        assert_eq!(removed, 10); // attempts: 60→50=10, query_records: 45<500=0
     }
 
     #[test]
@@ -8493,9 +8493,9 @@ mod tests {
             big_size,
             after.len()
         );
-        // 回读确认 query_records 已裁剪到 30
+        // 回读确认 query_records 上限 500，45 条不触发裁剪
         let reloaded = AppStore::load(temp.path().to_path_buf()).snapshot();
-        assert_eq!(reloaded.tasks[0].execution_records[0].query_records.len(), 30);
+        assert_eq!(reloaded.tasks[0].execution_records[0].query_records.len(), 45);
     }
 
     // ── persist 紧凑序列化 ─────────────────────────────────────────────────
