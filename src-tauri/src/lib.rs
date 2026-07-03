@@ -3939,6 +3939,23 @@ fn execution_record_model_queue_kind(record: &TaskExecutionRecord) -> ModelQueue
     model_queue_kind(&record.input_snapshot.params.model_version)
 }
 
+fn latest_retry_wait_execution_record(task: &ScheduledTask) -> Option<&TaskExecutionRecord> {
+    task.execution_records
+        .iter()
+        .rev()
+        .find(|record| record.status == "retry_wait")
+        .or_else(|| latest_execution_record(task))
+}
+
+fn submit_queue_kind_for_task(task: &ScheduledTask) -> ModelQueueKind {
+    if task.status == "retry_wait" {
+        return latest_retry_wait_execution_record(task)
+            .map(execution_record_model_queue_kind)
+            .unwrap_or_else(|| task_model_queue_kind(task));
+    }
+    task_model_queue_kind(task)
+}
+
 fn active_remote_queue_kinds(data: &AppData) -> HashSet<ModelQueueKind> {
     let mut kinds = HashSet::new();
     for task in &data.tasks {
@@ -3966,10 +3983,19 @@ fn has_concurrency_cooldown_for_queue(
     queue_kind: ModelQueueKind,
 ) -> bool {
     data.tasks.iter().any(|task| {
-        task_model_queue_kind(task) == queue_kind
-            && task.status == "retry_wait"
-            && is_concurrency_limit(&task.last_error)
-            && !is_due(task.next_run_at.as_deref(), now)
+        if task.status != "retry_wait"
+            || submit_queue_kind_for_task(task) != queue_kind
+            || is_due(task.next_run_at.as_deref(), now)
+        {
+            return false;
+        }
+        is_concurrency_limit(&task.last_error)
+            || latest_retry_wait_execution_record(task)
+                .map(|record| {
+                    record.error_kind == "ConcurrencyLimit"
+                        || is_concurrency_limit(&record.error_detail)
+                })
+                .unwrap_or(false)
     })
 }
 
@@ -4119,7 +4145,7 @@ fn next_due_submit_task_id_for_queue(
         .enumerate()
         .filter(|(_, task)| {
             queue_kind
-                .map(|kind| task_model_queue_kind(task) == kind)
+                .map(|kind| submit_queue_kind_for_task(task) == kind)
                 .unwrap_or(true)
                 && needs_more_successful_submits(task)
                 && is_due_for_submit(task, now)
@@ -4146,7 +4172,7 @@ fn next_idle_failed_retry_task_id_for_queue(
         .enumerate()
         .filter(|(_, task)| {
             queue_kind
-                .map(|kind| task_model_queue_kind(task) == kind)
+                .map(|kind| submit_queue_kind_for_task(task) == kind)
                 .unwrap_or(true)
                 && is_idle_failed_retry_due(task, now, retry_delay_seconds)
         })

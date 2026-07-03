@@ -330,6 +330,109 @@ fn promoted_fast_concurrency_failure_records_fast_snapshot() {
 }
 
 #[test]
+fn promoted_fast_concurrency_cooldown_blocks_second_fast_probe() {
+    let mut data = default_data();
+    let mut standard_active = queued_task("standard-active");
+    standard_active.status = "querying".to_string();
+    standard_active.submit_id = "standard-submit".to_string();
+    standard_active.last_auto_query_at = Some(Utc::now().to_rfc3339());
+
+    data.tasks.push(standard_active);
+    data.tasks.push(queued_task("standard-backlog-1"));
+    data.tasks.push(queued_task("standard-backlog-2"));
+
+    let first = process_next_due_task_with_runner(&mut data, |args| {
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--model_version=seedance2.0fast"));
+        Ok((
+            r#"{"submit_id":"fast-full","gen_status":"fail","fail_reason":"api error: ret=1310, message=ExceedConcurrencyLimit"}"#.to_string(),
+            String::new(),
+        ))
+    })
+    .expect("first process")
+    .expect("first fast probe should run");
+
+    assert_eq!(first.id, "standard-backlog-1");
+    assert_eq!(first.status, "retry_wait");
+
+    let second = process_next_due_task_with_runner(&mut data, |_| {
+        panic!("Fast lane should be cooling down after concurrency limit")
+    })
+    .expect("second process should not fail");
+
+    assert!(
+        second.is_none(),
+        "same lane should not immediately probe another backlog task"
+    );
+}
+
+#[test]
+fn promoted_fast_retry_wait_retries_on_fast_lane_after_cooldown() {
+    let mut data = default_data();
+    let mut standard_active = queued_task("standard-active");
+    standard_active.status = "querying".to_string();
+    standard_active.submit_id = "standard-submit".to_string();
+    standard_active.last_auto_query_at = Some(Utc::now().to_rfc3339());
+
+    let mut retry_task = queued_task("standard-promoted-retry");
+    retry_task.status = "retry_wait".to_string();
+    retry_task.next_run_at = Some((Utc::now() - Duration::seconds(1)).to_rfc3339());
+    retry_task.last_error = "api error: ret=1310, message=ExceedConcurrencyLimit".to_string();
+    retry_task.execution_records.push(TaskExecutionRecord {
+        id: "fast-retry-record".to_string(),
+        submit_id: "fast-full".to_string(),
+        status: "retry_wait".to_string(),
+        started_at: (Utc::now() - Duration::minutes(1)).to_rfc3339(),
+        finished_at: (Utc::now() - Duration::minutes(1)).to_rfc3339(),
+        input_snapshot: TaskExecutionInputSnapshot {
+            params: VideoParams {
+                model_version: "seedance2.0fast".to_string(),
+                ..VideoParams::default()
+            },
+            ..TaskExecutionInputSnapshot::default()
+        },
+        command_preview: vec![
+            "multimodal2video".to_string(),
+            "--model_version=seedance2.0fast".to_string(),
+        ],
+        query_records: vec![],
+        result_paths: vec![],
+        result_urls: vec![],
+        error_kind: "ConcurrencyLimit".to_string(),
+        error_detail: "并发任务仍在生成中，已自动排队等待下次重试。".to_string(),
+    });
+
+    data.tasks.push(standard_active);
+    data.tasks.push(retry_task);
+
+    let result = process_next_due_task_with_runner(&mut data, |args| {
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--model_version=seedance2.0fast"));
+        Ok((
+            r#"{"submit_id":"fast-retry-ok","gen_status":"querying"}"#.to_string(),
+            String::new(),
+        ))
+    })
+    .expect("process queue")
+    .expect("fast retry should run after cooldown");
+
+    assert_eq!(result.id, "standard-promoted-retry");
+    assert_eq!(result.params.model_version, "seedance2.0");
+    assert_eq!(
+        result
+            .execution_records
+            .last()
+            .unwrap()
+            .input_snapshot
+            .params
+            .model_version,
+        "seedance2.0fast"
+    );
+}
+
+#[test]
 fn queried_standard_submit_with_missing_backoff_does_not_starve_idle_fast_submission() {
     let mut data = default_data();
     let mut standard_active = queued_task("standard-active-missing-backoff");
