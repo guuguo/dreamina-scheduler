@@ -101,6 +101,48 @@ test('retry_wait execution_records with same retry error are collapsed for displ
   assert.equal(items[0].error_detail, '并发任务仍在生成中，已自动排队等待下次重试。');
 });
 
+test('retry_wait execution_records with different models stay separate', () => {
+  const task = {
+    id: 't2-models',
+    execution_records: [
+      {
+        id: 'rec-standard',
+        started_at: '2026-04-30T09:00:00Z',
+        finished_at: '2026-04-30T09:00:01Z',
+        submit_id: '',
+        status: 'retry_wait',
+        result_paths: [],
+        result_urls: [],
+        query_records: [],
+        error_kind: 'ConcurrencyLimit',
+        error_detail: 'api error: ret=1310, message=ExceedConcurrencyLimit',
+        command_preview: ['multimodal2video', '--model_version=seedance2.0'],
+        input_snapshot: { params: { model_version: 'seedance2.0' } },
+      },
+      {
+        id: 'rec-fast',
+        started_at: '2026-04-30T09:01:00Z',
+        finished_at: '2026-04-30T09:01:01Z',
+        submit_id: '',
+        status: 'retry_wait',
+        result_paths: [],
+        result_urls: [],
+        query_records: [],
+        error_kind: 'ConcurrencyLimit',
+        error_detail: 'api error: ret=1310, message=ExceedConcurrencyLimit',
+        command_preview: ['multimodal2video', '--model_version=seedance2.0fast'],
+        input_snapshot: { params: { model_version: 'seedance2.0fast' } },
+      },
+    ],
+  };
+
+  const items = deriveTaskHistory(task);
+
+  assert.equal(items.length, 2);
+  assert.equal(historyItemLabel(items[0], 2), '第 2 次 · Fast');
+  assert.equal(historyItemLabel(items[1], 1), '第 1 次 · 标准');
+});
+
 test('final failed concurrency retry record is collapsed into one short display item', () => {
   const task = {
     id: 't2c',
@@ -301,6 +343,17 @@ test('historyHasResults returns false when no results', () => {
 test('historyItemLabel with submit_id shows truncated id', () => {
   const item = { submit_id: 'abcdefgh1234' };
   assert.equal(historyItemLabel(item, 1), '第 1 次 · abcdefgh');
+});
+
+test('historyItemLabel includes execution model label', () => {
+  assert.equal(historyItemLabel({
+    submit_id: '',
+    input_snapshot: { params: { model_version: 'seedance2.0fast' } },
+  }, 1), '第 1 次 · Fast');
+  assert.equal(historyItemLabel({
+    submit_id: 'abcdefgh1234',
+    input_snapshot: { params: { model_version: 'seedance2.0' } },
+  }, 2), '第 2 次 · 标准 · abcdefgh');
 });
 
 test('historyItemLabel without submit_id shows index only', () => {

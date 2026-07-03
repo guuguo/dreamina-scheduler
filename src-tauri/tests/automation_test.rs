@@ -1006,6 +1006,50 @@ fn concurrency_retry_updates_single_execution_record_with_short_error() {
 }
 
 #[test]
+fn concurrency_retry_records_are_separated_by_model_version() {
+    let mut data = default_data();
+    data.settings.concurrency_limit_policy = ConcurrencyLimitPolicy::SilentRetry;
+    data.settings.concurrency_retry_delay_seconds = 0;
+    data.settings.concurrency_retry_max_attempts = 8;
+    data.tasks.push(queued_task("task-concurrency-models"));
+
+    process_next_due_task_with_runner(&mut data, |args| {
+        assert!(args.iter().any(|arg| arg == "--model_version=seedance2.0"));
+        Ok((r#"{"gen_status":"fail","fail_reason":"api error: ret=1310, message=ExceedConcurrencyLimit, logid=standard"}"#.to_string(), String::new()))
+    })
+    .expect("first process")
+    .expect("first task processed");
+
+    data.tasks[0].params.model_version = "seedance2.0fast".to_string();
+
+    let result = process_next_due_task_with_runner(&mut data, |args| {
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--model_version=seedance2.0fast"));
+        Ok((r#"{"gen_status":"fail","fail_reason":"api error: ret=1310, message=ExceedConcurrencyLimit, logid=fast"}"#.to_string(), String::new()))
+    })
+    .expect("second process")
+    .expect("second task processed");
+
+    assert_eq!(result.status, "retry_wait");
+    assert_eq!(result.execution_records.len(), 2);
+    assert_eq!(
+        result.execution_records[0]
+            .input_snapshot
+            .params
+            .model_version,
+        "seedance2.0"
+    );
+    assert_eq!(
+        result.execution_records[1]
+            .input_snapshot
+            .params
+            .model_version,
+        "seedance2.0fast"
+    );
+}
+
+#[test]
 fn concurrency_retry_past_configured_max_keeps_single_short_retry_record() {
     let mut data = default_data();
     data.settings.concurrency_limit_policy = ConcurrencyLimitPolicy::SilentRetry;

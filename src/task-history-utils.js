@@ -30,6 +30,20 @@ function retryErrorKind(errorKind, errorDetail) {
   return '';
 }
 
+export function executionModelVersion(item) {
+  const snapshotVersion = item?.input_snapshot?.params?.model_version;
+  if (snapshotVersion) return snapshotVersion;
+  const modelArg = (item?.command_preview || []).find((arg) => String(arg).startsWith('--model_version='));
+  return modelArg ? String(modelArg).slice('--model_version='.length) : '';
+}
+
+export function executionModelLabel(item) {
+  const version = executionModelVersion(item);
+  if (version === 'seedance2.0fast') return 'Fast';
+  if (version === 'seedance2.0') return '标准';
+  return version;
+}
+
 function compactRetryErrorDetail(errorKind, errorDetail) {
   const kind = retryErrorKind(errorKind, errorDetail);
   if (kind && RETRY_ERROR_DETAILS[kind]) return RETRY_ERROR_DETAILS[kind];
@@ -55,7 +69,7 @@ function collapseRetryWaitRecords(items) {
       continue;
     }
 
-    const key = `retry_wait:${kind}`;
+    const key = `retry_wait:${kind}:${executionModelVersion(item)}`;
     const existingIndex = retryIndexes.get(key);
     const compactItem = {
       ...item,
@@ -213,9 +227,12 @@ export function historyHasResults(historyItems) {
  * @param {number} index - 1-based
  */
 export function historyItemLabel(item, index) {
-  if (Number(item?.retry_count || 0) > 1) return `第 ${index} 次 · 自动重试 ${item.retry_count} 次`;
-  if (item.submit_id) return `第 ${index} 次 · ${item.submit_id.slice(0, 8)}`;
-  return `第 ${index} 次`;
+  const parts = [`第 ${index} 次`];
+  const modelLabel = executionModelLabel(item);
+  if (modelLabel) parts.push(modelLabel);
+  if (Number(item?.retry_count || 0) > 1) parts.push(`自动重试 ${item.retry_count} 次`);
+  else if (item.submit_id) parts.push(item.submit_id.slice(0, 8));
+  return parts.join(' · ');
 }
 
 /**

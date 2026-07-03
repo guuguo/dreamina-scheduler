@@ -35,6 +35,7 @@ import {
   deriveCurrentExecutionRecord,
   deriveCurrentQueryRecords,
   deriveTaskHistory,
+  executionModelLabel,
   historyItemLabel,
   isInterruptNotice,
 } from './task-history-utils.js';
@@ -3611,12 +3612,14 @@ function AttemptRow({ attempt }) {
     : ['submitting', 'querying'].includes(attempt.status) ? 'running'
     : attempt.status === 'failed' ? 'fail' : 'idle';
   const qi = attempt.status === 'querying' ? parseAttemptQueueInfo(attempt.stdout) : null;
+  const modelLabel = executionModelLabel(attempt);
   return (
     <div className="qc-attempt-row">
       <span className={`qc-attempt-dot ${dot}`} />
       <span className="qc-attempt-time">{formatDate(attempt.finished_at || attempt.started_at)}</span>
       <span className="qc-attempt-label">
         {statusLabel(attempt.status)}
+        {modelLabel ? ` · ${modelLabel}` : ''}
         {qi ? (
           <span className="qc-attempt-queue">
             &nbsp;·&nbsp;<b>#{qi.queue_idx ?? '-'}</b>
@@ -3644,12 +3647,16 @@ function AttemptsModal({ attempts, onClose }) {
             const dot = attempt.status === 'succeeded' ? 'done'
               : ['submitting', 'querying'].includes(attempt.status) ? 'running'
               : attempt.status === 'failed' ? 'fail' : 'idle';
+            const modelLabel = executionModelLabel(attempt);
             return (
               <div key={attempt.id} className="attempts-modal-row">
                 <span className={`qc-attempt-dot ${dot}`} />
                 <div className="attempts-modal-row-main">
                   <div className="attempts-modal-row-top">
-                    <span className="attempts-modal-label">{statusLabel(attempt.status)}</span>
+                    <span className="attempts-modal-label">
+                      {statusLabel(attempt.status)}
+                      {modelLabel ? ` · ${modelLabel}` : ''}
+                    </span>
                     <span className="attempts-modal-time">{formatDate(attempt.finished_at || attempt.started_at)}</span>
                   </div>
                   {qi ? (

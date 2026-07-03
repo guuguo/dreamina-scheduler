@@ -2500,15 +2500,22 @@ fn should_merge_retry_execution_record(status: &str, error_kind: &str) -> bool {
         && matches!(error_kind, "ConcurrencyLimit" | "Transient")
 }
 
+fn execution_record_model_version(record: &TaskExecutionRecord) -> &str {
+    record.input_snapshot.params.model_version.as_str()
+}
+
 fn upsert_submit_execution_record(task: &mut ScheduledTask, record: TaskExecutionRecord) {
     if should_merge_retry_execution_record(&record.status, &record.error_kind) {
+        let model_version = execution_record_model_version(&record);
         if let Some(existing) = task.execution_records.iter_mut().rev().find(|item| {
             matches!(item.status.as_str(), "retry_wait" | "failed")
                 && item.error_kind == record.error_kind
+                && execution_record_model_version(item) == model_version
         }) {
             existing.finished_at = record.finished_at;
             existing.status = record.status;
             existing.submit_id = record.submit_id;
+            existing.input_snapshot = record.input_snapshot;
             existing.command_preview = record.command_preview;
             existing.error_detail = record.error_detail;
             return;
@@ -2544,11 +2551,13 @@ pub fn compact_retry_execution_records_for_display(data: &mut AppData) -> usize 
                 &record.error_kind,
                 &record.error_detail,
             );
+            let model_version = execution_record_model_version(&record).to_string();
             let existing_index = compacted
                 .iter()
                 .rposition(|existing: &TaskExecutionRecord| {
                     should_merge_retry_execution_record(&existing.status, &existing.error_kind)
                         && existing.error_kind == record.error_kind
+                        && execution_record_model_version(existing) == model_version
                 });
 
             let Some(index) = existing_index else {
