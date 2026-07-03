@@ -2117,6 +2117,45 @@ fn next_due_current_query_target(data: &AppData, now: DateTime<Utc>) -> Option<(
     None
 }
 
+fn has_query_history_for_submit(task: &ScheduledTask, submit_id: &str) -> bool {
+    if task.attempts.iter().any(|attempt| {
+        attempt
+            .command_preview
+            .iter()
+            .any(|arg| arg == &format!("--submit_id={submit_id}"))
+    }) {
+        return true;
+    }
+    task.execution_records
+        .iter()
+        .any(|record| record.submit_id == submit_id && !record.query_records.is_empty())
+}
+
+fn latest_query_history_time_for_submit(task: &ScheduledTask, submit_id: &str) -> Option<String> {
+    let submit_arg = format!("--submit_id={submit_id}");
+    task.execution_records
+        .iter()
+        .filter(|record| record.submit_id == submit_id)
+        .flat_map(|record| record.query_records.iter())
+        .chain(
+            task.attempts
+                .iter()
+                .filter(|attempt| attempt.command_preview.iter().any(|arg| arg == &submit_arg)),
+        )
+        .filter_map(|attempt| {
+            let value = if attempt.finished_at.trim().is_empty() {
+                attempt.started_at.trim()
+            } else {
+                attempt.finished_at.trim()
+            };
+            DateTime::parse_from_rfc3339(value)
+                .ok()
+                .map(|time| (time.with_timezone(&Utc), value.to_string()))
+        })
+        .max_by_key(|(time, _)| *time)
+        .map(|(_, value)| value)
+}
+
 fn next_due_initial_current_query_target(
     data: &AppData,
     now: DateTime<Utc>,
@@ -2126,7 +2165,10 @@ fn next_due_initial_current_query_target(
             && !task.auto_query_stopped
             && task.last_auto_query_at.is_none()
     }) {
-        if !task.submit_id.trim().is_empty() && is_query_due(task, now) {
+        if !task.submit_id.trim().is_empty()
+            && !has_query_history_for_submit(task, task.submit_id.trim())
+            && is_query_due(task, now)
+        {
             return Some((task.id.clone(), task.submit_id.clone()));
         }
     }
@@ -3606,11 +3648,21 @@ pub fn recover_tasks_on_load(data: &mut AppData) {
                     }
                 }
             } else {
-                // 无结果：标记为 submitted 并允许自动查询一次（reset backoff，不停止）
+                let current_submit_id = task.submit_id.trim().to_string();
+                let latest_query_at =
+                    latest_query_history_time_for_submit(task, &current_submit_id);
+                // 无结果：标记为 submitted；如果已有查询历史，保留轮询节奏，避免每次进程启动都抢占调度。
                 task.status = "submitted".to_string();
                 task.last_error.clear();
-                reset_query_backoff(task);
-                // 不设 auto_query_stopped，让 process_queue_command 的第一次轮询来查一次
+                task.auto_query_stopped = false;
+                if let Some(latest_query_at) = latest_query_at {
+                    task.last_auto_query_at = Some(latest_query_at);
+                    if task.consecutive_no_result_queries == 0 {
+                        task.consecutive_no_result_queries = 1;
+                    }
+                } else {
+                    reset_query_backoff(task);
+                }
             }
         }
     }
@@ -3887,21 +3939,6 @@ fn execution_record_model_queue_kind(record: &TaskExecutionRecord) -> ModelQueue
     model_queue_kind(&record.input_snapshot.params.model_version)
 }
 
-fn is_terminal_task_status(status: &str) -> bool {
-    matches!(status, "succeeded" | "failed")
-}
-
-fn has_drained_fast_queue_history(data: &AppData) -> bool {
-    data.tasks.iter().any(|task| {
-        task_model_queue_kind(task) == ModelQueueKind::Fast && is_terminal_task_status(&task.status)
-    }) || data.tasks.iter().any(|task| {
-        task.execution_records.iter().any(|record| {
-            execution_record_model_queue_kind(record) == ModelQueueKind::Fast
-                && is_terminal_task_status(&record.status)
-        })
-    })
-}
-
 fn active_remote_queue_kinds(data: &AppData) -> HashSet<ModelQueueKind> {
     let mut kinds = HashSet::new();
     for task in &data.tasks {
@@ -4075,12 +4112,18 @@ fn next_due_submit_task_id(data: &AppData, now: DateTime<Utc>) -> Option<String>
 fn next_due_submit_task_id_for_queue(
     data: &AppData,
     now: DateTime<Utc>,
-    _queue_kind: Option<ModelQueueKind>,
+    queue_kind: Option<ModelQueueKind>,
 ) -> Option<String> {
     data.tasks
         .iter()
         .enumerate()
-        .filter(|(_, task)| needs_more_successful_submits(task) && is_due_for_submit(task, now))
+        .filter(|(_, task)| {
+            queue_kind
+                .map(|kind| task_model_queue_kind(task) == kind)
+                .unwrap_or(true)
+                && needs_more_successful_submits(task)
+                && is_due_for_submit(task, now)
+        })
         .min_by(|(left_index, left), (right_index, right)| {
             successful_execution_count(left)
                 .cmp(&successful_execution_count(right))
@@ -4095,13 +4138,18 @@ fn next_due_submit_task_id_for_queue(
 fn next_idle_failed_retry_task_id_for_queue(
     data: &AppData,
     now: DateTime<Utc>,
-    _queue_kind: Option<ModelQueueKind>,
+    queue_kind: Option<ModelQueueKind>,
 ) -> Option<String> {
     let retry_delay_seconds = data.settings.concurrency_retry_delay_seconds;
     data.tasks
         .iter()
         .enumerate()
-        .filter(|(_, task)| is_idle_failed_retry_due(task, now, retry_delay_seconds))
+        .filter(|(_, task)| {
+            queue_kind
+                .map(|kind| task_model_queue_kind(task) == kind)
+                .unwrap_or(true)
+                && is_idle_failed_retry_due(task, now, retry_delay_seconds)
+        })
         .min_by(|(left_index, left), (right_index, right)| {
             successful_execution_count(left)
                 .cmp(&successful_execution_count(right))
@@ -4169,7 +4217,7 @@ fn next_submit_task_id_for_available_queues(
         || has_concurrency_cooldown_for_queue(data, now, ModelQueueKind::Standard);
     let has_due_fast =
         next_submit_task_id_for_queue(data, now, Some(ModelQueueKind::Fast)).is_some();
-    if fast_available && standard_blocked && !has_due_fast && has_drained_fast_queue_history(data) {
+    if fast_available && standard_blocked && !has_due_fast {
         return next_submit_task_id_for_queue(data, now, Some(ModelQueueKind::Standard)).map(
             |task_id| SubmitQueueSelection {
                 task_id,
@@ -5252,9 +5300,10 @@ where
     data.tasks[task_index].updated_at = now_rfc3339();
     // 重置退避状态
     reset_query_backoff(&mut data.tasks[task_index]);
-    let preflight_detail =
-        build_submit_preflight_detail(&data.tasks[task_index], &resolved, &data.assets);
-    let log_task = data.tasks[task_index].clone();
+    let mut snapshot_task = data.tasks[task_index].clone();
+    snapshot_task.params = draft.params.clone();
+    let preflight_detail = build_submit_preflight_detail(&snapshot_task, &resolved, &data.assets);
+    let log_task = snapshot_task.clone();
     append_task_log(
         data,
         &log_task,
@@ -5303,7 +5352,7 @@ where
                 role_ids: task.role_ids.clone(),
                 manual_mention_ids: task.manual_mention_ids.clone(),
                 auto_match_roles: task.auto_match_roles,
-                params: task.params.clone(),
+                params: draft.params.clone(),
                 temp_image_asset_ids: task.temp_image_asset_ids.clone(),
             };
             data.tasks[task_index].attempts.push(TaskAttempt {
@@ -5460,7 +5509,7 @@ where
         role_ids: task.role_ids.clone(),
         manual_mention_ids: task.manual_mention_ids.clone(),
         auto_match_roles: task.auto_match_roles,
-        params: task.params.clone(),
+        params: draft.params.clone(),
         temp_image_asset_ids: task.temp_image_asset_ids.clone(),
     };
     upsert_submit_execution_record(

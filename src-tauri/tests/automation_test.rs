@@ -284,6 +284,112 @@ fn due_standard_query_does_not_starve_idle_fast_submission() {
     assert_eq!(result.id, "standard-backlog");
     assert_eq!(result.status, "querying");
     assert_eq!(result.submit_id, "promoted-fast-submit");
+    assert_eq!(result.params.model_version, "seedance2.0");
+    assert_eq!(
+        result.execution_records[0]
+            .input_snapshot
+            .params
+            .model_version,
+        "seedance2.0fast"
+    );
+}
+
+#[test]
+fn promoted_fast_concurrency_failure_records_fast_snapshot() {
+    let mut data = default_data();
+    let mut standard_active = queued_task("standard-active-due-query");
+    standard_active.status = "querying".to_string();
+    standard_active.submit_id = "standard-submit".to_string();
+    standard_active.last_auto_query_at = Some(Utc::now().to_rfc3339());
+    data.tasks.push(standard_active);
+    data.tasks.push(queued_task("standard-backlog"));
+
+    let result = process_next_due_task_with_runner(&mut data, |args| {
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--model_version=seedance2.0fast"));
+        Ok((
+            r#"{"submit_id":"fast-failed","gen_status":"fail","fail_reason":"api error: ret=1310, message=ExceedConcurrencyLimit"}"#.to_string(),
+            String::new(),
+        ))
+    })
+    .expect("process queue")
+    .expect("promoted fast submit should write retry record");
+
+    assert_eq!(result.id, "standard-backlog");
+    assert_eq!(result.status, "retry_wait");
+    assert_eq!(result.params.model_version, "seedance2.0");
+    assert_eq!(result.execution_records[0].submit_id, "fast-failed");
+    assert_eq!(
+        result.execution_records[0]
+            .input_snapshot
+            .params
+            .model_version,
+        "seedance2.0fast"
+    );
+}
+
+#[test]
+fn queried_standard_submit_with_missing_backoff_does_not_starve_idle_fast_submission() {
+    let mut data = default_data();
+    let mut standard_active = queued_task("standard-active-missing-backoff");
+    standard_active.status = "querying".to_string();
+    standard_active.submit_id = "standard-submit".to_string();
+    standard_active.submitted_at = Some((Utc::now() - Duration::minutes(10)).to_rfc3339());
+    standard_active.last_auto_query_at = None;
+    standard_active.execution_records.push(TaskExecutionRecord {
+        id: "rec-standard".to_string(),
+        submit_id: "standard-submit".to_string(),
+        status: "querying".to_string(),
+        started_at: (Utc::now() - Duration::minutes(10)).to_rfc3339(),
+        finished_at: String::new(),
+        input_snapshot: TaskExecutionInputSnapshot {
+            params: standard_active.params.clone(),
+            ..TaskExecutionInputSnapshot::default()
+        },
+        command_preview: vec![
+            "multimodal2video".to_string(),
+            "--model_version=seedance2.0".to_string(),
+        ],
+        query_records: vec![TaskAttempt {
+            id: "qr-standard".to_string(),
+            started_at: (Utc::now() - Duration::minutes(2)).to_rfc3339(),
+            finished_at: (Utc::now() - Duration::minutes(2)).to_rfc3339(),
+            status: "querying".to_string(),
+            command_preview: vec![
+                "query_result".to_string(),
+                "--submit_id=standard-submit".to_string(),
+            ],
+            stdout: String::new(),
+            stderr: String::new(),
+            error_kind: String::new(),
+            duration_seconds: 0.0,
+            error_detail: String::new(),
+        }],
+        result_paths: vec![],
+        result_urls: vec![],
+        error_kind: String::new(),
+        error_detail: String::new(),
+    });
+    data.tasks.push(standard_active);
+    data.tasks.push(queued_task("standard-backlog"));
+
+    let result = process_next_due_task_with_runner(&mut data, |args| {
+        assert_eq!(args[0], "multimodal2video");
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--model_version=seedance2.0fast"));
+        Ok((
+            r#"{"submit_id":"promoted-fast-submit","gen_status":"querying"}"#.to_string(),
+            String::new(),
+        ))
+    })
+    .expect("process queue")
+    .expect("idle fast lane should submit before re-querying standard task");
+
+    assert_eq!(result.id, "standard-backlog");
+    assert_eq!(result.status, "querying");
+    assert_eq!(result.submit_id, "promoted-fast-submit");
 }
 
 #[test]
@@ -395,6 +501,77 @@ fn peek_due_task_cli_submits_idle_fast_before_due_standard_query() {
     let due = peek_due_task_cli(&data)
         .expect("peek should build due cli")
         .expect("idle fast lane should be due");
+
+    assert_eq!(due.task_id, "standard-backlog");
+    assert!(due
+        .args
+        .iter()
+        .any(|arg| arg == "--model_version=seedance2.0fast"));
+    assert_eq!(
+        due.action,
+        DueTaskCliAction::Submit {
+            model_version_override: Some("seedance2.0fast".to_string())
+        }
+    );
+}
+
+#[test]
+fn recovered_queried_standard_task_does_not_starve_idle_fast_submission() {
+    let mut data = default_data();
+    let query_time = Utc::now().to_rfc3339();
+
+    let mut standard_active = queued_task("standard-active-recovered");
+    standard_active.status = "querying".to_string();
+    standard_active.submit_id = "standard-submit".to_string();
+    standard_active.submitted_at = Some((Utc::now() - Duration::minutes(30)).to_rfc3339());
+    standard_active.last_auto_query_at = None;
+    standard_active.execution_records = vec![TaskExecutionRecord {
+        id: "standard-exec".to_string(),
+        submit_id: "standard-submit".to_string(),
+        status: "querying".to_string(),
+        started_at: (Utc::now() - Duration::minutes(30)).to_rfc3339(),
+        finished_at: String::new(),
+        input_snapshot: TaskExecutionInputSnapshot {
+            params: standard_active.params.clone(),
+            ..TaskExecutionInputSnapshot::default()
+        },
+        command_preview: vec!["multimodal2video".to_string()],
+        query_records: vec![TaskAttempt {
+            id: "query-record".to_string(),
+            started_at: query_time.clone(),
+            finished_at: query_time.clone(),
+            status: "querying".to_string(),
+            command_preview: vec![
+                "query_result".to_string(),
+                "--submit_id=standard-submit".to_string(),
+            ],
+            stdout: r#"{"submit_id":"standard-submit","gen_status":"querying"}"#.to_string(),
+            stderr: String::new(),
+            error_kind: String::new(),
+            duration_seconds: 0.0,
+            error_detail: String::new(),
+        }],
+        result_paths: vec![],
+        result_urls: vec![],
+        error_kind: String::new(),
+        error_detail: String::new(),
+    }];
+
+    data.tasks.push(standard_active);
+    data.tasks.push(queued_task("standard-backlog"));
+
+    recover_tasks_on_load(&mut data);
+
+    let recovered = &data.tasks[0];
+    assert_eq!(recovered.status, "submitted");
+    assert_eq!(
+        recovered.last_auto_query_at.as_deref(),
+        Some(query_time.as_str())
+    );
+
+    let due = peek_due_task_cli(&data)
+        .expect("peek should build due cli")
+        .expect("idle fast lane should submit backlog");
 
     assert_eq!(due.task_id, "standard-backlog");
     assert!(due
