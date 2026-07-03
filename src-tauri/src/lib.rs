@@ -4287,11 +4287,9 @@ pub fn queue_tasks_with_batch_schedule(
                 task.status
             )));
         }
-        if alternate_fast_model && task.params.model_version != "seedance2.0" {
-            return Err(SchedulerError::Io(format!(
-                "任务 {} 不是标准 seedance2.0 模型，不能交叉 Fast 排队",
-                task.title
-            )));
+        if alternate_fast_model && task.params.model_version == "seedance2.0fast" {
+            // 已经是 Fast 模型的任务跳过，不参与交替排队
+            continue;
         }
         task_indices.push(index);
     }
