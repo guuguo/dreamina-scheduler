@@ -1096,13 +1096,21 @@ fn active_remote_task_not_due_blocks_new_submission() {
     data.tasks.push(active);
     data.tasks.push(queued_task("task-next"));
 
-    let runner = |_args: &[String]| -> Result<(String, String), String> {
-        panic!("active remote task should block new submission before query backoff is due");
-    };
-    let result = process_next_due_task_with_runner(&mut data, runner).expect("process queue");
+    // Fast lane is free → standard queued task should be submitted to Fast
+    let result = process_next_due_task_with_runner(&mut data, |args| {
+        assert!(args.iter().any(|a| a == "--model_version=seedance2.0fast"));
+        Ok((
+            r#"{"submit_id":"sub-fast","gen_status":"querying"}"#.to_string(),
+            String::new(),
+        ))
+    })
+    .expect("process queue")
+    .expect("should submit queued task to idle Fast lane");
 
-    assert!(result.is_none());
-    assert_eq!(data.tasks[1].attempt_count, 0);
+    assert_eq!(result.id, "task-next");
+    assert_eq!(result.status, "querying");
+    assert_eq!(result.submit_id, "sub-fast");
+    assert_eq!(data.tasks[1].attempt_count, 1);
 }
 
 #[test]
@@ -1115,13 +1123,20 @@ fn concurrency_retry_wait_blocks_whole_queue_until_due() {
     data.tasks.push(cooling);
     data.tasks.push(queued_task("task-next"));
 
-    let runner = |_args: &[String]| -> Result<(String, String), String> {
-        panic!("global concurrency cooldown should block every queued task");
-    };
-    let result = process_next_due_task_with_runner(&mut data, runner).expect("process queue");
+    // Standard cooldown → Fast lane takes over queued task
+    let result = process_next_due_task_with_runner(&mut data, |args| {
+        assert!(args.iter().any(|a| a == "--model_version=seedance2.0fast"));
+        Ok((
+            r#"{"submit_id":"sub-fast","gen_status":"querying"}"#.to_string(),
+            String::new(),
+        ))
+    })
+    .expect("process queue")
+    .expect("should submit queued task to idle Fast lane");
 
-    assert!(result.is_none());
-    assert_eq!(data.tasks[1].attempt_count, 0);
+    assert_eq!(result.id, "task-next");
+    assert_eq!(result.status, "querying");
+    assert_eq!(data.tasks[1].attempt_count, 1);
 }
 
 #[test]

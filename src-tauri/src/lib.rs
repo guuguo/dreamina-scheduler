@@ -4065,8 +4065,7 @@ fn next_due_submit_task_id_for_queue(
         .iter()
         .enumerate()
         .filter(|(_, task)| {
-            queue_kind.map_or(true, |kind| task_model_queue_kind(task) == kind)
-                && needs_more_successful_submits(task)
+            needs_more_successful_submits(task)
                 && is_due_for_submit(task, now)
         })
         .min_by(|(left_index, left), (right_index, right)| {
@@ -4090,8 +4089,7 @@ fn next_idle_failed_retry_task_id_for_queue(
         .iter()
         .enumerate()
         .filter(|(_, task)| {
-            queue_kind.map_or(true, |kind| task_model_queue_kind(task) == kind)
-                && is_idle_failed_retry_due(task, now, retry_delay_seconds)
+            is_idle_failed_retry_due(task, now, retry_delay_seconds)
         })
         .min_by(|(left_index, left), (right_index, right)| {
             successful_execution_count(left)
