@@ -47,6 +47,11 @@ export function canScheduleTask(task) {
   ].includes(task?.status);
 }
 
+export function canUseAlternatingFastQueue(tasks = []) {
+  return tasks.length > 0
+    && tasks.every((task) => task?.params?.model_version === 'seedance2.0');
+}
+
 export function formatSchedulePlanSummary(plan = []) {
   if (!plan.length) return '未选择任务';
   const first = new Date(plan[0].scheduledAt);

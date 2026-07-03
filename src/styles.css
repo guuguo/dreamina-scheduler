@@ -5873,6 +5873,36 @@ button:disabled {
   font-weight: 800;
 }
 
+.schedule-controls .schedule-checkbox {
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid #e5e9f3;
+  border-radius: var(--control-radius);
+  background: #fbfcff;
+}
+
+.schedule-controls .schedule-checkbox input {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+}
+
+.schedule-controls .schedule-checkbox span {
+  display: grid;
+  gap: 2px;
+  color: #26314f;
+  font-size: 12px;
+}
+
+.schedule-controls .schedule-checkbox em {
+  color: #758199;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 700;
+}
+
 .schedule-controls input,
 .schedule-controls select {
   height: var(--control-h);

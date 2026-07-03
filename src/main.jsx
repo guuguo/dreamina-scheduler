@@ -124,6 +124,7 @@ import {
 } from './queue-view-utils.js';
 import {
   buildBatchSchedulePlan,
+  canUseAlternatingFastQueue,
   canScheduleTask,
   formatSchedulePlanSummary,
   resolvePrepareGenerateOperation,
@@ -2102,14 +2103,20 @@ function QueueView({
     setScheduleModal({ mode: 'batch', taskIds, title: `批量排布 ${taskIds.length} 个任务` });
   };
   const openQueueMode = () => {
-    const taskIds = selectedBatchTasks.filter(canScheduleTask).map((task) => task.id);
+    const queueTasks = selectedBatchTasks.filter(canScheduleTask);
+    const taskIds = queueTasks.map((task) => task.id);
     if (!taskIds.length) {
       setFeedback('请先选择可排队的任务');
       return;
     }
-    setScheduleModal({ mode: 'queue', taskIds, title: `排队模式 ${taskIds.length} 个任务` });
+    setScheduleModal({
+      mode: 'queue',
+      taskIds,
+      title: `排队模式 ${taskIds.length} 个任务`,
+      allowAlternatingFastQueue: canUseAlternatingFastQueue(queueTasks),
+    });
   };
-  const applySchedulePlan = async ({ scheduledAt, intervalMinutes, plannedSubmitCount }) => {
+  const applySchedulePlan = async ({ scheduledAt, intervalMinutes, plannedSubmitCount, alternateFastModel }) => {
     if (!scheduleModal?.taskIds?.length) return;
     try {
       const submitCount = Math.max(1, Math.min(10, Number(plannedSubmitCount || 1)));
@@ -2126,16 +2133,15 @@ function QueueView({
         setFeedback(`已排布：${formatSchedulePlanSummary(plan)}`);
         setSelectedBatchIds([]);
       } else if (scheduleModal.mode === 'queue') {
-        for (const taskId of scheduleModal.taskIds) {
-          await invoke('set_task_planned_submit_count_command', {
-            taskId,
-            plannedSubmitCount: submitCount,
-          });
-          await rescheduleTask(taskId, scheduledAt || '');
-        }
+        await invoke('queue_tasks_with_model_strategy_command', {
+          taskIds: scheduleModal.taskIds,
+          newScheduledAt: scheduledAt || '',
+          plannedSubmitCount: submitCount,
+          alternateFastModel: Boolean(alternateFastModel),
+        });
         setFeedback(scheduledAt
-          ? `已设置排队：${scheduleModal.taskIds.length} 个任务 · 起始 ${formatDate(scheduledAt)}`
-          : `已设为立即排队：${scheduleModal.taskIds.length} 个任务`);
+          ? `已设置排队：${scheduleModal.taskIds.length} 个任务 · 起始 ${formatDate(scheduledAt)}${alternateFastModel ? ' · 交叉 Fast' : ''}`
+          : `已设为立即排队：${scheduleModal.taskIds.length} 个任务${alternateFastModel ? ' · 交叉 Fast' : ''}`);
         setSelectedBatchIds([]);
       } else if (scheduleModal.mode === 'prepare') {
         await invoke('set_task_planned_submit_count_command', {
@@ -2779,6 +2785,7 @@ function QueueView({
           title={scheduleModal.title}
           mode={scheduleModal.mode}
           taskCount={scheduleModal.taskIds.length}
+          allowAlternatingFastQueue={scheduleModal.allowAlternatingFastQueue}
           onClose={() => setScheduleModal(null)}
           onApply={applySchedulePlan}
         />
@@ -3080,7 +3087,7 @@ function LogsView({ logs, tasks, settings, clearLogs, setActiveView, setSelected
   );
 }
 
-function SchedulePickerModal({ title, mode = 'single', taskCount = 1, onClose, onApply }) {
+function SchedulePickerModal({ title, mode = 'single', taskCount = 1, allowAlternatingFastQueue = false, onClose, onApply }) {
   const isBatch = mode === 'batch';
   const isQueue = mode === 'queue';
   const isPrepare = mode === 'prepare';
@@ -3099,6 +3106,7 @@ function SchedulePickerModal({ title, mode = 'single', taskCount = 1, onClose, o
   const [customTime, setCustomTime] = useState('02:00');
   const [intervalMinutes, setIntervalMinutes] = useState(0);
   const [plannedSubmitCount, setPlannedSubmitCount] = useState(1);
+  const [alternateFastModel, setAlternateFastModel] = useState(false);
   const [error, setError] = useState('');
 
   const scheduleOptions = [
@@ -3141,7 +3149,7 @@ function SchedulePickerModal({ title, mode = 'single', taskCount = 1, onClose, o
     }
     setApplying(true);
     try {
-      await onApply?.({ scheduledAt, intervalMinutes, plannedSubmitCount });
+      await onApply?.({ scheduledAt, intervalMinutes, plannedSubmitCount, alternateFastModel });
     } finally {
       setApplying(false);
     }
@@ -3217,6 +3225,19 @@ function SchedulePickerModal({ title, mode = 'single', taskCount = 1, onClose, o
                 <option value={60}>1 小时</option>
                 <option value={90}>1.5 小时</option>
               </select>
+            </label>
+          ) : null}
+          {isQueue && allowAlternatingFastQueue ? (
+            <label className="schedule-checkbox">
+              <input
+                type="checkbox"
+                checked={alternateFastModel}
+                onChange={(e) => setAlternateFastModel(e.target.checked)}
+              />
+              <span>
+                <strong>交叉 Fast 模型</strong>
+                <em>第 1 个标准，第 2 个 Fast，依次交替</em>
+              </span>
             </label>
           ) : null}
           <label>

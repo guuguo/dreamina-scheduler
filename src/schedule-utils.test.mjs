@@ -2,6 +2,7 @@ import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import {
   buildBatchSchedulePlan,
+  canUseAlternatingFastQueue,
   canScheduleTask,
   resolvePrepareGenerateOperation,
   resolveScheduleAt,
@@ -63,6 +64,18 @@ test('buildBatchSchedulePlan: defaults to continuous queue with the same start t
     { taskId: 'task-1', scheduledAt: startAt },
     { taskId: 'task-2', scheduledAt: startAt },
   ]);
+});
+
+test('canUseAlternatingFastQueue: only standard seedance tasks can opt in', () => {
+  assert.equal(canUseAlternatingFastQueue([
+    { params: { model_version: 'seedance2.0' } },
+    { params: { model_version: 'seedance2.0' } },
+  ]), true);
+  assert.equal(canUseAlternatingFastQueue([
+    { params: { model_version: 'seedance2.0' } },
+    { params: { model_version: 'seedance2.0fast' } },
+  ]), false);
+  assert.equal(canUseAlternatingFastQueue([]), false);
 });
 
 test('canScheduleTask: saved or finished tasks can be prepared for scheduled generation', () => {
