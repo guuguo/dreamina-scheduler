@@ -84,6 +84,7 @@ import {
   Image,
   ImagePlus,
   LayoutList,
+  ListChecks,
   Loader2,
   Logs,
   MoreHorizontal,

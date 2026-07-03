@@ -49,3 +49,9 @@ test('queue center uses one unified batch queue action', () => {
   assert.match(source, /交叉 Fast 模型/);
   assert.match(source, /确认排队/);
 });
+
+test('main navigation icons are imported before use', () => {
+  const lucideImport = source.match(/import \{[\s\S]*?\} from 'lucide-react';/)?.[0] || '';
+  assert.match(source, /icon: ListChecks/);
+  assert.match(lucideImport, /\bListChecks\b/);
+});
