@@ -109,13 +109,17 @@ test('formatSchedulePlanSummary: immediate interval plans summarize immediate st
   assert.doesNotMatch(result, /1970/);
 });
 
-test('canUseAlternatingFastQueue: only standard seedance tasks can opt in', () => {
+test('canUseAlternatingFastQueue: any standard seedance task enables opt-in', () => {
   assert.equal(canUseAlternatingFastQueue([
     { params: { model_version: 'seedance2.0' } },
     { params: { model_version: 'seedance2.0' } },
   ]), true);
+  // Mixed standard+fast: still ok because at least one standard task exists
   assert.equal(canUseAlternatingFastQueue([
     { params: { model_version: 'seedance2.0' } },
+    { params: { model_version: 'seedance2.0fast' } },
+  ]), true);
+  assert.equal(canUseAlternatingFastQueue([
     { params: { model_version: 'seedance2.0fast' } },
   ]), false);
   assert.equal(canUseAlternatingFastQueue([]), false);

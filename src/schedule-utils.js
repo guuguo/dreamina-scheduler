@@ -62,8 +62,7 @@ export function canScheduleTask(task) {
 }
 
 export function canUseAlternatingFastQueue(tasks = []) {
-  return tasks.length > 0
-    && tasks.every((task) => task?.params?.model_version === 'seedance2.0');
+  return tasks.some((task) => task?.params?.model_version === 'seedance2.0');
 }
 
 export function formatSchedulePlanSummary(plan = []) {
