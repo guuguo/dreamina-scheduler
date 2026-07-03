@@ -1,9 +1,11 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import {
+  buildBatchQueuePlan,
   buildBatchSchedulePlan,
   canUseAlternatingFastQueue,
   canScheduleTask,
+  formatSchedulePlanSummary,
   resolvePrepareGenerateOperation,
   resolveScheduleAt,
 } from './schedule-utils.js';
@@ -64,6 +66,47 @@ test('buildBatchSchedulePlan: defaults to continuous queue with the same start t
     { taskId: 'task-1', scheduledAt: startAt },
     { taskId: 'task-2', scheduledAt: startAt },
   ]);
+});
+
+test('buildBatchQueuePlan: immediate continuous queue uses null schedule for all tasks', () => {
+  assert.deepEqual(buildBatchQueuePlan(['task-1', 'task-2'], { startAt: null, intervalMinutes: 0 }), [
+    { taskId: 'task-1', scheduledAt: null },
+    { taskId: 'task-2', scheduledAt: null },
+  ]);
+});
+
+test('buildBatchQueuePlan: immediate with interval queues first task now and schedules the rest', () => {
+  const now = new Date('2026-05-01T20:00:00+08:00');
+  assert.deepEqual(buildBatchQueuePlan(['task-1', 'task-2', 'task-3'], { startAt: null, intervalMinutes: 15, now }), [
+    { taskId: 'task-1', scheduledAt: null },
+    { taskId: 'task-2', scheduledAt: new Date(now.getTime() + 15 * 60 * 1000).toISOString() },
+    { taskId: 'task-3', scheduledAt: new Date(now.getTime() + 30 * 60 * 1000).toISOString() },
+  ]);
+});
+
+test('buildBatchQueuePlan: delayed start applies interval from the selected start time', () => {
+  const startAt = new Date('2026-05-01T20:00:00+08:00').toISOString();
+  assert.deepEqual(buildBatchQueuePlan(['task-1', 'task-2'], { startAt, intervalMinutes: 30 }), [
+    { taskId: 'task-1', scheduledAt: startAt },
+    { taskId: 'task-2', scheduledAt: new Date(new Date(startAt).getTime() + 30 * 60 * 1000).toISOString() },
+  ]);
+});
+
+test('formatSchedulePlanSummary: immediate queue plans do not show epoch time', () => {
+  assert.equal(formatSchedulePlanSummary([
+    { taskId: 'task-1', scheduledAt: null },
+    { taskId: 'task-2', scheduledAt: null },
+  ]), '2 个任务 · 立即连续排队');
+});
+
+test('formatSchedulePlanSummary: immediate interval plans summarize immediate start and scheduled tail', () => {
+  const later = new Date('2026-05-01T20:15:00+08:00').toISOString();
+  const result = formatSchedulePlanSummary([
+    { taskId: 'task-1', scheduledAt: null },
+    { taskId: 'task-2', scheduledAt: later },
+  ]);
+  assert.match(result, /^2 个任务 · 立即开始，排布至 /);
+  assert.doesNotMatch(result, /1970/);
 });
 
 test('canUseAlternatingFastQueue: only standard seedance tasks can opt in', () => {

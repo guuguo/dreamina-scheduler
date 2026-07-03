@@ -34,6 +34,20 @@ export function buildBatchSchedulePlan(taskIds = [], { startAt, intervalMinutes 
   }));
 }
 
+export function buildBatchQueuePlan(taskIds = [], { startAt = null, intervalMinutes = 0, now = new Date() } = {}) {
+  const intervalMs = Math.max(0, Number(intervalMinutes || 0)) * 60 * 1000;
+  if (!startAt && intervalMs === 0) {
+    return taskIds.map((taskId) => ({ taskId, scheduledAt: null }));
+  }
+  const startMs = startAt ? new Date(startAt).getTime() : now.getTime();
+  return taskIds.map((taskId, index) => ({
+    taskId,
+    scheduledAt: !startAt && index === 0
+      ? null
+      : new Date(startMs + index * intervalMs).toISOString(),
+  }));
+}
+
 export function canScheduleTask(task) {
   if (task?.status === 'submitted' && task?.auto_query_stopped) return true;
   return [
@@ -54,8 +68,15 @@ export function canUseAlternatingFastQueue(tasks = []) {
 
 export function formatSchedulePlanSummary(plan = []) {
   if (!plan.length) return '未选择任务';
-  const first = new Date(plan[0].scheduledAt);
-  const last = new Date(plan[plan.length - 1].scheduledAt);
+  const scheduledItems = plan.filter((item) => item.scheduledAt);
+  if (!scheduledItems.length) {
+    return `${plan.length} 个任务 · 立即连续排队`;
+  }
+  const first = new Date(scheduledItems[0].scheduledAt);
+  const last = new Date(scheduledItems[scheduledItems.length - 1].scheduledAt);
+  if (!plan[0].scheduledAt) {
+    return `${plan.length} 个任务 · 立即开始，排布至 ${last.toLocaleString()}`;
+  }
   if (first.getTime() === last.getTime()) {
     return `${plan.length} 个任务 · 从 ${first.toLocaleString()} 连续排队`;
   }

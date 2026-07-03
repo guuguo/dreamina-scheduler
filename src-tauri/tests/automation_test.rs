@@ -5,13 +5,13 @@ use dreamina_scheduler_lib::{
     create_draft_task, create_task_with_preview, delete_execution_record_from_data, delete_role,
     delete_task_from_data, import_media_to_role, needs_keep_awake, pause_task, peek_due_task_cli,
     process_next_due_task_with_runner, query_task_submit_id_once_with_runner,
-    queue_tasks_with_model_strategy, record_lifecycle_event, record_scheduler_tick,
-    recover_tasks_on_load, remove_media_from_role, reschedule_task, resume_task,
-    save_clipboard_image_asset, update_task_from_data, upsert_role, AppData, Asset, AssetKind,
-    ClipboardImageInput, ConcurrencyLimitPolicy, CreateRoleInput, DreaminaErrorKind,
-    DueTaskCliAction, ImportRoleMediaInput, LogEntry, LogLevel, LogSource, RemoveRoleMediaInput,
-    Role, ScheduledTask, SchedulerSettings, TaskAttempt, TaskDraft, TaskExecutionInputSnapshot,
-    TaskExecutionRecord, VideoParams,
+    queue_tasks_with_batch_schedule, queue_tasks_with_model_strategy, record_lifecycle_event,
+    record_scheduler_tick, recover_tasks_on_load, remove_media_from_role, reschedule_task,
+    resume_task, save_clipboard_image_asset, update_task_from_data, upsert_role, AppData, Asset,
+    AssetKind, BatchQueuePlanItem, ClipboardImageInput, ConcurrencyLimitPolicy, CreateRoleInput,
+    DreaminaErrorKind, DueTaskCliAction, ImportRoleMediaInput, LogEntry, LogLevel, LogSource,
+    RemoveRoleMediaInput, Role, ScheduledTask, SchedulerSettings, TaskAttempt, TaskDraft,
+    TaskExecutionInputSnapshot, TaskExecutionRecord, VideoParams,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -170,6 +170,38 @@ fn queue_tasks_with_alternating_fast_model_assigns_every_second_task_to_fast() {
     assert_eq!(data.tasks[2].params.model_version, "seedance2.0");
     assert_eq!(data.tasks[3].params.model_version, "seedance2.0fast");
     assert!(data.tasks.iter().all(|task| task.status == "queued"));
+}
+
+#[test]
+fn queue_tasks_with_batch_schedule_supports_immediate_interval_and_alternating_fast() {
+    let mut data = default_data();
+    data.tasks = vec![queued_task("task-1"), queued_task("task-2")];
+    let delayed_at = (Utc::now() + Duration::minutes(15)).to_rfc3339();
+
+    let updated = queue_tasks_with_batch_schedule(
+        &mut data,
+        &[
+            BatchQueuePlanItem {
+                task_id: "task-1".to_string(),
+                scheduled_at: None,
+            },
+            BatchQueuePlanItem {
+                task_id: "task-2".to_string(),
+                scheduled_at: Some(delayed_at.clone()),
+            },
+        ],
+        1,
+        true,
+    )
+    .expect("批量排队计划应成功");
+
+    assert_eq!(updated.len(), 2);
+    assert_eq!(data.tasks[0].status, "queued");
+    assert_eq!(data.tasks[0].scheduled_at, None);
+    assert_eq!(data.tasks[0].params.model_version, "seedance2.0");
+    assert_eq!(data.tasks[1].status, "scheduled");
+    assert_eq!(data.tasks[1].scheduled_at, Some(delayed_at));
+    assert_eq!(data.tasks[1].params.model_version, "seedance2.0fast");
 }
 
 #[test]

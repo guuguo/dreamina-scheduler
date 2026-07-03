@@ -84,7 +84,6 @@ import {
   Image,
   ImagePlus,
   LayoutList,
-  ListChecks,
   Loader2,
   Logs,
   MoreHorizontal,
@@ -123,7 +122,7 @@ import {
   getCommandPreviewPresentation,
 } from './queue-view-utils.js';
 import {
-  buildBatchSchedulePlan,
+  buildBatchQueuePlan,
   canUseAlternatingFastQueue,
   canScheduleTask,
   formatSchedulePlanSummary,
@@ -1443,7 +1442,7 @@ function CreateTaskView({ state, assetById, taskForm, setTaskForm, setActiveView
                 <CalendarClock size={16} />
                 <div>
                   <strong>默认不定时</strong>
-                  <span>保存后进入任务中心，可单选或多选任务后再指定开始时间、立即提交或批量排布。</span>
+                  <span>保存后进入任务中心，可单选或多选任务后再指定开始时间、立即提交或批量排队。</span>
                 </div>
               </div>
 
@@ -2095,25 +2094,17 @@ function QueueView({
     setScheduleModal({ mode: 'prepare', taskIds: [task.id], title: `准备生成「${task.title || '未命名任务'}」` });
   };
   const openBatchSchedule = () => {
-    const taskIds = selectedBatchTasks.filter(canScheduleTask).map((task) => task.id);
+    const batchTasks = selectedBatchTasks.filter(canScheduleTask);
+    const taskIds = batchTasks.map((task) => task.id);
     if (!taskIds.length) {
-      setFeedback('请先选择可排期的任务');
-      return;
-    }
-    setScheduleModal({ mode: 'batch', taskIds, title: `批量排布 ${taskIds.length} 个任务` });
-  };
-  const openQueueMode = () => {
-    const queueTasks = selectedBatchTasks.filter(canScheduleTask);
-    const taskIds = queueTasks.map((task) => task.id);
-    if (!taskIds.length) {
-      setFeedback('请先选择可排队的任务');
+      setFeedback('请先选择可批量排队的任务');
       return;
     }
     setScheduleModal({
-      mode: 'queue',
+      mode: 'batch',
       taskIds,
-      title: `排队模式 ${taskIds.length} 个任务`,
-      allowAlternatingFastQueue: canUseAlternatingFastQueue(queueTasks),
+      title: `批量排队 ${taskIds.length} 个任务`,
+      allowAlternatingFastQueue: canUseAlternatingFastQueue(batchTasks),
     });
   };
   const applySchedulePlan = async ({ scheduledAt, intervalMinutes, plannedSubmitCount, alternateFastModel }) => {
@@ -2121,27 +2112,13 @@ function QueueView({
     try {
       const submitCount = Math.max(1, Math.min(10, Number(plannedSubmitCount || 1)));
       if (scheduleModal.mode === 'batch') {
-        const startAt = scheduledAt || new Date().toISOString();
-        const plan = buildBatchSchedulePlan(scheduleModal.taskIds, { startAt, intervalMinutes });
-        for (const item of plan) {
-          await invoke('set_task_planned_submit_count_command', {
-            taskId: item.taskId,
-            plannedSubmitCount: submitCount,
-          });
-          await rescheduleTask(item.taskId, item.scheduledAt);
-        }
-        setFeedback(`已排布：${formatSchedulePlanSummary(plan)}`);
-        setSelectedBatchIds([]);
-      } else if (scheduleModal.mode === 'queue') {
-        await invoke('queue_tasks_with_model_strategy_command', {
-          taskIds: scheduleModal.taskIds,
-          newScheduledAt: scheduledAt || '',
+        const plan = buildBatchQueuePlan(scheduleModal.taskIds, { startAt: scheduledAt || null, intervalMinutes });
+        await invoke('queue_tasks_with_batch_schedule_command', {
+          plan,
           plannedSubmitCount: submitCount,
           alternateFastModel: Boolean(alternateFastModel),
         });
-        setFeedback(scheduledAt
-          ? `已设置排队：${scheduleModal.taskIds.length} 个任务 · 起始 ${formatDate(scheduledAt)}${alternateFastModel ? ' · 交叉 Fast' : ''}`
-          : `已设为立即排队：${scheduleModal.taskIds.length} 个任务${alternateFastModel ? ' · 交叉 Fast' : ''}`);
+        setFeedback(`已批量排队：${formatSchedulePlanSummary(plan)}${alternateFastModel ? ' · 交叉 Fast' : ''}`);
         setSelectedBatchIds([]);
       } else if (scheduleModal.mode === 'prepare') {
         await invoke('set_task_planned_submit_count_command', {
@@ -2199,7 +2176,7 @@ function QueueView({
       <div className="qc-header">
         <div className="qc-header-text">
           <h1 className="qc-title">任务中心</h1>
-          <p className="qc-subtitle">统一管理任务保存、单个排期、批量排布、执行状态与结果回看</p>
+          <p className="qc-subtitle">统一管理任务保存、单个排期、批量排队、执行状态与结果回看</p>
           <p className="qc-scheduler-hint">
             <Clock3 size={11} /> 本地调度每 30 秒自动检查
             {lastTickAt ? <> · 上次检查 {lastTickAt.toLocaleTimeString()} </> : null}
@@ -2222,7 +2199,7 @@ function QueueView({
         <StatCard2 label="重试中" count={stats.retry} icon={RefreshCcw} color="retry" />
         <StatCard2 label="已完成" count={stats.done} icon={CheckCircle2} color="done" />
         <StatCard2 label="失败" count={stats.failed} icon={AlertCircle} color="failed" />
-        <StatCard2 label="固定并发" count={1} icon={Gauge} color="neutral" sub="单通道顺序执行" />
+        <StatCard2 label="模型车道" count={2} icon={Gauge} color="neutral" sub="标准/Fast 独立" />
       </div>
 
       {/* ── Toolbar ── */}
@@ -2248,10 +2225,7 @@ function QueueView({
           <CheckCircle2 size={13} /> {schedulablePagedIds.length && schedulablePagedIds.every((id) => selectedBatchIds.includes(id)) ? '取消本页' : '选择本页'}
         </button>
         <button type="button" className="qc-btn" onClick={openBatchSchedule} disabled={!selectedBatchTasks.length}>
-          <CalendarClock size={13} /> 批量排布{selectedBatchTasks.length ? `（${selectedBatchTasks.length}）` : ''}
-        </button>
-        <button type="button" className="qc-btn" onClick={openQueueMode} disabled={!selectedBatchTasks.length}>
-          <ListChecks size={13} /> 排队模式{selectedBatchTasks.length ? `（${selectedBatchTasks.length}）` : ''}
+          <CalendarClock size={13} /> 批量排队{selectedBatchTasks.length ? `（${selectedBatchTasks.length}）` : ''}
         </button>
         <button type="button" className="qc-btn" onClick={() => setActiveView('settings')}><Settings size={13} /> 执行策略</button>
         <div className="qc-toolbar-end">
@@ -3089,9 +3063,8 @@ function LogsView({ logs, tasks, settings, clearLogs, setActiveView, setSelected
 
 function SchedulePickerModal({ title, mode = 'single', taskCount = 1, allowAlternatingFastQueue = false, onClose, onApply }) {
   const isBatch = mode === 'batch';
-  const isQueue = mode === 'queue';
   const isPrepare = mode === 'prepare';
-  const isMultiTask = isBatch || isQueue;
+  const isMultiTask = isBatch;
   const today = formatDateInputValue(new Date());
   const tomorrowDate = new Date();
   tomorrowDate.setDate(tomorrowDate.getDate() + 1);
@@ -3112,8 +3085,8 @@ function SchedulePickerModal({ title, mode = 'single', taskCount = 1, allowAlter
   const scheduleOptions = [
     {
       key: 'immediate',
-      label: isQueue ? '马上排队' : isBatch ? '排队模式' : isPrepare ? '立即生成' : '立即提交',
-      hint: isQueue ? '清掉预定时间，立刻进入连续队列' : isBatch ? '全部进入同一开始时间，按队列连续执行' : isPrepare ? '现在提交到即梦生成' : '移除计划时间，回到待提交',
+      label: isBatch ? '立即排队' : isPrepare ? '立即生成' : '立即提交',
+      hint: isBatch ? '清掉预定时间，立刻进入连续队列' : isPrepare ? '现在提交到即梦生成' : '移除计划时间，回到待提交',
     },
     { key: 'relative', label: '几小时后', hint: '适合临时错峰提交' },
     { key: 'dayTime', label: '今天 / 明天凌晨', hint: '常用夜间批量提交' },
@@ -3130,7 +3103,7 @@ function SchedulePickerModal({ title, mode = 'single', taskCount = 1, allowAlter
     if (scheduleMode === 'custom') {
       return resolveScheduleAt({ mode: 'custom', customValue: `${customDate}T${customTime}` });
     }
-    return isBatch ? new Date(Date.now() + 10000).toISOString() : null;
+    return null;
   };
 
   const [applying, setApplying] = useState(false);
@@ -3160,7 +3133,7 @@ function SchedulePickerModal({ title, mode = 'single', taskCount = 1, allowAlter
       <section className="schedule-modal" role="dialog" aria-modal="true" onMouseDown={(e) => e.stopPropagation()}>
         <header className="schedule-modal-head">
           <div>
-            <span>{isQueue ? `排队模式 ${taskCount} 个任务` : isBatch ? `批量排布 ${taskCount} 个任务` : isPrepare ? '准备生成' : '单个任务排期'}</span>
+            <span>{isBatch ? `批量排队 ${taskCount} 个任务` : isPrepare ? '准备生成' : '单个任务排期'}</span>
             <h3>{title || '安排提交时间'}</h3>
           </div>
           <button type="button" className="icon-ghost" onClick={onClose}><X size={16} /></button>
@@ -3227,7 +3200,7 @@ function SchedulePickerModal({ title, mode = 'single', taskCount = 1, allowAlter
               </select>
             </label>
           ) : null}
-          {isQueue && allowAlternatingFastQueue ? (
+          {isBatch && allowAlternatingFastQueue ? (
             <label className="schedule-checkbox">
               <input
                 type="checkbox"
@@ -3257,7 +3230,7 @@ function SchedulePickerModal({ title, mode = 'single', taskCount = 1, allowAlter
         <footer className="schedule-modal-actions">
           <button type="button" className="outline-button" onClick={onClose}>取消</button>
           <button type="button" className="gradient-button" onClick={handleApply} disabled={applying}>
-            {applying ? <><Loader2 size={14} className="spin" /> 处理中...</> : <><CalendarClock size={14} /> {isQueue ? '确认排队' : isBatch ? '确认排布' : isPrepare ? (scheduleMode === 'immediate' ? '立即生成' : '确认定时生成') : '确认安排'}</>}
+            {applying ? <><Loader2 size={14} className="spin" /> 处理中...</> : <><CalendarClock size={14} /> {isBatch ? '确认排队' : isPrepare ? (scheduleMode === 'immediate' ? '立即生成' : '确认定时生成') : '确认安排'}</>}
           </button>
         </footer>
       </section>

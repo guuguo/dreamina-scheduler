@@ -38,12 +38,14 @@ test('main app no longer includes README screenshot fixture mode', () => {
   assert.doesNotMatch(source, /readmeScreenshot/);
 });
 
-test('queue center exposes direct batch queue action', () => {
-  assert.match(source, /const openQueueMode = \(\) =>/);
-  assert.match(source, /allowAlternatingFastQueue: canUseAlternatingFastQueue\(queueTasks\)/);
-  assert.match(source, /scheduleModal\.mode === 'queue'/);
-  assert.match(source, /invoke\('queue_tasks_with_model_strategy_command'/);
-  assert.match(source, /排队模式/);
+test('queue center uses one unified batch queue action', () => {
+  assert.doesNotMatch(source, /const openQueueMode = \(\) =>/);
+  assert.doesNotMatch(source, /scheduleModal\.mode === 'queue'/);
+  assert.doesNotMatch(source, /> 排队模式/);
+  assert.match(source, /const openBatchSchedule = \(\) =>/);
+  assert.match(source, /allowAlternatingFastQueue: canUseAlternatingFastQueue\(batchTasks\)/);
+  assert.match(source, /invoke\('queue_tasks_with_batch_schedule_command'/);
+  assert.match(source, /批量排队/);
   assert.match(source, /交叉 Fast 模型/);
   assert.match(source, /确认排队/);
 });

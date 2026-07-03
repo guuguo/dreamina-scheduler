@@ -444,6 +444,14 @@ pub struct TaskDraft {
     pub prompt_doc: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchQueuePlanItem {
+    pub task_id: String,
+    #[serde(default)]
+    pub scheduled_at: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct TaskExecutionInputSnapshot {
     #[serde(default)]
@@ -4205,11 +4213,37 @@ pub fn queue_tasks_with_model_strategy(
     planned_submit_count: u32,
     alternate_fast_model: bool,
 ) -> Result<Vec<ScheduledTask>, SchedulerError> {
+    let plan: Vec<BatchQueuePlanItem> = task_ids
+        .iter()
+        .map(|task_id| BatchQueuePlanItem {
+            task_id: task_id.clone(),
+            scheduled_at: if new_scheduled_at.trim().is_empty() {
+                None
+            } else {
+                Some(new_scheduled_at.to_string())
+            },
+        })
+        .collect();
+    queue_tasks_with_batch_schedule(data, &plan, planned_submit_count, alternate_fast_model)
+}
+
+pub fn queue_tasks_with_batch_schedule(
+    data: &mut AppData,
+    plan: &[BatchQueuePlanItem],
+    planned_submit_count: u32,
+    alternate_fast_model: bool,
+) -> Result<Vec<ScheduledTask>, SchedulerError> {
+    let task_ids: Vec<String> = plan.iter().map(|item| item.task_id.clone()).collect();
     if task_ids.is_empty() {
         return Ok(vec![]);
     }
-    let scheduled_at = new_scheduled_at.trim();
-    if !scheduled_at.is_empty() {
+    for item in plan {
+        let Some(scheduled_at) = item.scheduled_at.as_ref().map(|value| value.trim()) else {
+            continue;
+        };
+        if scheduled_at.is_empty() {
+            continue;
+        }
         if let Ok(time) = DateTime::parse_from_rfc3339(scheduled_at) {
             if time.with_timezone(&Utc) <= Utc::now() {
                 return Err(SchedulerError::ScheduledAtInPast);
@@ -4226,10 +4260,10 @@ pub fn queue_tasks_with_model_strategy(
         "failed",
         "succeeded",
     ];
-    let mut seen = HashSet::new();
+    let mut seen: HashSet<String> = HashSet::new();
     let mut task_indices = Vec::with_capacity(task_ids.len());
     for task_id in task_ids {
-        if !seen.insert(task_id.as_str()) {
+        if !seen.insert(task_id.clone()) {
             return Err(SchedulerError::Io(format!("任务重复：{task_id}")));
         }
         let index = data
@@ -4258,6 +4292,11 @@ pub fn queue_tasks_with_model_strategy(
     let mut updated = Vec::with_capacity(task_indices.len());
     for (order, index) in task_indices.into_iter().enumerate() {
         let task = &mut data.tasks[index];
+        let scheduled_at = plan
+            .get(order)
+            .and_then(|item| item.scheduled_at.as_ref())
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty());
         task.planned_submit_count = normalized_count;
         if alternate_fast_model {
             task.params.model_version = if order % 2 == 1 {
@@ -4267,14 +4306,14 @@ pub fn queue_tasks_with_model_strategy(
             };
         }
         ensure_task_has_pending_submit(task);
-        if scheduled_at.is_empty() {
-            task.scheduled_at = None;
-            task.next_run_at = None;
-            task.status = "queued".to_string();
-        } else {
+        if let Some(scheduled_at) = scheduled_at {
             task.scheduled_at = Some(scheduled_at.to_string());
             task.next_run_at = Some(scheduled_at.to_string());
             task.status = "scheduled".to_string();
+        } else {
+            task.scheduled_at = None;
+            task.next_run_at = None;
+            task.status = "queued".to_string();
         }
         task.queued_at = Some(now.clone());
         task.updated_at = now.clone();
@@ -6483,6 +6522,7 @@ pub fn run() {
             commands::query_task_command,
             commands::set_task_planned_submit_count_command,
             commands::queue_tasks_with_model_strategy_command,
+            commands::queue_tasks_with_batch_schedule_command,
             commands::process_queue_command,
             commands::generate_task_title_command,
             commands::test_ai_model_command,
@@ -8233,6 +8273,66 @@ pub mod commands {
                             } else {
                                 format!("scheduled_at={new_scheduled_at}")
                             },
+                            task_id: None,
+                            task_title: None,
+                            submit_id: None,
+                            execution_record_id: None,
+                            error_detail: None,
+                            raw_output: None,
+                            stdout: None,
+                            stderr: None,
+                            module: None,
+                        },
+                    );
+                }
+                Ok(tasks)
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    #[tauri::command]
+    pub fn queue_tasks_with_batch_schedule_command(
+        store: State<'_, AppStore>,
+        plan: Vec<BatchQueuePlanItem>,
+        planned_submit_count: u32,
+        alternate_fast_model: bool,
+    ) -> Result<Vec<ScheduledTask>, String> {
+        store
+            .mutate(|data| {
+                let tasks = queue_tasks_with_batch_schedule(
+                    data,
+                    &plan,
+                    planned_submit_count,
+                    alternate_fast_model,
+                )?;
+                for task in &tasks {
+                    append_task_log(
+                        data,
+                        task,
+                        LogEntryDraft {
+                            level: LogLevel::Info,
+                            source: LogSource::Scheduler,
+                            category: "task".to_string(),
+                            event_type: "batch_queue_plan".to_string(),
+                            message: format!(
+                                "批量排队：{} -> {}{}",
+                                task.title,
+                                if task.status == "scheduled" {
+                                    "预定中"
+                                } else {
+                                    "排队中"
+                                },
+                                if alternate_fast_model {
+                                    format!(" · {}", task.params.model_version)
+                                } else {
+                                    String::new()
+                                }
+                            ),
+                            detail: task
+                                .scheduled_at
+                                .as_ref()
+                                .map(|scheduled_at| format!("scheduled_at={scheduled_at}"))
+                                .unwrap_or_default(),
                             task_id: None,
                             task_title: None,
                             submit_id: None,
