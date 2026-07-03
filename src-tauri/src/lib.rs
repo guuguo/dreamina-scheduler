@@ -52,6 +52,12 @@ enum ModelQueueKind {
     Fast,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubmitQueueSelection {
+    task_id: String,
+    target_queue_kind: ModelQueueKind,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AssetKind {
@@ -3848,6 +3854,21 @@ fn execution_record_model_queue_kind(record: &TaskExecutionRecord) -> ModelQueue
     model_queue_kind(&record.input_snapshot.params.model_version)
 }
 
+fn is_terminal_task_status(status: &str) -> bool {
+    matches!(status, "succeeded" | "failed")
+}
+
+fn has_drained_fast_queue_history(data: &AppData) -> bool {
+    data.tasks.iter().any(|task| {
+        task_model_queue_kind(task) == ModelQueueKind::Fast && is_terminal_task_status(&task.status)
+    }) || data.tasks.iter().any(|task| {
+        task.execution_records.iter().any(|record| {
+            execution_record_model_queue_kind(record) == ModelQueueKind::Fast
+                && is_terminal_task_status(&record.status)
+        })
+    })
+}
+
 fn active_remote_queue_kinds(data: &AppData) -> HashSet<ModelQueueKind> {
     let mut kinds = HashSet::new();
     for task in &data.tasks {
@@ -4081,17 +4102,28 @@ fn next_submit_task_id_for_available_queues(
     data: &AppData,
     now: DateTime<Utc>,
     active_kinds: &HashSet<ModelQueueKind>,
-) -> Option<String> {
-    [ModelQueueKind::Standard, ModelQueueKind::Fast]
+) -> Option<SubmitQueueSelection> {
+    let normal_selection = [ModelQueueKind::Standard, ModelQueueKind::Fast]
         .iter()
         .copied()
         .filter(|kind| model_queue_available(data, now, active_kinds, *kind))
         .filter_map(|kind| {
-            next_submit_task_id_for_queue(data, now, Some(kind)).map(|task_id| (kind, task_id))
+            next_submit_task_id_for_queue(data, now, Some(kind)).map(|task_id| {
+                SubmitQueueSelection {
+                    task_id,
+                    target_queue_kind: kind,
+                }
+            })
         })
-        .min_by(|(_, left_id), (_, right_id)| {
-            let left = data.tasks.iter().find(|task| task.id == *left_id);
-            let right = data.tasks.iter().find(|task| task.id == *right_id);
+        .min_by(|left_selection, right_selection| {
+            let left = data
+                .tasks
+                .iter()
+                .find(|task| task.id == left_selection.task_id);
+            let right = data
+                .tasks
+                .iter()
+                .find(|task| task.id == right_selection.task_id);
             match (left, right) {
                 (Some(left), Some(right)) => successful_execution_count(left)
                     .cmp(&successful_execution_count(right))
@@ -4100,8 +4132,27 @@ fn next_submit_task_id_for_available_queues(
                     .then_with(|| left.created_at.cmp(&right.created_at)),
                 _ => std::cmp::Ordering::Equal,
             }
-        })
-        .map(|(_, task_id)| task_id)
+        });
+
+    if normal_selection.is_some() {
+        return normal_selection;
+    }
+
+    let fast_available = model_queue_available(data, now, active_kinds, ModelQueueKind::Fast);
+    let standard_blocked = active_kinds.contains(&ModelQueueKind::Standard)
+        || has_concurrency_cooldown_for_queue(data, now, ModelQueueKind::Standard);
+    let has_due_fast =
+        next_submit_task_id_for_queue(data, now, Some(ModelQueueKind::Fast)).is_some();
+    if fast_available && standard_blocked && !has_due_fast && has_drained_fast_queue_history(data) {
+        return next_submit_task_id_for_queue(data, now, Some(ModelQueueKind::Standard)).map(
+            |task_id| SubmitQueueSelection {
+                task_id,
+                target_queue_kind: ModelQueueKind::Fast,
+            },
+        );
+    }
+
+    None
 }
 
 fn apply_planned_submit_completion(task: &mut ScheduledTask) {
@@ -4233,6 +4284,19 @@ pub fn queue_tasks_with_model_strategy(
     Ok(updated)
 }
 
+fn promote_task_to_fast_model(data: &mut AppData, task_id: &str) -> Result<(), SchedulerError> {
+    let task = data
+        .tasks
+        .iter_mut()
+        .find(|task| task.id == task_id)
+        .ok_or_else(|| SchedulerError::Io(format!("找不到任务：{task_id}")))?;
+    if task.params.model_version != FAST_FALLBACK_MODEL_VERSION {
+        task.params.model_version = FAST_FALLBACK_MODEL_VERSION.to_string();
+        task.updated_at = now_rfc3339();
+    }
+    Ok(())
+}
+
 pub fn process_next_due_task(data: &mut AppData) -> Result<Option<ScheduledTask>, SchedulerError> {
     process_next_due_task_with_runner(data, |args| run_dreamina_command(args))
 }
@@ -4278,11 +4342,14 @@ where
     }
 
     let active_kinds = active_remote_queue_kinds(data);
-    let Some(task_id) = next_submit_task_id_for_available_queues(data, now, &active_kinds) else {
+    let Some(selection) = next_submit_task_id_for_available_queues(data, now, &active_kinds) else {
         return Ok(None);
     };
+    if selection.target_queue_kind == ModelQueueKind::Fast {
+        promote_task_to_fast_model(data, &selection.task_id)?;
+    }
 
-    submit_task_once_with_runner(data, &task_id, &mut runner).map(Some)
+    submit_task_once_with_runner(data, &selection.task_id, &mut runner).map(Some)
 }
 
 pub fn pause_task(data: &mut AppData, task_id: &str) -> Result<ScheduledTask, SchedulerError> {
@@ -4535,8 +4602,12 @@ pub struct DueTaskCli {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DueTaskCliAction {
-    Query { submit_id: String },
-    Submit,
+    Query {
+        submit_id: String,
+    },
+    Submit {
+        model_version_override: Option<String>,
+    },
     FastFallbackSubmit,
 }
 
@@ -4604,12 +4675,23 @@ pub fn peek_due_task_cli(data: &AppData) -> Result<Option<DueTaskCli>, DueTaskBu
     }
     // 找下一个待提交任务；普通任务优先，队列空闲时再补试瞬时失败任务。
     let active_kinds = active_remote_queue_kinds(data);
-    let Some(task_id) = next_submit_task_id_for_available_queues(data, now, &active_kinds) else {
+    let Some(selection) = next_submit_task_id_for_available_queues(data, now, &active_kinds) else {
         return Ok(None);
     };
-    let Some(task) = data.tasks.iter().find(|task| task.id == task_id) else {
+    let Some(task) = data.tasks.iter().find(|task| task.id == selection.task_id) else {
         return Ok(None);
     };
+    let model_version_override = if selection.target_queue_kind == ModelQueueKind::Fast
+        && task_model_queue_kind(task) != ModelQueueKind::Fast
+    {
+        Some(FAST_FALLBACK_MODEL_VERSION.to_string())
+    } else {
+        None
+    };
+    let mut params = task.params.clone();
+    if let Some(model_version) = &model_version_override {
+        params.model_version = model_version.clone();
+    }
     let draft = TaskDraft {
         title: task.title.clone(),
         prompt: task.prompt.clone(),
@@ -4618,7 +4700,7 @@ pub fn peek_due_task_cli(data: &AppData) -> Result<Option<DueTaskCli>, DueTaskBu
         role_ids: task.role_ids.clone(),
         manual_mention_ids: task.manual_mention_ids.clone(),
         auto_match_roles: task.auto_match_roles,
-        params: task.params.clone(),
+        params,
         scheduled_at: task.scheduled_at.clone(),
         temp_image_asset_ids: task.temp_image_asset_ids.clone(),
         temp_image_paths: task.temp_image_paths.clone(),
@@ -4640,7 +4722,9 @@ pub fn peek_due_task_cli(data: &AppData) -> Result<Option<DueTaskCli>, DueTaskBu
     Ok(Some(DueTaskCli {
         task_id: task.id.clone(),
         args,
-        action: DueTaskCliAction::Submit,
+        action: DueTaskCliAction::Submit {
+            model_version_override,
+        },
     }))
 }
 
@@ -6181,7 +6265,7 @@ pub fn process_queue_for_store_blocking(
     let task = store
         .mutate(|data| {
             // scheduled → queued 迁移（仅普通 submit 路径需要）
-            if matches!(action, DueTaskCliAction::Submit) {
+            if matches!(action, DueTaskCliAction::Submit { .. }) {
                 let now = Utc::now();
                 let mut log_drafts: Vec<LogEntryDraft> = Vec::new();
                 for t in &mut data.tasks {
@@ -6221,7 +6305,14 @@ pub fn process_queue_for_store_blocking(
                         cli_result.clone()
                     })?
                 }
-                DueTaskCliAction::Submit => {
+                DueTaskCliAction::Submit {
+                    model_version_override,
+                } => {
+                    if let Some(model_version) = model_version_override {
+                        if model_version == FAST_FALLBACK_MODEL_VERSION {
+                            promote_task_to_fast_model(data, &task_id)?;
+                        }
+                    }
                     submit_task_once_with_runner(data, &task_id, |_| cli_result.clone())?
                 }
                 DueTaskCliAction::FastFallbackSubmit => {

@@ -9,9 +9,9 @@ use dreamina_scheduler_lib::{
     recover_tasks_on_load, remove_media_from_role, reschedule_task, resume_task,
     save_clipboard_image_asset, update_task_from_data, upsert_role, AppData, Asset, AssetKind,
     ClipboardImageInput, ConcurrencyLimitPolicy, CreateRoleInput, DreaminaErrorKind,
-    ImportRoleMediaInput, LogEntry, LogLevel, LogSource, RemoveRoleMediaInput, Role, ScheduledTask,
-    SchedulerSettings, TaskAttempt, TaskDraft, TaskExecutionInputSnapshot, TaskExecutionRecord,
-    VideoParams,
+    DueTaskCliAction, ImportRoleMediaInput, LogEntry, LogLevel, LogSource, RemoveRoleMediaInput,
+    Role, ScheduledTask, SchedulerSettings, TaskAttempt, TaskDraft, TaskExecutionInputSnapshot,
+    TaskExecutionRecord, VideoParams,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -222,6 +222,100 @@ fn standard_active_task_does_not_block_fast_queue_submission() {
     assert_eq!(result.id, "fast-waiting");
     assert_eq!(result.status, "querying");
     assert_eq!(result.submit_id, "fast-submit");
+}
+
+#[test]
+fn drained_fast_queue_promotes_standard_backlog_to_fast_when_standard_lane_is_stuck() {
+    let mut data = default_data();
+    let mut standard_active = queued_task("standard-active");
+    standard_active.status = "querying".to_string();
+    standard_active.submit_id = "standard-submit".to_string();
+    standard_active.submitted_at = Some(Utc::now().to_rfc3339());
+    standard_active.last_auto_query_at = Some(Utc::now().to_rfc3339());
+    standard_active.execution_records.push(TaskExecutionRecord {
+        id: "rec-standard".to_string(),
+        submit_id: "standard-submit".to_string(),
+        status: "querying".to_string(),
+        started_at: Utc::now().to_rfc3339(),
+        finished_at: String::new(),
+        input_snapshot: TaskExecutionInputSnapshot {
+            params: standard_active.params.clone(),
+            ..TaskExecutionInputSnapshot::default()
+        },
+        command_preview: vec![
+            "multimodal2video".to_string(),
+            "--model_version=seedance2.0".to_string(),
+        ],
+        query_records: vec![],
+        result_paths: vec![],
+        result_urls: vec![],
+        error_kind: String::new(),
+        error_detail: String::new(),
+    });
+
+    let mut fast_done = queued_task("fast-done");
+    fast_done.params.model_version = "seedance2.0fast".to_string();
+    fast_done.status = "succeeded".to_string();
+    fast_done.submit_id = "fast-done-submit".to_string();
+    fast_done.result_urls = vec!["https://example.com/fast.mp4".to_string()];
+
+    let standard_backlog = queued_task("standard-backlog");
+    data.tasks.push(standard_active);
+    data.tasks.push(fast_done);
+    data.tasks.push(standard_backlog);
+
+    let result = process_next_due_task_with_runner(&mut data, |args| {
+        assert_eq!(args[0], "multimodal2video");
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--model_version=seedance2.0fast"));
+        Ok((
+            r#"{"submit_id":"promoted-fast-submit","gen_status":"querying"}"#.to_string(),
+            String::new(),
+        ))
+    })
+    .expect("process queue")
+    .expect("standard backlog should be promoted into idle fast lane");
+
+    assert_eq!(result.id, "standard-backlog");
+    assert_eq!(result.params.model_version, "seedance2.0fast");
+    assert_eq!(result.status, "querying");
+    assert_eq!(result.submit_id, "promoted-fast-submit");
+}
+
+#[test]
+fn peek_due_task_cli_marks_promoted_standard_backlog_as_fast_submit() {
+    let mut data = default_data();
+    let mut standard_active = queued_task("standard-active");
+    standard_active.status = "querying".to_string();
+    standard_active.submit_id = "standard-submit".to_string();
+    standard_active.last_auto_query_at = Some(Utc::now().to_rfc3339());
+
+    let mut fast_done = queued_task("fast-done");
+    fast_done.params.model_version = "seedance2.0fast".to_string();
+    fast_done.status = "succeeded".to_string();
+    fast_done.submit_id = "fast-done-submit".to_string();
+    fast_done.result_urls = vec!["https://example.com/fast.mp4".to_string()];
+
+    data.tasks.push(standard_active);
+    data.tasks.push(fast_done);
+    data.tasks.push(queued_task("standard-backlog"));
+
+    let due = peek_due_task_cli(&data)
+        .expect("peek should build due cli")
+        .expect("promoted standard backlog should be due");
+
+    assert_eq!(due.task_id, "standard-backlog");
+    assert!(due
+        .args
+        .iter()
+        .any(|arg| arg == "--model_version=seedance2.0fast"));
+    assert_eq!(
+        due.action,
+        DueTaskCliAction::Submit {
+            model_version_override: Some("seedance2.0fast".to_string())
+        }
+    );
 }
 
 #[test]
