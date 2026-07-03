@@ -166,9 +166,9 @@ fn queue_tasks_with_alternating_fast_model_assigns_every_second_task_to_fast() {
 
     assert_eq!(updated.len(), 4);
     assert_eq!(data.tasks[0].params.model_version, "seedance2.0");
-    assert_eq!(data.tasks[1].params.model_version, "seedance2.0fast");
+    assert_eq!(data.tasks[1].params.model_version, "seedance2.0");
     assert_eq!(data.tasks[2].params.model_version, "seedance2.0");
-    assert_eq!(data.tasks[3].params.model_version, "seedance2.0fast");
+    assert_eq!(data.tasks[3].params.model_version, "seedance2.0");
     assert!(data.tasks.iter().all(|task| task.status == "queued"));
 }
 
@@ -201,7 +201,7 @@ fn queue_tasks_with_batch_schedule_supports_immediate_interval_and_alternating_f
     assert_eq!(data.tasks[0].params.model_version, "seedance2.0");
     assert_eq!(data.tasks[1].status, "scheduled");
     assert_eq!(data.tasks[1].scheduled_at, Some(delayed_at));
-    assert_eq!(data.tasks[1].params.model_version, "seedance2.0fast");
+    assert_eq!(data.tasks[1].params.model_version, "seedance2.0");
 }
 
 #[test]
@@ -310,7 +310,7 @@ fn drained_fast_queue_promotes_standard_backlog_to_fast_when_standard_lane_is_st
     .expect("standard backlog should be promoted into idle fast lane");
 
     assert_eq!(result.id, "standard-backlog");
-    assert_eq!(result.params.model_version, "seedance2.0fast");
+    assert_eq!(result.params.model_version, "seedance2.0"); // original task unchanged
     assert_eq!(result.status, "querying");
     assert_eq!(result.submit_id, "promoted-fast-submit");
 }
@@ -2669,6 +2669,7 @@ fn second_submit_creates_new_execution_record_with_new_submit_id() {
     let submitted = dreamina_scheduler_lib::submit_task_once_with_runner(
         &mut data,
         "task-second-submit",
+        None,
         |_| {
             Ok((
                 r#"{"submit_id":"sub-second","gen_status":"querying"}"#.to_string(),
@@ -2711,7 +2712,7 @@ fn failed_second_submit_does_not_reuse_previous_submit_id() {
     .expect("edit should succeed");
 
     let submitted =
-        dreamina_scheduler_lib::submit_task_once_with_runner(&mut data, "task-second-fail", |_| {
+        dreamina_scheduler_lib::submit_task_once_with_runner(&mut data, "task-second-fail", None, |_| {
             Ok((r#"{"message":"提交失败"}"#.to_string(), String::new()))
         })
         .expect("failed submit should still write task state");

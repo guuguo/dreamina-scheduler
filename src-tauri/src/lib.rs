@@ -4305,13 +4305,6 @@ pub fn queue_tasks_with_batch_schedule(
             .map(|value| value.trim())
             .filter(|value| !value.is_empty());
         task.planned_submit_count = normalized_count;
-        if alternate_fast_model {
-            task.params.model_version = if order % 2 == 1 {
-                FAST_FALLBACK_MODEL_VERSION.to_string()
-            } else {
-                "seedance2.0".to_string()
-            };
-        }
         ensure_task_has_pending_submit(task);
         if let Some(scheduled_at) = scheduled_at {
             task.scheduled_at = Some(scheduled_at.to_string());
@@ -4328,19 +4321,6 @@ pub fn queue_tasks_with_batch_schedule(
     }
 
     Ok(updated)
-}
-
-fn promote_task_to_fast_model(data: &mut AppData, task_id: &str) -> Result<(), SchedulerError> {
-    let task = data
-        .tasks
-        .iter_mut()
-        .find(|task| task.id == task_id)
-        .ok_or_else(|| SchedulerError::Io(format!("找不到任务：{task_id}")))?;
-    if task.params.model_version != FAST_FALLBACK_MODEL_VERSION {
-        task.params.model_version = FAST_FALLBACK_MODEL_VERSION.to_string();
-        task.updated_at = now_rfc3339();
-    }
-    Ok(())
 }
 
 pub fn process_next_due_task(data: &mut AppData) -> Result<Option<ScheduledTask>, SchedulerError> {
@@ -4391,11 +4371,13 @@ where
     let Some(selection) = next_submit_task_id_for_available_queues(data, now, &active_kinds) else {
         return Ok(None);
     };
-    if selection.target_queue_kind == ModelQueueKind::Fast {
-        promote_task_to_fast_model(data, &selection.task_id)?;
-    }
+    let model_version_override = if selection.target_queue_kind == ModelQueueKind::Fast {
+        Some(FAST_FALLBACK_MODEL_VERSION)
+    } else {
+        None
+    };
 
-    submit_task_once_with_runner(data, &selection.task_id, &mut runner).map(Some)
+    submit_task_once_with_runner(data, &selection.task_id, model_version_override, &mut runner).map(Some)
 }
 
 pub fn pause_task(data: &mut AppData, task_id: &str) -> Result<ScheduledTask, SchedulerError> {
@@ -5182,12 +5164,13 @@ pub fn submit_task_once(
     data: &mut AppData,
     task_id: &str,
 ) -> Result<ScheduledTask, SchedulerError> {
-    submit_task_once_with_runner(data, task_id, |args| run_dreamina_command(args))
+    submit_task_once_with_runner(data, task_id, None, |args| run_dreamina_command(args))
 }
 
 pub fn submit_task_once_with_runner<F>(
     data: &mut AppData,
     task_id: &str,
+    model_version_override: Option<&str>,
     mut runner: F,
 ) -> Result<ScheduledTask, SchedulerError>
 where
@@ -5199,6 +5182,10 @@ where
         .position(|task| task.id == task_id)
         .ok_or_else(|| SchedulerError::Io(format!("找不到任务：{task_id}")))?;
     let task = data.tasks[task_index].clone();
+    let mut params = task.params.clone();
+    if let Some(mv) = model_version_override {
+        params.model_version = mv.to_string();
+    }
     let draft = TaskDraft {
         title: task.title.clone(),
         prompt: task.prompt.clone(),
@@ -5207,7 +5194,7 @@ where
         role_ids: task.role_ids.clone(),
         manual_mention_ids: task.manual_mention_ids.clone(),
         auto_match_roles: task.auto_match_roles,
-        params: task.params.clone(),
+        params,
         scheduled_at: task.scheduled_at.clone(),
         temp_image_asset_ids: task.temp_image_asset_ids.clone(),
         temp_image_paths: task.temp_image_paths.clone(),
@@ -6354,12 +6341,7 @@ pub fn process_queue_for_store_blocking(
                 DueTaskCliAction::Submit {
                     model_version_override,
                 } => {
-                    if let Some(model_version) = model_version_override {
-                        if model_version == FAST_FALLBACK_MODEL_VERSION {
-                            promote_task_to_fast_model(data, &task_id)?;
-                        }
-                    }
-                    submit_task_once_with_runner(data, &task_id, |_| cli_result.clone())?
+                    submit_task_once_with_runner(data, &task_id, model_version_override.as_deref(), |_| cli_result.clone())?
                 }
                 DueTaskCliAction::FastFallbackSubmit => {
                     submit_fast_fallback_once_with_runner(data, &task_id, |_| cli_result.clone())?
@@ -7085,7 +7067,7 @@ pub mod commands {
         let task = store
             .mutate(|data| {
                 let task =
-                    submit_task_once_with_runner(data, &task_id, |_args| cli_result.clone())?;
+                    submit_task_once_with_runner(data, &task_id, None, |_args| cli_result.clone())?;
                 append_task_log(
                     data,
                     &task,
@@ -9729,7 +9711,7 @@ mod tests {
             assets: vec![make_test_image_asset()],
             ..AppData::default()
         };
-        let task = submit_task_once_with_runner(&mut data, "t5xx", |_args| {
+        let task = submit_task_once_with_runner(&mut data, "t5xx", None, |_args| {
             Ok((
                 r#"{"code": 50001, "message": "服务器内部错误"}"#.to_string(),
                 String::new(),
@@ -9750,7 +9732,7 @@ mod tests {
         // 模拟已经历 1 轮并发等待
         data.tasks[0].server_error_retry_count = 1;
         data.tasks[0].status = "queued".to_string();
-        let task = submit_task_once_with_runner(&mut data, "t5xx2", |_args| {
+        let task = submit_task_once_with_runner(&mut data, "t5xx2", None, |_args| {
             Ok((
                 r#"{"code": 50001, "message": "服务器内部错误"}"#.to_string(),
                 String::new(),
@@ -9771,7 +9753,7 @@ mod tests {
         // 模拟已经历 2 轮并发等待
         data.tasks[0].server_error_retry_count = 2;
         data.tasks[0].status = "queued".to_string();
-        let task = submit_task_once_with_runner(&mut data, "t5xx3", |_args| {
+        let task = submit_task_once_with_runner(&mut data, "t5xx3", None, |_args| {
             Ok((
                 r#"{"code": 50001, "message": "服务器内部错误"}"#.to_string(),
                 String::new(),
@@ -9791,7 +9773,7 @@ mod tests {
         };
         data.tasks[0].server_error_retry_count = 1;
         data.tasks[0].status = "queued".to_string();
-        let task = submit_task_once_with_runner(&mut data, "t5xx-ok", |_args| {
+        let task = submit_task_once_with_runner(&mut data, "t5xx-ok", None, |_args| {
             Ok((r#"{"submit_id": "ok-id-123"}"#.to_string(), String::new()))
         })
         .expect("should not Err");
@@ -9809,6 +9791,7 @@ mod tests {
         let task = submit_task_once_with_runner(
             &mut data,
             "t-concurrency-submit-id",
+            None,
             |_args| Ok((
                 r#"{"submit_id":"fake-sub-123","gen_status":"fail","fail_reason":"api error: ret=1310, message=ExceedConcurrencyLimit"}"#.to_string(),
                 String::new(),
