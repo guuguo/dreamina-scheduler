@@ -257,6 +257,36 @@ fn standard_active_task_does_not_block_fast_queue_submission() {
 }
 
 #[test]
+fn due_standard_query_does_not_starve_idle_fast_submission() {
+    let mut data = default_data();
+    let mut standard_active = queued_task("standard-active-due-query");
+    standard_active.status = "querying".to_string();
+    standard_active.submit_id = "standard-submit".to_string();
+    standard_active.submitted_at = Some((Utc::now() - Duration::minutes(10)).to_rfc3339());
+    standard_active.last_auto_query_at = Some((Utc::now() - Duration::minutes(10)).to_rfc3339());
+    let standard_backlog = queued_task("standard-backlog");
+    data.tasks.push(standard_active);
+    data.tasks.push(standard_backlog);
+
+    let result = process_next_due_task_with_runner(&mut data, |args| {
+        assert_eq!(args[0], "multimodal2video");
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--model_version=seedance2.0fast"));
+        Ok((
+            r#"{"submit_id":"promoted-fast-submit","gen_status":"querying"}"#.to_string(),
+            String::new(),
+        ))
+    })
+    .expect("process queue")
+    .expect("idle fast lane should submit before querying standard task");
+
+    assert_eq!(result.id, "standard-backlog");
+    assert_eq!(result.status, "querying");
+    assert_eq!(result.submit_id, "promoted-fast-submit");
+}
+
+#[test]
 fn drained_fast_queue_promotes_standard_backlog_to_fast_when_standard_lane_is_stuck() {
     let mut data = default_data();
     let mut standard_active = queued_task("standard-active");
@@ -336,6 +366,35 @@ fn peek_due_task_cli_marks_promoted_standard_backlog_as_fast_submit() {
     let due = peek_due_task_cli(&data)
         .expect("peek should build due cli")
         .expect("promoted standard backlog should be due");
+
+    assert_eq!(due.task_id, "standard-backlog");
+    assert!(due
+        .args
+        .iter()
+        .any(|arg| arg == "--model_version=seedance2.0fast"));
+    assert_eq!(
+        due.action,
+        DueTaskCliAction::Submit {
+            model_version_override: Some("seedance2.0fast".to_string())
+        }
+    );
+}
+
+#[test]
+fn peek_due_task_cli_submits_idle_fast_before_due_standard_query() {
+    let mut data = default_data();
+    let mut standard_active = queued_task("standard-active-due-query");
+    standard_active.status = "querying".to_string();
+    standard_active.submit_id = "standard-submit".to_string();
+    standard_active.submitted_at = Some((Utc::now() - Duration::minutes(10)).to_rfc3339());
+    standard_active.last_auto_query_at = Some((Utc::now() - Duration::minutes(10)).to_rfc3339());
+
+    data.tasks.push(standard_active);
+    data.tasks.push(queued_task("standard-backlog"));
+
+    let due = peek_due_task_cli(&data)
+        .expect("peek should build due cli")
+        .expect("idle fast lane should be due");
 
     assert_eq!(due.task_id, "standard-backlog");
     assert!(due
@@ -2726,11 +2785,13 @@ fn failed_second_submit_does_not_reuse_previous_submit_id() {
     )
     .expect("edit should succeed");
 
-    let submitted =
-        dreamina_scheduler_lib::submit_task_once_with_runner(&mut data, "task-second-fail", None, |_| {
-            Ok((r#"{"message":"提交失败"}"#.to_string(), String::new()))
-        })
-        .expect("failed submit should still write task state");
+    let submitted = dreamina_scheduler_lib::submit_task_once_with_runner(
+        &mut data,
+        "task-second-fail",
+        None,
+        |_| Ok((r#"{"message":"提交失败"}"#.to_string(), String::new())),
+    )
+    .expect("failed submit should still write task state");
 
     assert_eq!(submitted.status, "failed");
     assert_eq!(

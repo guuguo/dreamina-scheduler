@@ -2117,6 +2117,22 @@ fn next_due_current_query_target(data: &AppData, now: DateTime<Utc>) -> Option<(
     None
 }
 
+fn next_due_initial_current_query_target(
+    data: &AppData,
+    now: DateTime<Utc>,
+) -> Option<(String, String)> {
+    for task in data.tasks.iter().filter(|task| {
+        matches!(task.status.as_str(), "querying" | "submitted")
+            && !task.auto_query_stopped
+            && task.last_auto_query_at.is_none()
+    }) {
+        if !task.submit_id.trim().is_empty() && is_query_due(task, now) {
+            return Some((task.id.clone(), task.submit_id.clone()));
+        }
+    }
+    None
+}
+
 /// 判断任务是否超过最长等待时间（4小时），需要停止自动查询
 pub fn is_past_max_wait(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
     let Some(ref submitted_at) = task.submitted_at else {
@@ -4059,15 +4075,12 @@ fn next_due_submit_task_id(data: &AppData, now: DateTime<Utc>) -> Option<String>
 fn next_due_submit_task_id_for_queue(
     data: &AppData,
     now: DateTime<Utc>,
-    queue_kind: Option<ModelQueueKind>,
+    _queue_kind: Option<ModelQueueKind>,
 ) -> Option<String> {
     data.tasks
         .iter()
         .enumerate()
-        .filter(|(_, task)| {
-            needs_more_successful_submits(task)
-                && is_due_for_submit(task, now)
-        })
+        .filter(|(_, task)| needs_more_successful_submits(task) && is_due_for_submit(task, now))
         .min_by(|(left_index, left), (right_index, right)| {
             successful_execution_count(left)
                 .cmp(&successful_execution_count(right))
@@ -4082,15 +4095,13 @@ fn next_due_submit_task_id_for_queue(
 fn next_idle_failed_retry_task_id_for_queue(
     data: &AppData,
     now: DateTime<Utc>,
-    queue_kind: Option<ModelQueueKind>,
+    _queue_kind: Option<ModelQueueKind>,
 ) -> Option<String> {
     let retry_delay_seconds = data.settings.concurrency_retry_delay_seconds;
     data.tasks
         .iter()
         .enumerate()
-        .filter(|(_, task)| {
-            is_idle_failed_retry_due(task, now, retry_delay_seconds)
-        })
+        .filter(|(_, task)| is_idle_failed_retry_due(task, now, retry_delay_seconds))
         .min_by(|(left_index, left), (right_index, right)| {
             successful_execution_count(left)
                 .cmp(&successful_execution_count(right))
@@ -4351,7 +4362,7 @@ where
         return submit_fast_fallback_once_with_runner(data, &task_id, &mut runner).map(Some);
     }
 
-    if let Some((task_id, submit_id)) = next_due_current_query_target(data, now) {
+    if let Some((task_id, submit_id)) = next_due_initial_current_query_target(data, now) {
         return query_task_submit_id_once_with_runner(data, &task_id, &submit_id, &mut runner)
             .map(Some);
     }
@@ -4366,16 +4377,28 @@ where
     }
 
     let active_kinds = active_remote_queue_kinds(data);
-    let Some(selection) = next_submit_task_id_for_available_queues(data, now, &active_kinds) else {
-        return Ok(None);
-    };
-    let model_version_override = if selection.target_queue_kind == ModelQueueKind::Fast {
-        Some(FAST_FALLBACK_MODEL_VERSION)
-    } else {
-        None
-    };
+    if let Some(selection) = next_submit_task_id_for_available_queues(data, now, &active_kinds) {
+        let model_version_override = if selection.target_queue_kind == ModelQueueKind::Fast {
+            Some(FAST_FALLBACK_MODEL_VERSION)
+        } else {
+            None
+        };
 
-    submit_task_once_with_runner(data, &selection.task_id, model_version_override, &mut runner).map(Some)
+        return submit_task_once_with_runner(
+            data,
+            &selection.task_id,
+            model_version_override,
+            &mut runner,
+        )
+        .map(Some);
+    }
+
+    if let Some((task_id, submit_id)) = next_due_current_query_target(data, now) {
+        return query_task_submit_id_once_with_runner(data, &task_id, &submit_id, &mut runner)
+            .map(Some);
+    }
+
+    Ok(None)
 }
 
 pub fn pause_task(data: &mut AppData, task_id: &str) -> Result<ScheduledTask, SchedulerError> {
@@ -4688,7 +4711,7 @@ pub fn peek_due_task_cli(data: &AppData) -> Result<Option<DueTaskCli>, DueTaskBu
             action: DueTaskCliAction::FastFallbackSubmit,
         }));
     }
-    if let Some((task_id, submit_id)) = next_due_current_query_target(data, now) {
+    if let Some((task_id, submit_id)) = next_due_initial_current_query_target(data, now) {
         let args = vec![
             "query_result".to_string(),
             format!("--submit_id={submit_id}"),
@@ -4701,57 +4724,70 @@ pub fn peek_due_task_cli(data: &AppData) -> Result<Option<DueTaskCli>, DueTaskBu
     }
     // 找下一个待提交任务；普通任务优先，队列空闲时再补试瞬时失败任务。
     let active_kinds = active_remote_queue_kinds(data);
-    let Some(selection) = next_submit_task_id_for_available_queues(data, now, &active_kinds) else {
-        return Ok(None);
-    };
-    let Some(task) = data.tasks.iter().find(|task| task.id == selection.task_id) else {
-        return Ok(None);
-    };
-    let model_version_override = if selection.target_queue_kind == ModelQueueKind::Fast
-        && task_model_queue_kind(task) != ModelQueueKind::Fast
-    {
-        Some(FAST_FALLBACK_MODEL_VERSION.to_string())
-    } else {
-        None
-    };
-    let mut params = task.params.clone();
-    if let Some(model_version) = &model_version_override {
-        params.model_version = model_version.clone();
-    }
-    let draft = TaskDraft {
-        title: task.title.clone(),
-        prompt: task.prompt.clone(),
-        image_asset_ids: task.image_asset_ids.clone(),
-        audio_asset_ids: task.audio_asset_ids.clone(),
-        role_ids: task.role_ids.clone(),
-        manual_mention_ids: task.manual_mention_ids.clone(),
-        auto_match_roles: task.auto_match_roles,
-        params,
-        scheduled_at: task.scheduled_at.clone(),
-        temp_image_asset_ids: task.temp_image_asset_ids.clone(),
-        temp_image_paths: task.temp_image_paths.clone(),
-        prompt_doc: task.prompt_doc.clone(),
-    };
-    let resolved = resolve_task_inputs(&draft, &data.assets, &data.roles).map_err(|error| {
-        DueTaskBuildError {
-            task_id: task.id.clone(),
-            task_title: task.title.clone(),
-            message: format!("构建提交输入失败：{error}"),
+    if let Some(selection) = next_submit_task_id_for_available_queues(data, now, &active_kinds) {
+        let Some(task) = data.tasks.iter().find(|task| task.id == selection.task_id) else {
+            return Ok(None);
+        };
+        let model_version_override = if selection.target_queue_kind == ModelQueueKind::Fast
+            && task_model_queue_kind(task) != ModelQueueKind::Fast
+        {
+            Some(FAST_FALLBACK_MODEL_VERSION.to_string())
+        } else {
+            None
+        };
+        let mut params = task.params.clone();
+        if let Some(model_version) = &model_version_override {
+            params.model_version = model_version.clone();
         }
-    })?;
-    let args =
-        build_multimodal2video_args(&draft, &resolved).map_err(|error| DueTaskBuildError {
-            task_id: task.id.clone(),
-            task_title: task.title.clone(),
-            message: format!("构建提交命令失败：{error}"),
+        let draft = TaskDraft {
+            title: task.title.clone(),
+            prompt: task.prompt.clone(),
+            image_asset_ids: task.image_asset_ids.clone(),
+            audio_asset_ids: task.audio_asset_ids.clone(),
+            role_ids: task.role_ids.clone(),
+            manual_mention_ids: task.manual_mention_ids.clone(),
+            auto_match_roles: task.auto_match_roles,
+            params,
+            scheduled_at: task.scheduled_at.clone(),
+            temp_image_asset_ids: task.temp_image_asset_ids.clone(),
+            temp_image_paths: task.temp_image_paths.clone(),
+            prompt_doc: task.prompt_doc.clone(),
+        };
+        let resolved = resolve_task_inputs(&draft, &data.assets, &data.roles).map_err(|error| {
+            DueTaskBuildError {
+                task_id: task.id.clone(),
+                task_title: task.title.clone(),
+                message: format!("构建提交输入失败：{error}"),
+            }
         })?;
-    Ok(Some(DueTaskCli {
-        task_id: task.id.clone(),
-        args,
-        action: DueTaskCliAction::Submit {
-            model_version_override,
-        },
-    }))
+        let args =
+            build_multimodal2video_args(&draft, &resolved).map_err(|error| DueTaskBuildError {
+                task_id: task.id.clone(),
+                task_title: task.title.clone(),
+                message: format!("构建提交命令失败：{error}"),
+            })?;
+        return Ok(Some(DueTaskCli {
+            task_id: task.id.clone(),
+            args,
+            action: DueTaskCliAction::Submit {
+                model_version_override,
+            },
+        }));
+    }
+
+    if let Some((task_id, submit_id)) = next_due_current_query_target(data, now) {
+        let args = vec![
+            "query_result".to_string(),
+            format!("--submit_id={submit_id}"),
+        ];
+        return Ok(Some(DueTaskCli {
+            task_id,
+            args,
+            action: DueTaskCliAction::Query { submit_id },
+        }));
+    }
+
+    Ok(None)
 }
 
 /// 后台调度循环的空闲短路判定：仅当存在活跃任务、或有到期工作（含构建出错需处理）时才跑重函数。
@@ -6338,9 +6374,12 @@ pub fn process_queue_for_store_blocking(
                 }
                 DueTaskCliAction::Submit {
                     model_version_override,
-                } => {
-                    submit_task_once_with_runner(data, &task_id, model_version_override.as_deref(), |_| cli_result.clone())?
-                }
+                } => submit_task_once_with_runner(
+                    data,
+                    &task_id,
+                    model_version_override.as_deref(),
+                    |_| cli_result.clone(),
+                )?,
                 DueTaskCliAction::FastFallbackSubmit => {
                     submit_fast_fallback_once_with_runner(data, &task_id, |_| cli_result.clone())?
                 }
