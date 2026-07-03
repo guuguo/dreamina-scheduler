@@ -198,7 +198,7 @@ const views = [
 const emptyState = {
   settings: {
     concurrency_limit_policy: 'SilentRetry',
-    concurrency_retry_delay_seconds: 300,
+    concurrency_retry_delay_seconds: 30,
     concurrency_retry_max_attempts: 8,
     auto_query_enabled: true,
     poll_interval_seconds: 60,
@@ -949,7 +949,7 @@ function App() {
       const savedSettings = await invoke('update_settings_command', {
         input: {
           concurrency_limit_policy: 'SilentRetry',
-          concurrency_retry_delay_seconds: Number(settingsForm.concurrency_retry_delay_seconds) || 300,
+          concurrency_retry_delay_seconds: Number(settingsForm.concurrency_retry_delay_seconds) || 30,
           concurrency_retry_max_attempts: Number(settingsForm.concurrency_retry_max_attempts) || 8,
           auto_query_enabled: settingsForm.auto_query_enabled ?? true,
           poll_interval_seconds: Number(settingsForm.poll_interval_seconds) || 60,
@@ -1851,7 +1851,7 @@ const TaskCard = React.memo(function TaskCard({ task, index, selected, selectedF
         <StatusBadge status={task.status} />
         <span className={`qc-task-time${task.status === 'scheduled' ? ' scheduled' : ''}`}>
           {task.status === 'scheduled' && task.scheduled_at
-            ? formatDatePart(task.scheduled_at, 'time')
+            ? formatDate(task.scheduled_at)
             : formatDatePart(task.updated_at, 'time')}
         </span>
       </div>
@@ -3088,10 +3088,13 @@ function SchedulePickerModal({ title, mode = 'single', taskCount = 1, onClose, o
   const today = formatDateInputValue(new Date());
   const tomorrowDate = new Date();
   tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+  const defaultQuietTime = '02:00';
+  const defaultQuietDate = new Date();
+  defaultQuietDate.setHours(2, 0, 0, 0);
   const [scheduleMode, setScheduleMode] = useState(isMultiTask ? 'relative' : 'immediate');
   const [relativeHours, setRelativeHours] = useState(2);
-  const [day, setDay] = useState('tomorrow');
-  const [quietTime, setQuietTime] = useState('02:00');
+  const [day, setDay] = useState(defaultQuietDate.getTime() > Date.now() ? 'today' : 'tomorrow');
+  const [quietTime, setQuietTime] = useState(defaultQuietTime);
   const [customDate, setCustomDate] = useState(formatDateInputValue(tomorrowDate));
   const [customTime, setCustomTime] = useState('02:00');
   const [intervalMinutes, setIntervalMinutes] = useState(0);
@@ -3473,7 +3476,7 @@ function SettingsView({ cli, settingsForm, setSettingsForm, checkCli, checkCliUp
           <label>
             并发重试间隔（秒）
             <div className="settings-input-hint-row">
-              <input type="number" min="30" value={settingsForm.concurrency_retry_delay_seconds || 300}
+              <input type="number" min="30" value={settingsForm.concurrency_retry_delay_seconds || 30}
                 onChange={(e) => setSettingsForm({ ...settingsForm, concurrency_retry_delay_seconds: e.target.value })} />
               <span className="settings-range-hint">30-3600</span>
             </div>

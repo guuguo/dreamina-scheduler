@@ -40,6 +40,10 @@ const MAX_CONCURRENCY_FAILURE_RECOVERY_HOURS: i64 = 24;
 const IMAGE_SUBMIT_TIMEOUT_SECS: u64 = 300;
 const IMAGE_SUBMIT_CONNECT_TIMEOUT_SECS: u64 = 300;
 const SCHEDULER_TICK_INTERVAL_SECS: u64 = 30;
+const DEFAULT_CONCURRENCY_RETRY_DELAY_SECONDS: u64 = 30;
+const LEGACY_CONCURRENCY_RETRY_DELAY_SECONDS: u64 = 300;
+const FAST_FALLBACK_MODEL_VERSION: &str = "seedance2.0fast";
+const FAST_FALLBACK_QUEUE_WAIT_HOURS: i64 = 2;
 static PROCESS_QUEUE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 
@@ -491,6 +495,8 @@ pub struct ScheduledTask {
     pub status: String,
     pub scheduled_at: Option<String>,
     pub next_run_at: Option<String>,
+    #[serde(default)]
+    pub queued_at: Option<String>,
     pub submit_id: String,
     pub attempt_count: u32,
     pub concurrency_retry_count: u32,
@@ -560,6 +566,7 @@ impl From<TaskDraft> for ScheduledTask {
             status: status.to_string(),
             scheduled_at: scheduled_at.clone(),
             next_run_at: scheduled_at,
+            queued_at: Some(now.clone()),
             submit_id: String::new(),
             attempt_count: 0,
             concurrency_retry_count: 0,
@@ -1471,6 +1478,7 @@ fn load_app_data_from_disk(root_dir: &Path) -> Result<AppData, SchedulerError> {
 
 fn normalize_loaded_app_data(data: &mut AppData) {
     data.settings.concurrency_limit_policy = ConcurrencyLimitPolicy::SilentRetry;
+    normalize_concurrency_retry_settings(&mut data.settings);
     normalize_image_model_settings(&mut data.settings);
     backfill_execution_records_from_attempts(data);
     compact_retry_execution_records_for_display(data);
@@ -1481,6 +1489,12 @@ fn normalize_loaded_app_data(data: &mut AppData) {
     apply_log_retention(data);
     cap_execution_history(data);
     rebuild_asset_hash_index(data);
+}
+
+fn normalize_concurrency_retry_settings(settings: &mut SchedulerSettings) {
+    if settings.concurrency_retry_delay_seconds == LEGACY_CONCURRENCY_RETRY_DELAY_SECONDS {
+        settings.concurrency_retry_delay_seconds = DEFAULT_CONCURRENCY_RETRY_DELAY_SECONDS;
+    }
 }
 
 pub fn default_store_dir() -> PathBuf {
@@ -1827,7 +1841,7 @@ impl Default for SchedulerSettings {
     fn default() -> Self {
         Self {
             concurrency_limit_policy: ConcurrencyLimitPolicy::SilentRetry,
-            concurrency_retry_delay_seconds: 300,
+            concurrency_retry_delay_seconds: DEFAULT_CONCURRENCY_RETRY_DELAY_SECONDS,
             concurrency_retry_max_attempts: 8,
             auto_query_enabled: true,
             poll_interval_seconds: 60,
@@ -1954,6 +1968,122 @@ pub fn is_query_due(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
     DateTime::parse_from_rfc3339(last_at)
         .map(|t| now.signed_duration_since(t.with_timezone(&Utc)) >= interval)
         .unwrap_or(true)
+}
+
+fn record_query_due(record: &TaskExecutionRecord, now: DateTime<Utc>) -> bool {
+    let Some(last_query) = record.query_records.last() else {
+        return true;
+    };
+    DateTime::parse_from_rfc3339(&last_query.finished_at)
+        .or_else(|_| DateTime::parse_from_rfc3339(&last_query.started_at))
+        .map(|time| now.signed_duration_since(time.with_timezone(&Utc)) >= Duration::seconds(60))
+        .unwrap_or(true)
+}
+
+fn is_active_execution_record(record: &TaskExecutionRecord) -> bool {
+    matches!(record.status.as_str(), "querying" | "submitted")
+        && !record.submit_id.trim().is_empty()
+}
+
+fn queue_info_is_queueing(queue_info: Option<&QueueInfo>) -> bool {
+    queue_info
+        .and_then(|info| info.queue_status.as_deref())
+        .map(|status| status.eq_ignore_ascii_case("queueing"))
+        .unwrap_or(false)
+}
+
+fn current_submit_has_waited_for_fast_fallback(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
+    if !matches!(task.status.as_str(), "querying" | "submitted")
+        || task.submit_id.trim().is_empty()
+        || !queue_info_is_queueing(task.queue_info.as_ref())
+    {
+        return false;
+    }
+    let Some(submitted_at) = task.submitted_at.as_ref() else {
+        return false;
+    };
+    DateTime::parse_from_rfc3339(submitted_at.trim())
+        .map(|time| {
+            now.signed_duration_since(time.with_timezone(&Utc))
+                >= Duration::hours(FAST_FALLBACK_QUEUE_WAIT_HOURS)
+        })
+        .unwrap_or(false)
+}
+
+fn is_fast_execution_record(record: &TaskExecutionRecord) -> bool {
+    record.input_snapshot.params.model_version == FAST_FALLBACK_MODEL_VERSION
+        || record
+            .command_preview
+            .iter()
+            .any(|arg| arg == &format!("--model_version={FAST_FALLBACK_MODEL_VERSION}"))
+}
+
+fn record_sort_time(record: &TaskExecutionRecord) -> &str {
+    if record.finished_at.trim().is_empty() {
+        record.started_at.as_str()
+    } else {
+        record.finished_at.as_str()
+    }
+}
+
+fn latest_fast_execution_record(task: &ScheduledTask) -> Option<&TaskExecutionRecord> {
+    task.execution_records
+        .iter()
+        .filter(|record| is_fast_execution_record(record))
+        .max_by(|left, right| record_sort_time(left).cmp(record_sort_time(right)))
+}
+
+fn has_active_fast_execution_record(task: &ScheduledTask) -> bool {
+    task.execution_records
+        .iter()
+        .any(|record| is_fast_execution_record(record) && is_active_execution_record(record))
+}
+
+fn is_fast_fallback_due(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
+    if !current_submit_has_waited_for_fast_fallback(task, now)
+        || has_active_fast_execution_record(task)
+    {
+        return false;
+    }
+    let Some(latest_fast) = latest_fast_execution_record(task) else {
+        return true;
+    };
+    DateTime::parse_from_rfc3339(record_sort_time(latest_fast))
+        .map(|time| {
+            now.signed_duration_since(time.with_timezone(&Utc))
+                >= Duration::hours(FAST_FALLBACK_QUEUE_WAIT_HOURS)
+        })
+        .unwrap_or(true)
+}
+
+fn next_due_fast_query_target(data: &AppData, now: DateTime<Utc>) -> Option<(String, String)> {
+    for task in data.tasks.iter().filter(|task| {
+        matches!(task.status.as_str(), "querying" | "submitted") && !task.auto_query_stopped
+    }) {
+        if let Some(record) = task
+            .execution_records
+            .iter()
+            .find(|record| {
+                is_fast_execution_record(record)
+                    && is_active_execution_record(record)
+                    && record_query_due(record, now)
+            })
+        {
+            return Some((task.id.clone(), record.submit_id.clone()));
+        }
+    }
+    None
+}
+
+fn next_due_current_query_target(data: &AppData, now: DateTime<Utc>) -> Option<(String, String)> {
+    for task in data.tasks.iter().filter(|task| {
+        matches!(task.status.as_str(), "querying" | "submitted") && !task.auto_query_stopped
+    }) {
+        if !task.submit_id.trim().is_empty() && is_query_due(task, now) {
+            return Some((task.id.clone(), task.submit_id.clone()));
+        }
+    }
+    None
 }
 
 /// 判断任务是否超过最长等待时间（4小时），需要停止自动查询
@@ -3383,7 +3513,10 @@ pub fn recover_tasks_on_load(data: &mut AppData) {
             task.updated_at = now_rfc3339();
             recover_failed_concurrency_execution_record(task);
         } else if task.status == "submitting" {
+            let now = now_rfc3339();
             task.status = "queued".to_string();
+            task.queued_at = Some(now.clone());
+            task.updated_at = now;
             task.last_error.clear();
         } else if task.status == "querying" {
             // 重启后，有结果 → succeeded，无结果 → submitted + auto_query_stopped=true
@@ -3699,11 +3832,22 @@ fn is_due_for_submit(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
         || (task.status == "scheduled" && is_due(task.next_run_at.as_deref(), now))
 }
 
-fn due_sort_key(task: &ScheduledTask) -> String {
-    task.next_run_at
-        .clone()
-        .or_else(|| task.scheduled_at.clone())
+fn non_empty_task_time(value: Option<&String>) -> Option<String> {
+    value
+        .filter(|time| !time.trim().is_empty())
+        .map(|time| time.to_string())
+}
+
+fn queue_started_sort_key(task: &ScheduledTask) -> String {
+    non_empty_task_time(task.queued_at.as_ref())
+        .or_else(|| non_empty_task_time(Some(&task.updated_at)))
         .unwrap_or_else(|| task.created_at.clone())
+}
+
+fn due_sort_key(task: &ScheduledTask) -> String {
+    non_empty_task_time(task.next_run_at.as_ref())
+        .or_else(|| non_empty_task_time(task.scheduled_at.as_ref()))
+        .unwrap_or_else(|| queue_started_sort_key(task))
 }
 
 fn retryable_failed_execution_count(task: &ScheduledTask, error_kind: &str) -> u32 {
@@ -3816,6 +3960,7 @@ fn next_due_submit_task_id(data: &AppData, now: DateTime<Utc>) -> Option<String>
             successful_execution_count(left)
                 .cmp(&successful_execution_count(right))
                 .then_with(|| due_sort_key(left).cmp(&due_sort_key(right)))
+                .then_with(|| queue_started_sort_key(left).cmp(&queue_started_sort_key(right)))
                 .then_with(|| left.created_at.cmp(&right.created_at))
                 .then_with(|| left_index.cmp(right_index))
         })
@@ -3850,8 +3995,11 @@ fn apply_planned_submit_completion(task: &mut ScheduledTask) {
         return;
     }
     if needs_more_successful_submits(task) {
+        let now = now_rfc3339();
         task.status = "queued".to_string();
         task.next_run_at = None;
+        task.queued_at = Some(now.clone());
+        task.updated_at = now;
     }
 }
 
@@ -3870,8 +4018,10 @@ pub fn set_task_planned_submit_count(
     if !is_active_remote_task(task) {
         if needs_more_successful_submits(task) {
             if task.status == "succeeded" || task.status == "failed" {
+                let now = now_rfc3339();
                 task.status = "queued".to_string();
                 task.next_run_at = None;
+                task.queued_at = Some(now);
                 task.last_error.clear();
                 task.finished_at.clear();
             }
@@ -3899,26 +4049,27 @@ where
     }
 
     let now = Utc::now();
+    if let Some((task_id, submit_id)) = next_due_fast_query_target(data, now) {
+        return query_task_submit_id_once_with_runner(data, &task_id, &submit_id, &mut runner)
+            .map(Some);
+    }
+
     if let Some(task_id) = data
         .tasks
         .iter()
-        .find(|task| {
-            (task.status == "querying" || task.status == "submitted")
-                && !task.submit_id.trim().is_empty()
-                && !task.auto_query_stopped
-        })
-        .map(|task| {
-            if is_query_due(task, now) {
-                Some(task.id.clone())
-            } else {
-                None
-            }
-        })
+        .find(|task| is_fast_fallback_due(task, now))
+        .map(|task| task.id.clone())
     {
-        let Some(task_id) = task_id else {
-            return Ok(None);
-        };
-        return query_task_once_with_runner(data, &task_id, &mut runner).map(Some);
+        return submit_fast_fallback_once_with_runner(data, &task_id, &mut runner).map(Some);
+    }
+
+    if let Some((task_id, submit_id)) = next_due_current_query_target(data, now) {
+        return query_task_submit_id_once_with_runner(data, &task_id, &submit_id, &mut runner)
+            .map(Some);
+    }
+
+    if data.tasks.iter().any(is_active_remote_task) {
+        return Ok(None);
     }
 
     if has_concurrency_cooldown(data, now) {
@@ -3988,7 +4139,9 @@ pub fn resume_task(
             data.tasks[task_index].status = "queued".to_string();
         }
     }
-    data.tasks[task_index].updated_at = now_rfc3339();
+    let now = now_rfc3339();
+    data.tasks[task_index].queued_at = Some(now.clone());
+    data.tasks[task_index].updated_at = now;
     Ok(data.tasks[task_index].clone())
 }
 
@@ -4019,10 +4172,12 @@ pub fn reschedule_task(
     }
     if new_scheduled_at.trim().is_empty() {
         ensure_task_has_pending_submit(&mut data.tasks[task_index]);
+        let now = now_rfc3339();
         data.tasks[task_index].scheduled_at = None;
         data.tasks[task_index].next_run_at = None;
         data.tasks[task_index].status = "queued".to_string();
-        data.tasks[task_index].updated_at = now_rfc3339();
+        data.tasks[task_index].queued_at = Some(now.clone());
+        data.tasks[task_index].updated_at = now;
         return Ok(data.tasks[task_index].clone());
     }
     if !new_scheduled_at.trim().is_empty() {
@@ -4033,10 +4188,12 @@ pub fn reschedule_task(
         }
     }
     ensure_task_has_pending_submit(&mut data.tasks[task_index]);
+    let now = now_rfc3339();
     data.tasks[task_index].scheduled_at = Some(new_scheduled_at.to_string());
     data.tasks[task_index].next_run_at = Some(new_scheduled_at.to_string());
     data.tasks[task_index].status = "scheduled".to_string();
-    data.tasks[task_index].updated_at = now_rfc3339();
+    data.tasks[task_index].queued_at = Some(now.clone());
+    data.tasks[task_index].updated_at = now;
     Ok(data.tasks[task_index].clone())
 }
 
@@ -4103,7 +4260,8 @@ pub fn update_task_from_data(
     task.temp_image_asset_ids = draft.temp_image_asset_ids;
     task.temp_image_paths = draft.temp_image_paths;
     task.prompt_doc = draft.prompt_doc.clone();
-    task.updated_at = now_rfc3339();
+    let now = now_rfc3339();
+    task.updated_at = now.clone();
     task.command_preview = new_command_preview;
     // draft 模式：若任务已处于有效执行状态则保留，不强制回退为 draft
     if save_mode == "draft" && task.status != "draft" {
@@ -4112,6 +4270,7 @@ pub fn update_task_from_data(
         task.status = new_status;
         task.scheduled_at = new_scheduled_at.clone();
         task.next_run_at = new_scheduled_at;
+        task.queued_at = Some(now);
     }
 
     Ok(data
@@ -4178,7 +4337,14 @@ pub fn download_result_urls(urls: &[String], results_dir: &Path) -> Vec<String> 
 pub struct DueTaskCli {
     pub task_id: String,
     pub args: Vec<String>,
-    pub is_query: bool,
+    pub action: DueTaskCliAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DueTaskCliAction {
+    Query { submit_id: String },
+    Submit,
+    FastFallbackSubmit,
 }
 
 #[derive(Debug, Clone)]
@@ -4196,25 +4362,51 @@ pub fn peek_due_task_cli(data: &AppData) -> Result<Option<DueTaskCli>, DueTaskBu
     }
     let now = Utc::now();
     // 优先处理已提交、正在排队的任务；未到查询退避时阻塞新提交。
-    if let Some(task) = data.tasks.iter().find(|t| {
-        (t.status == "querying" || t.status == "submitted")
-            && !t.submit_id.trim().is_empty()
-            && !t.auto_query_stopped
-    }) {
-        if !is_query_due(task, now) {
-            return Ok(None);
-        }
-        // 对于 querying 状态且超过 4 小时的任务，标记停止（不在 peek 中修改数据，返回 None）
-        // 让 process_queue_command 的锁内部分处理
+    if let Some((task_id, submit_id)) = next_due_fast_query_target(data, now) {
         let args = vec![
             "query_result".to_string(),
-            format!("--submit_id={}", task.submit_id),
+            format!("--submit_id={submit_id}"),
         ];
+        return Ok(Some(DueTaskCli {
+            task_id,
+            args,
+            action: DueTaskCliAction::Query { submit_id },
+        }));
+    }
+    if let Some(task) = data.tasks.iter().find(|task| is_fast_fallback_due(task, now)) {
+        let draft = fast_fallback_draft(task);
+        let resolved = resolve_task_inputs(&draft, &data.assets, &data.roles).map_err(|error| {
+            DueTaskBuildError {
+                task_id: task.id.clone(),
+                task_title: task.title.clone(),
+                message: format!("构建 Fast 兜底提交输入失败：{error}"),
+            }
+        })?;
+        let args =
+            build_multimodal2video_args(&draft, &resolved).map_err(|error| DueTaskBuildError {
+                task_id: task.id.clone(),
+                task_title: task.title.clone(),
+                message: format!("构建 Fast 兜底提交命令失败：{error}"),
+            })?;
         return Ok(Some(DueTaskCli {
             task_id: task.id.clone(),
             args,
-            is_query: true,
+            action: DueTaskCliAction::FastFallbackSubmit,
         }));
+    }
+    if let Some((task_id, submit_id)) = next_due_current_query_target(data, now) {
+        let args = vec![
+            "query_result".to_string(),
+            format!("--submit_id={submit_id}"),
+        ];
+        return Ok(Some(DueTaskCli {
+            task_id,
+            args,
+            action: DueTaskCliAction::Query { submit_id },
+        }));
+    }
+    if data.tasks.iter().any(is_active_remote_task) {
+        return Ok(None);
     }
     if has_concurrency_cooldown(data, now) {
         return Ok(None);
@@ -4256,7 +4448,7 @@ pub fn peek_due_task_cli(data: &AppData) -> Result<Option<DueTaskCli>, DueTaskBu
     Ok(Some(DueTaskCli {
         task_id: task.id.clone(),
         args,
-        is_query: false,
+        action: DueTaskCliAction::Submit,
     }))
 }
 
@@ -4295,6 +4487,158 @@ where
     query_task_submit_id_once_with_runner_inner(data, task_id, submit_id, &mut runner, false)
 }
 
+fn fast_fallback_draft(task: &ScheduledTask) -> TaskDraft {
+    let mut params = task.params.clone();
+    params.model_version = FAST_FALLBACK_MODEL_VERSION.to_string();
+    TaskDraft {
+        title: task.title.clone(),
+        prompt: task.prompt.clone(),
+        image_asset_ids: task.image_asset_ids.clone(),
+        audio_asset_ids: task.audio_asset_ids.clone(),
+        role_ids: task.role_ids.clone(),
+        manual_mention_ids: task.manual_mention_ids.clone(),
+        auto_match_roles: task.auto_match_roles,
+        params,
+        scheduled_at: task.scheduled_at.clone(),
+        temp_image_asset_ids: task.temp_image_asset_ids.clone(),
+        temp_image_paths: task.temp_image_paths.clone(),
+        prompt_doc: task.prompt_doc.clone(),
+    }
+}
+
+fn input_snapshot_from_task_with_params(
+    task: &ScheduledTask,
+    params: VideoParams,
+) -> TaskExecutionInputSnapshot {
+    TaskExecutionInputSnapshot {
+        prompt: task.prompt.clone(),
+        image_asset_ids: task.image_asset_ids.clone(),
+        audio_asset_ids: task.audio_asset_ids.clone(),
+        role_ids: task.role_ids.clone(),
+        manual_mention_ids: task.manual_mention_ids.clone(),
+        auto_match_roles: task.auto_match_roles,
+        params,
+        temp_image_asset_ids: task.temp_image_asset_ids.clone(),
+    }
+}
+
+pub fn submit_fast_fallback_once_with_runner<F>(
+    data: &mut AppData,
+    task_id: &str,
+    mut runner: F,
+) -> Result<ScheduledTask, SchedulerError>
+where
+    F: FnMut(&[String]) -> Result<(String, String), String>,
+{
+    let task_index = data
+        .tasks
+        .iter()
+        .position(|task| task.id == task_id)
+        .ok_or_else(|| SchedulerError::Io(format!("找不到任务：{task_id}")))?;
+    let task = data.tasks[task_index].clone();
+    let draft = fast_fallback_draft(&task);
+    let resolved = resolve_task_inputs(&draft, &data.assets, &data.roles)?;
+    let args = build_multimodal2video_args(&draft, &resolved)?;
+    let started_at = now_rfc3339();
+    let (stdout, stderr) = match runner(&args) {
+        Ok(output) => output,
+        Err(message) => {
+            let finished = now_rfc3339();
+            let duration_secs = calc_duration_seconds(&started_at, &finished);
+            data.tasks[task_index].attempts.push(TaskAttempt {
+                id: format!("attempt_{}", Uuid::new_v4().simple()),
+                started_at: started_at.clone(),
+                finished_at: finished.clone(),
+                status: "failed".to_string(),
+                command_preview: args.clone(),
+                stdout: String::new(),
+                stderr: truncate_log(&message),
+                error_kind: "FastFallback".to_string(),
+                duration_seconds: duration_secs,
+                error_detail: message.clone(),
+            });
+            data.tasks[task_index].execution_records.push(TaskExecutionRecord {
+                id: format!("exec_{}", Uuid::new_v4().simple()),
+                submit_id: String::new(),
+                status: "failed".to_string(),
+                started_at,
+                finished_at: finished,
+                input_snapshot: input_snapshot_from_task_with_params(&task, draft.params),
+                command_preview: args,
+                query_records: vec![],
+                result_paths: vec![],
+                result_urls: vec![],
+                error_kind: "FastFallback".to_string(),
+                error_detail: message,
+            });
+            data.tasks[task_index].updated_at = now_rfc3339();
+            return Ok(data.tasks[task_index].clone());
+        }
+    };
+
+    let raw = format!("{stdout}\n{stderr}");
+    let parsed = parse_submit_output(&raw);
+    let submit_failed = parsed
+        .gen_status
+        .as_deref()
+        .map(|status| {
+            let normalized = status.trim().to_ascii_lowercase();
+            normalized.contains("fail") || normalized.contains("cancel")
+        })
+        .unwrap_or(false);
+    let finished = now_rfc3339();
+    let duration_secs = calc_duration_seconds(&started_at, &finished);
+    let submit_id = parsed.submit_id.unwrap_or_default();
+    let status = if submit_failed {
+        "failed".to_string()
+    } else if parsed.gen_status.as_deref() == Some("success") {
+        "succeeded".to_string()
+    } else if data.settings.auto_query_enabled {
+        "querying".to_string()
+    } else {
+        "submitted".to_string()
+    };
+    let error_detail = if submit_failed {
+        parsed
+            .fail_reason
+            .unwrap_or_else(|| raw.trim().to_string())
+    } else {
+        String::new()
+    };
+    data.tasks[task_index].attempts.push(TaskAttempt {
+        id: format!("attempt_{}", Uuid::new_v4().simple()),
+        started_at: started_at.clone(),
+        finished_at: finished.clone(),
+        status: status.clone(),
+        command_preview: args.clone(),
+        stdout: truncate_log(&stdout),
+        stderr: truncate_log(&stderr),
+        error_kind: "FastFallback".to_string(),
+        duration_seconds: duration_secs,
+        error_detail: error_detail.clone(),
+    });
+    data.tasks[task_index].execution_records.push(TaskExecutionRecord {
+        id: format!("exec_{}", Uuid::new_v4().simple()),
+        submit_id: submit_id.clone(),
+        status: status.clone(),
+        started_at,
+        finished_at: if status == "succeeded" || status == "failed" {
+            finished.clone()
+        } else {
+            String::new()
+        },
+        input_snapshot: input_snapshot_from_task_with_params(&task, draft.params),
+        command_preview: args,
+        query_records: vec![],
+        result_paths: vec![],
+        result_urls: vec![],
+        error_kind: "FastFallback".to_string(),
+        error_detail,
+    });
+    data.tasks[task_index].updated_at = finished;
+    Ok(data.tasks[task_index].clone())
+}
+
 fn query_task_submit_id_once_with_runner_inner<F>(
     data: &mut AppData,
     task_id: &str,
@@ -4317,6 +4661,12 @@ where
         ));
     }
     let is_current_submit = data.tasks[task_index].submit_id == submit_id;
+    let is_fast_fallback_submit = data.tasks[task_index]
+        .execution_records
+        .iter()
+        .find(|record| record.submit_id == submit_id)
+        .map(|record| is_fast_execution_record(record))
+        .unwrap_or(false);
 
     let started_at = now_rfc3339();
 
@@ -4442,6 +4792,15 @@ where
             data.tasks[task_index].queue_info = final_queue_info.clone();
             data.tasks[task_index].last_error = final_error_detail.clone();
         }
+    } else if is_fast_fallback_submit && final_status == "succeeded" {
+        data.tasks[task_index].status = "succeeded".to_string();
+        data.tasks[task_index].submit_id = submit_id.clone();
+        data.tasks[task_index].result_paths = final_result_paths.clone();
+        data.tasks[task_index].result_urls = final_result_urls.clone();
+        data.tasks[task_index].finished_at = finished.clone();
+        data.tasks[task_index].queue_info = None;
+        data.tasks[task_index].last_error.clear();
+        data.tasks[task_index].updated_at = finished.clone();
     }
     let duration_secs = calc_duration_seconds(&started_at, &finished);
     let query_record = TaskAttempt {
@@ -5551,7 +5910,7 @@ pub fn process_queue_for_store_blocking(
     let DueTaskCli {
         task_id,
         args,
-        is_query,
+        action,
     } = match due {
         Ok(None) => {
             let _ = store.mutate(|data| {
@@ -5627,8 +5986,8 @@ pub fn process_queue_for_store_blocking(
     // 锁内：写回（使用 replay runner）
     let task = store
         .mutate(|data| {
-            // scheduled → queued 迁移（仅 submit 路径需要）
-            if !is_query {
+            // scheduled → queued 迁移（仅普通 submit 路径需要）
+            if matches!(action, DueTaskCliAction::Submit) {
                 let now = Utc::now();
                 let mut log_drafts: Vec<LogEntryDraft> = Vec::new();
                 for t in &mut data.tasks {
@@ -5662,10 +6021,18 @@ pub fn process_queue_for_store_blocking(
                     append_log(data, draft);
                 }
             }
-            let task = if is_query {
-                query_task_once_with_runner(data, &task_id, |_| cli_result.clone())?
-            } else {
-                submit_task_once_with_runner(data, &task_id, |_| cli_result.clone())?
+            let task = match &action {
+                DueTaskCliAction::Query { submit_id } => {
+                    query_task_submit_id_once_with_runner(data, &task_id, submit_id, |_| {
+                        cli_result.clone()
+                    })?
+                }
+                DueTaskCliAction::Submit => {
+                    submit_task_once_with_runner(data, &task_id, |_| cli_result.clone())?
+                }
+                DueTaskCliAction::FastFallbackSubmit => {
+                    submit_fast_fallback_once_with_runner(data, &task_id, |_| cli_result.clone())?
+                }
             };
             append_task_log(
                 data,
@@ -7958,6 +8325,7 @@ mod tests {
             status: "querying".to_string(),
             scheduled_at: None,
             next_run_at: None,
+            queued_at: None,
             submit_id: "sub-2".to_string(),
             attempt_count: 0,
             concurrency_retry_count: 0,
@@ -8113,6 +8481,24 @@ mod tests {
     }
 
     #[test]
+    fn concurrency_retry_delay_default_is_fast_enough_for_hot_window() {
+        assert_eq!(
+            SchedulerSettings::default().concurrency_retry_delay_seconds,
+            30
+        );
+    }
+
+    #[test]
+    fn normalize_loaded_app_data_migrates_legacy_five_minute_concurrency_retry_delay() {
+        let mut data = AppData::default();
+        data.settings.concurrency_retry_delay_seconds = 300;
+
+        normalize_loaded_app_data(&mut data);
+
+        assert_eq!(data.settings.concurrency_retry_delay_seconds, 30);
+    }
+
+    #[test]
     fn active_image_model_config_prefers_selected_config() {
         let mut settings = SchedulerSettings::default();
         settings.image_model_configs = vec![
@@ -8192,6 +8578,7 @@ mod tests {
             status: "querying".to_string(),
             scheduled_at: None,
             next_run_at: None,
+            queued_at: None,
             submit_id: "sub-123".to_string(),
             attempt_count: 0,
             concurrency_retry_count: 0,
@@ -8797,6 +9184,7 @@ mod tests {
             status: "queued".to_string(),
             scheduled_at: None,
             next_run_at: None,
+            queued_at: None,
             submit_id: String::new(),
             attempt_count: 0,
             concurrency_retry_count: 0,
@@ -8820,6 +9208,39 @@ mod tests {
             consecutive_no_result_queries: 0,
             prompt_doc: None,
         }
+    }
+
+    #[test]
+    fn next_due_submit_uses_queue_start_time_when_scheduled_time_ties() {
+        let scheduled_at = "2026-05-03T02:00:00Z";
+        let mut old_draft_queued_later = make_queued_task_for_submit("old-draft");
+        old_draft_queued_later.status = "scheduled".to_string();
+        old_draft_queued_later.scheduled_at = Some(scheduled_at.to_string());
+        old_draft_queued_later.next_run_at = Some(scheduled_at.to_string());
+        old_draft_queued_later.created_at = "2026-05-01T00:00:00Z".to_string();
+        old_draft_queued_later.updated_at = "2026-05-02T10:00:00Z".to_string();
+
+        let mut new_draft_queued_earlier = make_queued_task_for_submit("new-draft");
+        new_draft_queued_earlier.status = "scheduled".to_string();
+        new_draft_queued_earlier.scheduled_at = Some(scheduled_at.to_string());
+        new_draft_queued_earlier.next_run_at = Some(scheduled_at.to_string());
+        new_draft_queued_earlier.created_at = "2026-05-01T12:00:00Z".to_string();
+        new_draft_queued_earlier.updated_at = "2026-05-02T09:00:00Z".to_string();
+
+        let data = AppData {
+            tasks: vec![old_draft_queued_later, new_draft_queued_earlier],
+            ..AppData::default()
+        };
+
+        assert_eq!(
+            next_due_submit_task_id(
+                &data,
+                DateTime::parse_from_rfc3339(scheduled_at)
+                    .unwrap()
+                    .with_timezone(&Utc)
+            ),
+            Some("new-draft".to_string())
+        );
     }
 
     #[test]
@@ -9093,6 +9514,7 @@ mod tests {
             status: status.to_string(),
             scheduled_at: None,
             next_run_at: None,
+            queued_at: None,
             submit_id: "sub-456".to_string(),
             attempt_count: 0,
             concurrency_retry_count: 0,
@@ -9161,6 +9583,7 @@ mod tests {
                 status: "succeeded".to_string(),
                 scheduled_at: None,
                 next_run_at: None,
+                queued_at: None,
                 submit_id: String::new(),
                 attempt_count: 0,
                 concurrency_retry_count: 0,

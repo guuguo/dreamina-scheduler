@@ -9,9 +9,11 @@ export function resolveScheduleAt(options = {}, now = new Date()) {
 
   if (mode === 'dayTime') {
     const date = new Date(now);
-    if (options.day === 'tomorrow') date.setDate(date.getDate() + 1);
     const [hour, minute] = parseTimeValue(options.time || '02:00');
     date.setHours(hour, minute, 0, 0);
+    if (options.day === 'tomorrow' || (options.day === 'auto' && date.getTime() <= now.getTime())) {
+      date.setDate(date.getDate() + 1);
+    }
     return date.toISOString();
   }
 

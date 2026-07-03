@@ -78,6 +78,7 @@ fn queued_task(id: &str) -> ScheduledTask {
         status: "queued".to_string(),
         scheduled_at: None,
         next_run_at: None,
+        queued_at: None,
         submitted_at: None,
         queue_info: None,
         submit_id: String::new(),
@@ -1491,6 +1492,166 @@ fn querying_task_with_submit_id_is_prioritized() {
         .expect("process queue")
         .expect("task found");
     assert_eq!(result.status, "succeeded");
+}
+
+#[test]
+fn queueing_over_two_hours_submits_fast_fallback() {
+    let mut data = default_data();
+    let mut task = queued_task("task-slow-queue");
+    task.status = "querying".to_string();
+    task.submit_id = "slow-123".to_string();
+    task.submitted_at = Some((Utc::now() - Duration::minutes(121)).to_rfc3339());
+    task.queue_info = Some(dreamina_scheduler_lib::QueueInfo {
+        queue_idx: Some(4680),
+        priority: Some(1),
+        queue_status: Some("Queueing".to_string()),
+        queue_length: Some(300_031),
+    });
+    task.execution_records.push(TaskExecutionRecord {
+        id: "rec-slow".to_string(),
+        submit_id: "slow-123".to_string(),
+        status: "querying".to_string(),
+        started_at: (Utc::now() - Duration::minutes(121)).to_rfc3339(),
+        finished_at: String::new(),
+        input_snapshot: TaskExecutionInputSnapshot {
+            prompt: task.prompt.clone(),
+            image_asset_ids: task.image_asset_ids.clone(),
+            audio_asset_ids: task.audio_asset_ids.clone(),
+            role_ids: task.role_ids.clone(),
+            manual_mention_ids: task.manual_mention_ids.clone(),
+            auto_match_roles: task.auto_match_roles,
+            params: task.params.clone(),
+            temp_image_asset_ids: task.temp_image_asset_ids.clone(),
+        },
+        command_preview: vec!["multimodal2video".to_string(), "--model_version=seedance2.0".to_string()],
+        query_records: vec![],
+        result_paths: vec![],
+        result_urls: vec![],
+        error_kind: String::new(),
+        error_detail: String::new(),
+    });
+    data.tasks.push(task);
+
+    let result = process_next_due_task_with_runner(&mut data, |args| {
+        assert_eq!(args[0], "multimodal2video");
+        assert!(args.iter().any(|arg| arg == "--model_version=seedance2.0fast"));
+        Ok((r#"{"submit_id":"fast-123","gen_status":"querying"}"#.to_string(), String::new()))
+    })
+    .expect("process queue")
+    .expect("task processed");
+
+    assert_eq!(result.status, "querying");
+    assert_eq!(result.submit_id, "slow-123");
+    assert!(result
+        .execution_records
+        .iter()
+        .any(|record| record.submit_id == "fast-123"
+            && record.status == "querying"
+            && record.input_snapshot.params.model_version == "seedance2.0fast"));
+}
+
+#[test]
+fn active_fast_fallback_is_queried_instead_of_duplicated() {
+    let mut data = default_data();
+    let mut task = queued_task("task-fast-active");
+    task.status = "querying".to_string();
+    task.submit_id = "slow-123".to_string();
+    task.submitted_at = Some((Utc::now() - Duration::minutes(180)).to_rfc3339());
+    task.queue_info = Some(dreamina_scheduler_lib::QueueInfo {
+        queue_idx: Some(4680),
+        priority: Some(1),
+        queue_status: Some("Queueing".to_string()),
+        queue_length: Some(300_031),
+    });
+    let mut fast_params = task.params.clone();
+    fast_params.model_version = "seedance2.0fast".to_string();
+    task.execution_records.push(TaskExecutionRecord {
+        id: "rec-fast".to_string(),
+        submit_id: "fast-123".to_string(),
+        status: "querying".to_string(),
+        started_at: (Utc::now() - Duration::minutes(61)).to_rfc3339(),
+        finished_at: String::new(),
+        input_snapshot: TaskExecutionInputSnapshot {
+            prompt: task.prompt.clone(),
+            image_asset_ids: task.image_asset_ids.clone(),
+            audio_asset_ids: task.audio_asset_ids.clone(),
+            role_ids: task.role_ids.clone(),
+            manual_mention_ids: task.manual_mention_ids.clone(),
+            auto_match_roles: task.auto_match_roles,
+            params: fast_params,
+            temp_image_asset_ids: task.temp_image_asset_ids.clone(),
+        },
+        command_preview: vec!["multimodal2video".to_string(), "--model_version=seedance2.0fast".to_string()],
+        query_records: vec![],
+        result_paths: vec![],
+        result_urls: vec![],
+        error_kind: String::new(),
+        error_detail: String::new(),
+    });
+    data.tasks.push(task);
+
+    let result = process_next_due_task_with_runner(&mut data, |args| {
+        assert_eq!(args, &["query_result".to_string(), "--submit_id=fast-123".to_string()]);
+        Ok((r#"{"gen_status":"querying","queue_status":"Queueing","queue_idx":1000}"#.to_string(), String::new()))
+    })
+    .expect("process queue")
+    .expect("task processed");
+
+    assert_eq!(result.status, "querying");
+    assert_eq!(
+        result
+            .execution_records
+            .iter()
+            .filter(|record| record.input_snapshot.params.model_version == "seedance2.0fast")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn successful_fast_fallback_completes_task() {
+    let mut data = default_data();
+    let mut task = queued_task("task-fast-success");
+    task.status = "querying".to_string();
+    task.submit_id = "slow-123".to_string();
+    task.submitted_at = Some((Utc::now() - Duration::minutes(180)).to_rfc3339());
+    let mut fast_params = task.params.clone();
+    fast_params.model_version = "seedance2.0fast".to_string();
+    task.execution_records.push(TaskExecutionRecord {
+        id: "rec-fast".to_string(),
+        submit_id: "fast-123".to_string(),
+        status: "querying".to_string(),
+        started_at: (Utc::now() - Duration::minutes(30)).to_rfc3339(),
+        finished_at: String::new(),
+        input_snapshot: TaskExecutionInputSnapshot {
+            prompt: task.prompt.clone(),
+            image_asset_ids: task.image_asset_ids.clone(),
+            audio_asset_ids: task.audio_asset_ids.clone(),
+            role_ids: task.role_ids.clone(),
+            manual_mention_ids: task.manual_mention_ids.clone(),
+            auto_match_roles: task.auto_match_roles,
+            params: fast_params,
+            temp_image_asset_ids: task.temp_image_asset_ids.clone(),
+        },
+        command_preview: vec!["multimodal2video".to_string(), "--model_version=seedance2.0fast".to_string()],
+        query_records: vec![],
+        result_paths: vec![],
+        result_urls: vec![],
+        error_kind: String::new(),
+        error_detail: String::new(),
+    });
+    data.tasks.push(task);
+
+    let result = process_next_due_task_with_runner(&mut data, |args| {
+        assert_eq!(args, &["query_result".to_string(), "--submit_id=fast-123".to_string()]);
+        Ok((r#"{"gen_status":"success","result_urls":["https://cdn.example.com/fast.mp4"]}"#.to_string(), String::new()))
+    })
+    .expect("process queue")
+    .expect("task processed");
+
+    assert_eq!(result.status, "succeeded");
+    assert_eq!(result.submit_id, "fast-123");
+    assert_eq!(result.result_urls, vec!["https://cdn.example.com/fast.mp4"]);
 }
 
 #[test]

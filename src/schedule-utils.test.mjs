@@ -18,11 +18,28 @@ test('resolveScheduleAt: relative hours schedules after the requested hours', ()
   assert.equal(result.getTime() - baseNow.getTime(), 3 * 60 * 60 * 1000);
 });
 
-test('resolveScheduleAt: day time combines tomorrow with HH:mm', () => {
+test('resolveScheduleAt: tomorrow day time combines tomorrow with HH:mm', () => {
   const result = new Date(resolveScheduleAt({ mode: 'dayTime', day: 'tomorrow', time: '02:30' }, baseNow));
   const expected = new Date(baseNow);
   expected.setDate(expected.getDate() + 1);
   expected.setHours(2, 30, 0, 0);
+  assert.equal(result.getTime(), expected.getTime());
+});
+
+test('resolveScheduleAt: today day time uses today when the time is still ahead', () => {
+  const now = new Date('2026-05-01T00:26:00+08:00');
+  const result = new Date(resolveScheduleAt({ mode: 'dayTime', day: 'today', time: '02:00' }, now));
+  const expected = new Date(now);
+  expected.setHours(2, 0, 0, 0);
+  assert.equal(result.getTime(), expected.getTime());
+});
+
+test('resolveScheduleAt: auto day time rolls to tomorrow only after the time passed', () => {
+  const now = new Date('2026-05-01T09:26:00+08:00');
+  const result = new Date(resolveScheduleAt({ mode: 'dayTime', day: 'auto', time: '02:00' }, now));
+  const expected = new Date(now);
+  expected.setDate(expected.getDate() + 1);
+  expected.setHours(2, 0, 0, 0);
   assert.equal(result.getTime(), expected.getTime());
 });
 
