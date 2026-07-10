@@ -231,17 +231,19 @@ test('deriveTaskFlowSteps: returns 5 steps', () => {
   assert.equal(deriveTaskFlowSteps(makeTask()).length, 5);
 });
 
-test('canDeleteTask: draft and terminal statuses can be deleted', () => {
+test('canDeleteTask: local waiting and inactive statuses can be deleted', () => {
   assert.equal(canDeleteTask(makeTask({ status: 'draft' })), true);
+  assert.equal(canDeleteTask(makeTask({ status: 'queued' })), true);
+  assert.equal(canDeleteTask(makeTask({ status: 'scheduled' })), true);
+  assert.equal(canDeleteTask(makeTask({ status: 'retry_wait' })), true);
+  assert.equal(canDeleteTask(makeTask({ status: 'paused' })), true);
   assert.equal(canDeleteTask(makeTask({ status: 'succeeded' })), true);
   assert.equal(canDeleteTask(makeTask({ status: 'failed' })), true);
-  assert.equal(canDeleteTask(makeTask({ status: 'paused' })), true);
-  assert.equal(canDeleteTask(makeTask({ status: 'paused' })), true);
 });
 
-test('canDeleteTask: active queue statuses are not deleted from detail actions', () => {
-  assert.equal(canDeleteTask(makeTask({ status: 'queued' })), false);
+test('canDeleteTask: remote active statuses cannot be deleted', () => {
   assert.equal(canDeleteTask(makeTask({ status: 'submitting' })), false);
+  assert.equal(canDeleteTask(makeTask({ status: 'submitted' })), false);
   assert.equal(canDeleteTask(makeTask({ status: 'querying' })), false);
 });
 
@@ -395,15 +397,20 @@ test('deriveTaskProgress: retry_wait stage includes attempt count', () => {
 // ── deriveTaskDispatchInfo ───────────────────────────────────────────────────
 
 test('deriveTaskDispatchInfo: queued exposes attempts and next scheduler check', () => {
+  const nowMs = Date.parse('2026-01-01T00:00:00Z');
   const info = deriveTaskDispatchInfo(makeTask({ status: 'queued', attempt_count: 2 }), {
-    nowMs: Date.parse('2026-01-01T00:00:00Z'),
+    nowMs,
     schedulerTickSeconds: 30,
   });
+  const checkAt = new Date(nowMs + 30_000);
+  const checkClock = `${String(checkAt.getHours()).padStart(2, '0')}:${String(checkAt.getMinutes()).padStart(2, '0')}`;
 
   assert.equal(info.attemptCount, 2);
   assert.equal(info.nextLabel, '下次检查');
-  assert.equal(info.nextText, '30 秒内检查');
-  assert.equal(info.reason, '等待调度器空闲');
+  assert.equal(info.nextText, '约 30 秒内检查');
+  assert.equal(info.nextAt, '2026-01-01T00:00:30.000Z');
+  assert.ok(info.nextSummary.endsWith('前后'));
+  assert.equal(info.reason, `预计 ${checkClock} 前后调度，走标准车道`);
 });
 
 test('deriveTaskDispatchInfo: scheduled exposes start time', () => {

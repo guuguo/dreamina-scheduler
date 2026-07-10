@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use dreamina_scheduler_lib::{
     default_store_dir, parse_mcp_queue_videos_input, parse_mcp_video_task_input,
     process_queue_for_store_blocking, queue_mcp_video_task, queue_mcp_video_tasks, AppStore,
@@ -38,6 +40,8 @@ const TOOL_ARGUMENT_HINT_KEYS: &[&str] = &[
     "videoResolution",
     "planned_submit_count",
     "plannedSubmitCount",
+    "alternate_fast_model",
+    "alternateFastModel",
 ];
 
 #[derive(Debug, Serialize)]
@@ -440,9 +444,13 @@ fn tool_definitions() -> Value {
                             "model": { "type": "string", "enum": ["fast", "standard"] },
                             "duration": { "type": "integer", "minimum": 4, "maximum": 15 },
                             "video_resolution": { "type": "string", "enum": ["720p"] },
-                            "planned_submit_count": { "type": "integer", "minimum": 1 }
+                            "planned_submit_count": { "type": "integer", "minimum": 1 },
+                            "alternate_fast_model": { "type": "boolean", "description": "When queueing multiple videos, alternate unspecified item models as standard, fast, standard, fast." },
+                            "alternateFastModel": { "type": "boolean", "description": "Alias of alternate_fast_model." }
                         }
                     },
+                    "alternate_fast_model": { "type": "boolean", "description": "Alternate unspecified item models as standard, fast, standard, fast so both Dreamina queues can be used." },
+                    "alternateFastModel": { "type": "boolean", "description": "Alias of alternate_fast_model." },
                     "items": {
                         "type": "array",
                         "items": {

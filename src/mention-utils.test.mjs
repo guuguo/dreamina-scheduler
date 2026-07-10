@@ -32,6 +32,17 @@ test('buildMentionItems exposes role images, temp images, and audio assets', () 
   assert.ok(items.some((item) => item.key === 'temp:tmp-img-1' && item.label === '图片1'));
 });
 
+test('buildMentionItems hides disabled roles and their media resources', () => {
+  const items = buildMentionItems({
+    roles: [{ ...role, disabled: true }],
+    assetById: assets,
+  });
+
+  assert.equal(items.some((item) => item.key === 'role:role-hero'), false);
+  assert.equal(items.some((item) => item.key === 'img:img-1'), false);
+  assert.equal(items.some((item) => item.key === 'aud:aud-1'), false);
+});
+
 test('buildMentionItems keeps imported asset names mention-safe when source file had spaces', () => {
   const spacedRole = {
     id: 'role-car',

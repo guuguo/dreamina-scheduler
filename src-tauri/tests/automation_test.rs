@@ -58,9 +58,11 @@ fn default_data() -> AppData {
         assets: vec![image_asset("img-1", "角色图", "/tmp/role.png")],
         roles: vec![],
         tasks: vec![],
+        task_priorities: HashMap::new(),
         logs: vec![],
         imagegen_history: vec![],
         asset_hash_index: HashMap::new(),
+        lane_status: vec![],
     }
 }
 
@@ -1002,6 +1004,8 @@ fn concurrency_limit_legacy_silent_fail_policy_still_waits() {
         ai_model_configs: SchedulerSettings::default().ai_model_configs,
         active_ai_model_id: SchedulerSettings::default().active_ai_model_id,
         prevent_sleep: true,
+        standard_lane_enabled: true,
+        fast_lane_enabled: true,
         image_model_configs: SchedulerSettings::default().image_model_configs,
         active_image_model_id: SchedulerSettings::default().active_image_model_id,
         image_model_config: SchedulerSettings::default().image_model_config,
@@ -1094,7 +1098,9 @@ fn importing_same_role_audio_path_is_idempotent() {
             name: "女主".to_string(),
             aliases: vec![],
             tags: vec![],
+            series: String::new(),
             description: String::new(),
+            disabled: false,
             asset_ids: vec![],
         },
     );
@@ -1166,7 +1172,9 @@ fn removing_role_media_removes_duplicate_assets_with_same_source_from_role() {
             name: "女主".to_string(),
             aliases: vec![],
             tags: vec![],
+            series: String::new(),
             description: String::new(),
+            disabled: false,
             asset_ids: vec!["aud-visible".to_string(), "aud-hidden".to_string()],
         },
     );
@@ -1360,6 +1368,7 @@ fn concurrency_retry_records_are_separated_by_model_version() {
     .expect("first task processed");
 
     data.tasks[0].params.model_version = "seedance2.0fast".to_string();
+    data.settings.standard_lane_enabled = false;
 
     let result = process_next_due_task_with_runner(&mut data, |args| {
         assert!(args
@@ -1453,7 +1462,7 @@ fn active_remote_task_not_due_blocks_new_submission() {
 }
 
 #[test]
-fn concurrency_retry_wait_blocks_whole_queue_until_due() {
+fn concurrency_retry_can_switch_to_idle_fast_lane_before_cooldown_due() {
     let mut data = default_data();
     let mut cooling = queued_task("task-cooling");
     cooling.status = "retry_wait".to_string();
@@ -1473,9 +1482,9 @@ fn concurrency_retry_wait_blocks_whole_queue_until_due() {
     .expect("process queue")
     .expect("should submit queued task to idle Fast lane");
 
-    assert_eq!(result.id, "task-next");
+    assert_eq!(result.id, "task-cooling");
     assert_eq!(result.status, "querying");
-    assert_eq!(data.tasks[1].attempt_count, 1);
+    assert_eq!(data.tasks[0].attempt_count, 1);
 }
 
 #[test]
@@ -1821,7 +1830,9 @@ fn importing_same_image_path_to_same_role_is_idempotent() {
             name: "女主".to_string(),
             aliases: vec![],
             tags: vec![],
+            series: String::new(),
             description: String::new(),
+            disabled: false,
             asset_ids: vec![],
         },
     );
@@ -1869,7 +1880,9 @@ fn importing_same_path_to_different_roles_does_not_merge_ownership() {
             name: "角色A".to_string(),
             aliases: vec![],
             tags: vec![],
+            series: String::new(),
             description: String::new(),
+            disabled: false,
             asset_ids: vec![],
         },
     );
@@ -1880,7 +1893,9 @@ fn importing_same_path_to_different_roles_does_not_merge_ownership() {
             name: "角色B".to_string(),
             aliases: vec![],
             tags: vec![],
+            series: String::new(),
             description: String::new(),
+            disabled: false,
             asset_ids: vec![],
         },
     );
@@ -1933,7 +1948,9 @@ fn removing_role_media_keeps_global_asset_if_still_referenced_by_other_role() {
             name: "角色A".to_string(),
             aliases: vec![],
             tags: vec![],
+            series: String::new(),
             description: String::new(),
+            disabled: false,
             asset_ids: vec!["img-shared".to_string()],
         },
     );
@@ -1944,7 +1961,9 @@ fn removing_role_media_keeps_global_asset_if_still_referenced_by_other_role() {
             name: "角色B".to_string(),
             aliases: vec![],
             tags: vec![],
+            series: String::new(),
             description: String::new(),
+            disabled: false,
             asset_ids: vec!["img-shared".to_string()],
         },
     );
@@ -1980,7 +1999,9 @@ fn removing_role_media_deletes_global_asset_if_no_longer_referenced() {
             name: "角色1".to_string(),
             aliases: vec![],
             tags: vec![],
+            series: String::new(),
             description: String::new(),
+            disabled: false,
             asset_ids: vec!["img-sole".to_string()],
         },
     );
@@ -2007,7 +2028,9 @@ fn delete_role_rejected_when_referenced_by_task() {
             name: "被引用角色".to_string(),
             aliases: vec![],
             tags: vec![],
+            series: String::new(),
             description: String::new(),
+            disabled: false,
             asset_ids: vec!["img-1".to_string()],
         },
     );
@@ -2030,7 +2053,9 @@ fn delete_role_succeeds_when_not_referenced() {
             name: "未引用角色".to_string(),
             aliases: vec![],
             tags: vec![],
+            series: String::new(),
             description: String::new(),
+            disabled: false,
             asset_ids: vec![],
         },
     );
@@ -2453,6 +2478,42 @@ fn transient_submit_error_fails_after_three_retries() {
 }
 
 #[test]
+fn authsdk_transport_submit_error_waits_even_after_transient_retry_cap() {
+    let mut data = default_data();
+    let mut task = queued_task("task-network-wait");
+    for index in 0..3 {
+        task.execution_records.push(TaskExecutionRecord {
+            id: format!("exec-transient-{index}"),
+            submit_id: String::new(),
+            status: "retry_wait".to_string(),
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: Utc::now().to_rfc3339(),
+            input_snapshot: TaskExecutionInputSnapshot::default(),
+            command_preview: vec![],
+            query_records: vec![],
+            result_paths: vec![],
+            result_urls: vec![],
+            error_kind: "Transient".to_string(),
+            error_detail: "upload connection reset".to_string(),
+        });
+    }
+    data.tasks.push(task);
+
+    let runner = |_args: &[String]| -> Result<(String, String), String> {
+        Err("authsdk: refresh failed: protocol transport: do request".to_string())
+    };
+    let result = process_next_due_task_with_runner(&mut data, runner)
+        .expect("process queue")
+        .expect("task processed");
+
+    assert_eq!(result.status, "retry_wait");
+    assert!(result.next_run_at.is_some());
+    let record = result.execution_records.last().unwrap();
+    assert_eq!(record.status, "retry_wait");
+    assert_eq!(record.error_kind, "NetworkUnavailable");
+}
+
+#[test]
 fn upload_image_eof_triggers_retry_wait() {
     let mut data = default_data();
     data.tasks.push(queued_task("task-upload-eof"));
@@ -2599,7 +2660,9 @@ fn delete_task_does_not_remove_role_assets() {
             name: "角色".to_string(),
             aliases: vec![],
             tags: vec![],
+            series: String::new(),
             description: String::new(),
+            disabled: false,
             asset_ids: vec!["img-1".to_string()],
         },
     );
@@ -2639,7 +2702,9 @@ fn upsert_role_updates_existing_role_preserving_created_at() {
             name: "原名".to_string(),
             aliases: vec![],
             tags: vec![],
+            series: String::new(),
             description: String::new(),
+            disabled: false,
             asset_ids: vec![],
         },
     );
@@ -2652,12 +2717,16 @@ fn upsert_role_updates_existing_role_preserving_created_at() {
             name: "新名".to_string(),
             aliases: vec!["别名".to_string()],
             tags: vec![],
+            series: "显眼包".to_string(),
             description: "描述".to_string(),
+            disabled: true,
             asset_ids: vec!["img-1".to_string()],
         },
     );
     assert_eq!(updated.name, "新名");
     assert_eq!(updated.created_at, created_at);
+    assert_eq!(updated.series, "显眼包");
+    assert!(updated.disabled);
     assert_eq!(updated.asset_ids, vec!["img-1"]);
 }
 
@@ -2675,15 +2744,19 @@ fn draft_task_backfills_prompt_mentioned_role_image_and_audio_assets() {
             name: "女主".to_string(),
             aliases: vec![],
             tags: vec![],
+            series: String::new(),
             description: String::new(),
+            disabled: false,
             asset_ids: vec!["img-chef".to_string(), "aud-hero".to_string()],
             created_at: String::new(),
             updated_at: String::new(),
         }],
         tasks: vec![],
+        task_priorities: HashMap::new(),
         logs: vec![],
         imagegen_history: vec![],
         asset_hash_index: HashMap::new(),
+        lane_status: vec![],
     };
     let draft = TaskDraft {
         title: String::new(),
@@ -3468,7 +3541,7 @@ fn restart_recovery_clears_legacy_query_interrupt_from_error_detail() {
 }
 
 #[test]
-fn automatic_query_fails_after_five_minutes_without_remote_queue_info() {
+fn automatic_query_keeps_valid_remote_querying_without_queue_info() {
     let mut data = default_data();
     let mut task = make_querying_task_with_record("task-stale-local", "sub-local-only");
     task.submitted_at = Some((Utc::now() - Duration::minutes(6)).to_rfc3339());
@@ -3489,20 +3562,55 @@ fn automatic_query_fails_after_five_minutes_without_remote_queue_info() {
     )
     .expect("stale local-only query should be handled");
 
-    assert_eq!(result.status, "failed");
-    assert_eq!(result.consecutive_no_result_queries, 0);
-    assert!(
-        result.last_error.contains("未返回远端队列信息"),
-        "unexpected error: {}",
-        result.last_error
-    );
+    assert_eq!(result.status, "querying");
+    assert_eq!(result.consecutive_no_result_queries, 4);
+    assert!(result.last_error.is_empty());
     let record = result
         .execution_records
         .iter()
         .find(|r| r.submit_id == "sub-local-only")
         .expect("record exists");
-    assert_eq!(record.status, "failed");
-    assert!(!record.finished_at.is_empty());
+    assert_eq!(record.status, "querying");
+    assert!(record.finished_at.is_empty());
+}
+
+#[test]
+fn query_authsdk_transport_error_keeps_task_waiting() {
+    let mut data = default_data();
+    data.tasks.push(make_querying_task_with_record(
+        "task-network-query",
+        "sub-network",
+    ));
+
+    let result = query_task_submit_id_once_with_runner(
+        &mut data,
+        "task-network-query",
+        "sub-network",
+        |_| Err("authsdk: refresh failed: protocol transport: do request".to_string()),
+    )
+    .expect("network query error should be handled");
+
+    assert_eq!(result.status, "querying");
+    assert_eq!(result.submit_id, "sub-network");
+    assert!(!result.auto_query_stopped);
+    assert!(result.last_auto_query_at.is_some());
+    assert!(
+        result.last_error.contains("网络暂不可用"),
+        "unexpected last_error: {}",
+        result.last_error
+    );
+
+    let record = result
+        .execution_records
+        .iter()
+        .find(|r| r.submit_id == "sub-network")
+        .expect("record exists");
+    assert_eq!(record.status, "querying");
+    assert!(record.finished_at.is_empty());
+    assert_eq!(record.error_kind, "NetworkUnavailable");
+    assert_eq!(record.query_records.len(), 1);
+    assert_eq!(record.query_records[0].status, "retry_wait");
+    assert_eq!(record.query_records[0].error_kind, "NetworkUnavailable");
 }
 
 // ── T001/T003: 指定 submit_id 查询不污染其他执行记录 ─────────────────────────────

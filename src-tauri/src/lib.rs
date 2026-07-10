@@ -1,6 +1,6 @@
 mod keep_awake;
 use chrono::{DateTime, Duration, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::{
@@ -26,7 +26,7 @@ const MAX_IMAGES: usize = 9;
 const MAX_AUDIO: usize = 3;
 /// 自动查询最长等待时间（4小时），超过后停止自动查询，改为手动
 const MAX_WAIT_HOURS: i64 = 6;
-const MAX_NO_REMOTE_QUEUE_INFO_MINUTES: i64 = 5;
+const MAX_NO_REMOTE_QUEUE_INFO_MINUTES: i64 = 10;
 /// 5xx 服务器错误自动重试上限次数
 const MAX_SERVER_ERROR_RETRIES: u32 = 2;
 /// 上传 EOF / connection reset 等提交阶段瞬时错误，最多自动重试次数。
@@ -35,13 +35,15 @@ const MAX_TRANSIENT_SUBMIT_RETRIES: u32 = 3;
 const MAX_IDLE_TRANSIENT_FAILED_RETRIES: u32 = 3;
 /// 队列空闲后，因并发限制被旧策略标失败的任务额外补试次数。
 const MAX_IDLE_CONCURRENCY_FAILED_RETRIES: u32 = 3;
+/// 生成阶段 pre-TNS 检查失败后，自动重新提交的次数。
+const MAX_GENERATION_PRECHECK_RETRIES: u32 = 2;
 /// 只自动捞起近期并发限制失败，避免把几周前的历史失败任务重新提交。
 const MAX_CONCURRENCY_FAILURE_RECOVERY_HOURS: i64 = 24;
 const IMAGE_SUBMIT_TIMEOUT_SECS: u64 = 300;
 const IMAGE_SUBMIT_CONNECT_TIMEOUT_SECS: u64 = 300;
 const SCHEDULER_TICK_INTERVAL_SECS: u64 = 30;
-const DEFAULT_CONCURRENCY_RETRY_DELAY_SECONDS: u64 = 30;
-const LEGACY_CONCURRENCY_RETRY_DELAY_SECONDS: u64 = 300;
+const DEFAULT_CONCURRENCY_RETRY_DELAY_SECONDS: u64 = 300;
+const LEGACY_CONCURRENCY_RETRY_DELAY_SECONDS: u64 = 30;
 const FAST_FALLBACK_MODEL_VERSION: &str = "seedance2.0fast";
 const FAST_FALLBACK_QUEUE_WAIT_HOURS: i64 = 2;
 static PROCESS_QUEUE_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -56,6 +58,24 @@ enum ModelQueueKind {
 struct SubmitQueueSelection {
     task_id: String,
     target_queue_kind: ModelQueueKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaneStatus {
+    pub queue_kind: String,
+    pub model_version: String,
+    pub enabled: bool,
+    pub is_active: bool,
+    pub is_cooling_down: bool,
+    pub cooldown_reason: String,
+    pub current_task_id: String,
+    pub current_task_title: String,
+    pub submit_id: String,
+    pub queue_position: Option<u64>,
+    pub queue_length: Option<u64>,
+    pub next_check_at: String,
+    pub waiting_task_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -393,7 +413,11 @@ pub struct Role {
     pub name: String,
     pub aliases: Vec<String>,
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub series: String,
     pub description: String,
+    #[serde(default)]
+    pub disabled: bool,
     pub asset_ids: Vec<String>,
     #[serde(default)]
     pub created_at: String,
@@ -845,12 +869,16 @@ pub struct AppData {
     pub assets: Vec<Asset>,
     pub roles: Vec<Role>,
     pub tasks: Vec<ScheduledTask>,
+    #[serde(default, rename = "taskPriorities", alias = "task_priorities")]
+    pub task_priorities: HashMap<String, u8>,
     #[serde(default, deserialize_with = "deserialize_logs_compat")]
     pub logs: Vec<LogEntry>,
     #[serde(default)]
     pub imagegen_history: Vec<ImageGenHistoryItem>,
     #[serde(skip, default = "HashMap::new")]
     pub asset_hash_index: HashMap<String, String>,
+    #[serde(default, rename = "laneStatus", alias = "lane_status")]
+    pub lane_status: Vec<LaneStatus>,
 }
 
 impl Default for AppData {
@@ -860,9 +888,11 @@ impl Default for AppData {
             assets: vec![],
             roles: vec![],
             tasks: vec![],
+            task_priorities: HashMap::new(),
             logs: vec![],
             imagegen_history: vec![],
             asset_hash_index: HashMap::new(),
+            lane_status: vec![],
         }
     }
 }
@@ -927,6 +957,8 @@ pub struct McpVideoTaskDefaults {
     pub video_resolution: Option<String>,
     #[serde(default, alias = "plannedSubmitCount")]
     pub planned_submit_count: Option<u32>,
+    #[serde(default, alias = "alternateFastModel")]
+    pub alternate_fast_model: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -968,6 +1000,8 @@ pub struct McpQueueVideosInput {
     pub start_at: Option<String>,
     #[serde(default)]
     pub defaults: McpVideoTaskDefaults,
+    #[serde(default, alias = "alternateFastModel")]
+    pub alternate_fast_model: bool,
     #[serde(default, alias = "tasks", alias = "videos")]
     pub items: Vec<McpVideoTaskInput>,
 }
@@ -1217,7 +1251,11 @@ pub struct CreateRoleInput {
     pub name: String,
     pub aliases: Vec<String>,
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub series: String,
     pub description: String,
+    #[serde(default)]
+    pub disabled: bool,
     pub asset_ids: Vec<String>,
 }
 
@@ -1347,6 +1385,10 @@ pub struct UpdateSettingsInput {
     pub active_ai_model_id: String,
     #[serde(default = "default_true")]
     pub prevent_sleep: bool,
+    #[serde(default = "default_true")]
+    pub standard_lane_enabled: bool,
+    #[serde(default = "default_true")]
+    pub fast_lane_enabled: bool,
     #[serde(default = "default_image_model_configs")]
     pub image_model_configs: Vec<ImageModelConfig>,
     #[serde(default = "default_active_image_model_id")]
@@ -1412,12 +1454,17 @@ pub struct AppStore {
 
 impl AppStore {
     pub fn load(root_dir: PathBuf) -> Self {
-        let data = load_app_data_from_disk(&root_dir).unwrap_or_default();
+        let (data, should_compact) = match load_app_data_from_disk(&root_dir) {
+            Ok(data) => (data, true),
+            Err(_) => (AppData::default(), false),
+        };
         let store = Self {
             root_dir,
             data: Mutex::new(data),
         };
-        store.compact_on_disk_if_oversized();
+        if should_compact {
+            store.compact_on_disk_if_oversized();
+        }
         store
     }
 
@@ -1443,6 +1490,7 @@ impl AppStore {
         if let Ok(latest) = load_app_data_from_disk(&self.root_dir) {
             *data = latest;
         }
+        data.lane_status = compute_lane_status(&data, Utc::now());
         data.clone()
     }
 
@@ -1503,12 +1551,287 @@ impl AppStore {
 
 fn load_app_data_from_disk(root_dir: &Path) -> Result<AppData, SchedulerError> {
     let data_path = root_dir.join("state.json");
-    let mut data: AppData = fs::read_to_string(&data_path)
-        .ok()
-        .and_then(|content| serde_json::from_str(&content).ok())
-        .unwrap_or_default();
+    let content = match fs::read_to_string(&data_path) {
+        Ok(content) => content,
+        Err(_) => {
+            let mut data = AppData::default();
+            normalize_loaded_app_data(&mut data);
+            return Ok(data);
+        }
+    };
+    let mut data: AppData = match serde_json::from_str(&content) {
+        Ok(data) => data,
+        Err(error) => {
+            let value = serde_json::from_str::<JsonValue>(&content)
+                .map_err(|parse_error| SchedulerError::Io(parse_error.to_string()))?;
+            load_app_data_resilient(value, &error.to_string())
+        }
+    };
     normalize_loaded_app_data(&mut data);
     Ok(data)
+}
+
+fn parse_json_field<T>(object: &mut JsonMap<String, JsonValue>, key: &str) -> T
+where
+    T: DeserializeOwned + Default,
+{
+    object
+        .remove(key)
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
+}
+
+fn parse_logs_field(object: &mut JsonMap<String, JsonValue>) -> Vec<LogEntry> {
+    #[derive(Deserialize, Default)]
+    struct LogsOnly {
+        #[serde(default, deserialize_with = "deserialize_logs_compat")]
+        logs: Vec<LogEntry>,
+    }
+
+    object
+        .remove("logs")
+        .and_then(|logs| {
+            serde_json::from_value::<LogsOnly>(serde_json::json!({ "logs": logs })).ok()
+        })
+        .map(|parsed| parsed.logs)
+        .unwrap_or_default()
+}
+
+fn load_app_data_resilient(value: JsonValue, root_error: &str) -> AppData {
+    let Some(mut object) = value.as_object().cloned() else {
+        return AppData::default();
+    };
+    let mut data = AppData {
+        settings: parse_json_field(&mut object, "settings"),
+        assets: parse_json_field(&mut object, "assets"),
+        roles: parse_json_field(&mut object, "roles"),
+        tasks: vec![],
+        task_priorities: object
+            .remove("taskPriorities")
+            .or_else(|| object.remove("task_priorities"))
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default(),
+        logs: parse_logs_field(&mut object),
+        imagegen_history: parse_json_field(&mut object, "imagegen_history"),
+        asset_hash_index: HashMap::new(),
+        lane_status: object
+            .remove("laneStatus")
+            .or_else(|| object.remove("lane_status"))
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default(),
+    };
+
+    if let Some(JsonValue::Array(tasks)) = object.remove("tasks") {
+        for (index, task_value) in tasks.into_iter().enumerate() {
+            match serde_json::from_value::<ScheduledTask>(task_value.clone()) {
+                Ok(task) => data.tasks.push(task),
+                Err(error) => {
+                    let mut task = isolate_schema_error_task(task_value, index, &error.to_string());
+                    append_schema_error_log(&mut data, &task, root_error, &error.to_string());
+                    task.next_run_at = None;
+                    data.tasks.push(task);
+                }
+            }
+        }
+    }
+
+    data
+}
+
+fn append_schema_error_log(
+    data: &mut AppData,
+    task: &ScheduledTask,
+    root_error: &str,
+    task_error: &str,
+) {
+    append_log(
+        data,
+        LogEntryDraft {
+            level: LogLevel::Error,
+            source: LogSource::System,
+            category: "state".to_string(),
+            event_type: "task_schema_error_isolated".to_string(),
+            message: format!("启动校验隔离异常任务：{}", task.title),
+            detail: format!(
+                "task_id={}\nroot_error={}\ntask_error={}",
+                task.id, root_error, task_error
+            ),
+            task_id: Some(task.id.clone()),
+            task_title: Some(task.title.clone()),
+            submit_id: if task.submit_id.trim().is_empty() {
+                None
+            } else {
+                Some(task.submit_id.clone())
+            },
+            execution_record_id: None,
+            error_detail: Some(task_error.to_string()),
+            raw_output: None,
+            stdout: None,
+            stderr: None,
+            module: Some("state_loader".to_string()),
+        },
+    );
+}
+
+fn isolate_schema_error_task(value: JsonValue, index: usize, task_error: &str) -> ScheduledTask {
+    let mut sanitized = value.clone();
+    let mut repaired_fields = Vec::new();
+    sanitize_task_command_preview_fields(&mut sanitized, &mut repaired_fields);
+    let mut task = serde_json::from_value::<ScheduledTask>(sanitized)
+        .unwrap_or_else(|_| schema_error_placeholder_task(&value, index));
+    task.status = "schema_error".to_string();
+    task.next_run_at = None;
+    task.auto_query_stopped = true;
+    task.updated_at = now_rfc3339();
+    let fields = if repaired_fields.is_empty() {
+        "未知字段".to_string()
+    } else {
+        repaired_fields.join(", ")
+    };
+    task.last_error = format!(
+        "启动校验发现任务数据字段异常，已隔离该任务，不影响其他任务。字段：{fields}；错误：{task_error}"
+    );
+    task
+}
+
+fn sanitize_task_command_preview_fields(value: &mut JsonValue, repaired_fields: &mut Vec<String>) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    coerce_command_preview_list(
+        object,
+        "command_preview",
+        "command_preview",
+        repaired_fields,
+    );
+    if let Some(JsonValue::Array(attempts)) = object.get_mut("attempts") {
+        for (index, attempt) in attempts.iter_mut().enumerate() {
+            if let Some(attempt_object) = attempt.as_object_mut() {
+                coerce_command_preview_list(
+                    attempt_object,
+                    "command_preview",
+                    &format!("attempts[{index}].command_preview"),
+                    repaired_fields,
+                );
+            }
+        }
+    }
+    if let Some(JsonValue::Array(records)) = object.get_mut("execution_records") {
+        for (record_index, record) in records.iter_mut().enumerate() {
+            let Some(record_object) = record.as_object_mut() else {
+                continue;
+            };
+            coerce_command_preview_list(
+                record_object,
+                "command_preview",
+                &format!("execution_records[{record_index}].command_preview"),
+                repaired_fields,
+            );
+            if let Some(JsonValue::Array(queries)) = record_object.get_mut("query_records") {
+                for (query_index, query) in queries.iter_mut().enumerate() {
+                    if let Some(query_object) = query.as_object_mut() {
+                        coerce_command_preview_list(
+                            query_object,
+                            "command_preview",
+                            &format!(
+                                "execution_records[{record_index}].query_records[{query_index}].command_preview"
+                            ),
+                            repaired_fields,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn coerce_command_preview_list(
+    object: &mut JsonMap<String, JsonValue>,
+    key: &str,
+    path: &str,
+    repaired_fields: &mut Vec<String>,
+) {
+    let Some(value) = object.get_mut(key) else {
+        return;
+    };
+    if !value.is_array() {
+        *value = JsonValue::Array(vec![]);
+        repaired_fields.push(path.to_string());
+    }
+}
+
+fn schema_error_placeholder_task(value: &JsonValue, index: usize) -> ScheduledTask {
+    let object = value.as_object();
+    let get_string = |key: &str| {
+        object
+            .and_then(|map| map.get(key))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let now = now_rfc3339();
+    ScheduledTask {
+        id: {
+            let id = get_string("id");
+            if id.trim().is_empty() {
+                format!("task_schema_error_{index}")
+            } else {
+                id
+            }
+        },
+        title: {
+            let title = get_string("title");
+            if title.trim().is_empty() {
+                format!("异常任务 {}", index + 1)
+            } else {
+                title
+            }
+        },
+        prompt: get_string("prompt"),
+        image_asset_ids: vec![],
+        audio_asset_ids: vec![],
+        role_ids: vec![],
+        manual_mention_ids: vec![],
+        auto_match_roles: false,
+        params: object
+            .and_then(|map| map.get("params"))
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default(),
+        status: "schema_error".to_string(),
+        scheduled_at: None,
+        next_run_at: None,
+        queued_at: None,
+        submit_id: get_string("submit_id"),
+        attempt_count: 0,
+        concurrency_retry_count: 0,
+        last_error: String::new(),
+        command_preview: vec![],
+        attempts: vec![],
+        result_paths: vec![],
+        result_urls: vec![],
+        created_at: {
+            let created_at = get_string("created_at");
+            if created_at.trim().is_empty() {
+                now.clone()
+            } else {
+                created_at
+            }
+        },
+        updated_at: now,
+        finished_at: String::new(),
+        submitted_at: None,
+        queue_info: None,
+        temp_image_asset_ids: vec![],
+        temp_image_paths: vec![],
+        execution_records: vec![],
+        last_auto_query_at: None,
+        auto_query_stopped: true,
+        consecutive_no_result_queries: 0,
+        server_error_retry_count: 0,
+        planned_submit_count: 1,
+        prompt_doc: None,
+    }
 }
 
 fn normalize_loaded_app_data(data: &mut AppData) {
@@ -1518,6 +1841,7 @@ fn normalize_loaded_app_data(data: &mut AppData) {
     backfill_execution_records_from_attempts(data);
     compact_retry_execution_records_for_display(data);
     // Sort query_records chronologically before capping (cap drains oldest from front)
+    dedupe_all_query_records(data);
     sort_all_query_records(data);
     recover_tasks_on_load(data);
     backfill_draft_command_previews(data);
@@ -1848,6 +2172,10 @@ pub struct SchedulerSettings {
     pub active_ai_model_id: String,
     #[serde(default = "default_true")]
     pub prevent_sleep: bool,
+    #[serde(default = "default_true")]
+    pub standard_lane_enabled: bool,
+    #[serde(default = "default_true")]
+    pub fast_lane_enabled: bool,
     #[serde(default = "default_image_model_configs")]
     pub image_model_configs: Vec<ImageModelConfig>,
     #[serde(default = "default_active_image_model_id")]
@@ -1887,6 +2215,8 @@ impl Default for SchedulerSettings {
             ai_model_configs: default_ai_model_configs(),
             active_ai_model_id: default_active_ai_model_id(),
             prevent_sleep: true,
+            standard_lane_enabled: true,
+            fast_lane_enabled: true,
             image_model_configs: default_image_model_configs(),
             active_image_model_id: default_active_image_model_id(),
             image_model_config: Some(ImageModelConfig::default()),
@@ -1897,10 +2227,11 @@ impl Default for SchedulerSettings {
 /// 检查当前是否存在需要防休眠的任务（排队/预定/等待重试/提交中/查询中/非停止的提交后查询）。
 pub fn needs_keep_awake(tasks: &[ScheduledTask]) -> bool {
     tasks.iter().any(|t| {
-        matches!(
+        (matches!(
             t.status.as_str(),
             "queued" | "scheduled" | "retry_wait" | "submitting" | "submitted" | "querying"
-        ) && !t.auto_query_stopped
+        ) || t.execution_records.iter().any(is_active_execution_record))
+            && !t.auto_query_stopped
     })
 }
 
@@ -2015,9 +2346,114 @@ fn record_query_due(record: &TaskExecutionRecord, now: DateTime<Utc>) -> bool {
         .unwrap_or(true)
 }
 
+fn query_output_has_explicit_remote_progress(parsed: &QueryOutput) -> bool {
+    if parsed.queue_info.is_some()
+        || !parsed.result_paths.is_empty()
+        || !parsed.result_urls.is_empty()
+        || parsed.fail_reason.is_some()
+        || parsed.error_code.is_some()
+    {
+        return true;
+    }
+    parsed
+        .gen_status
+        .as_deref()
+        .map(|status| {
+            matches!(
+                status.to_ascii_lowercase().as_str(),
+                "processing" | "generating" | "success" | "succeeded" | "failed" | "cancelled"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn execution_tracking_window_expired(record: &TaskExecutionRecord, now: DateTime<Utc>) -> bool {
+    DateTime::parse_from_rfc3339(record.started_at.trim())
+        .map(|time| {
+            now.signed_duration_since(time.with_timezone(&Utc))
+                >= Duration::minutes(MAX_NO_REMOTE_QUEUE_INFO_MINUTES)
+        })
+        .unwrap_or(false)
+}
+
+fn latest_record_query_has_explicit_remote_progress(record: &TaskExecutionRecord) -> bool {
+    record.query_records.last().is_some_and(|attempt| {
+        let raw = format!("{}\n{}", attempt.stdout, attempt.stderr);
+        query_output_has_explicit_remote_progress(&parse_query_output(&raw))
+    })
+}
+
+fn expire_stale_historical_execution_records(
+    task: &mut ScheduledTask,
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    let current_submit_id = task.submit_id.trim().to_string();
+    let finished_at = now.to_rfc3339();
+    let mut expired_submit_ids = Vec::new();
+    for record in &mut task.execution_records {
+        if record.submit_id == current_submit_id
+            || !is_active_execution_record(record)
+            || !execution_tracking_window_expired(record, now)
+            || latest_record_query_has_explicit_remote_progress(record)
+        {
+            continue;
+        }
+        record.status = "query_timeout".to_string();
+        record.finished_at = finished_at.clone();
+        record.error_kind = "RemoteTrackingExpired".to_string();
+        record.error_detail = format!(
+            "远端超过 {} 分钟仅返回 querying 且无排队或生成进度，已停止自动追踪并释放本地车道；不代表生成失败。",
+            MAX_NO_REMOTE_QUEUE_INFO_MINUTES
+        );
+        expired_submit_ids.push(record.submit_id.clone());
+    }
+    expired_submit_ids
+}
+
 fn is_active_execution_record(record: &TaskExecutionRecord) -> bool {
     matches!(record.status.as_str(), "querying" | "submitted")
         && !record.submit_id.trim().is_empty()
+        && record.finished_at.trim().is_empty()
+}
+
+fn normalize_active_execution_records(task: &mut ScheduledTask) {
+    for record in &mut task.execution_records {
+        if matches!(record.status.as_str(), "querying" | "submitted")
+            && !record.submit_id.trim().is_empty()
+        {
+            record.finished_at.clear();
+        }
+    }
+}
+
+fn reconcile_task_with_active_execution(task: &mut ScheduledTask) {
+    if task.status == "succeeded" {
+        return;
+    }
+    let Some(record) = task
+        .execution_records
+        .iter()
+        .filter(|record| is_active_execution_record(record))
+        .max_by(|left, right| left.started_at.cmp(&right.started_at))
+    else {
+        return;
+    };
+    let status = record.status.clone();
+    let submit_id = record.submit_id.clone();
+    let submitted_at = record.started_at.clone();
+    let queue_info = execution_record_queue_info(record);
+
+    let was_failed = task.status == "failed";
+    task.status = status;
+    task.submit_id = submit_id;
+    task.submitted_at = Some(submitted_at);
+    task.finished_at.clear();
+    if was_failed {
+        task.last_error.clear();
+    }
+    task.next_run_at = None;
+    task.queue_info = queue_info;
+    task.auto_query_stopped = false;
 }
 
 fn queue_info_is_queueing(queue_info: Option<&QueueInfo>) -> bool {
@@ -2091,12 +2527,10 @@ fn is_fast_fallback_due(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
         .unwrap_or(true)
 }
 
-fn next_due_fast_query_target(data: &AppData, now: DateTime<Utc>) -> Option<(String, String)> {
-    for task in data.tasks.iter().filter(|task| {
-        matches!(task.status.as_str(), "querying" | "submitted") && !task.auto_query_stopped
-    }) {
+fn next_due_execution_query_target(data: &AppData, now: DateTime<Utc>) -> Option<(String, String)> {
+    for task in data.tasks.iter().filter(|task| !task.auto_query_stopped) {
         if let Some(record) = task.execution_records.iter().find(|record| {
-            is_fast_execution_record(record)
+            record.submit_id != task.submit_id
                 && is_active_execution_record(record)
                 && record_query_due(record, now)
         }) {
@@ -2209,21 +2643,20 @@ fn is_past_no_remote_queue_info_wait(task: &ScheduledTask, now: DateTime<Utc>) -
 }
 
 fn query_output_has_remote_progress_info(parsed: &QueryOutput, raw: &str) -> bool {
-    if parsed.queue_info.is_some()
-        || !parsed.result_paths.is_empty()
-        || !parsed.result_urls.is_empty()
-        || parsed.fail_reason.is_some()
-        || parsed.error_code.is_some()
-    {
+    if query_output_has_explicit_remote_progress(parsed) {
         return true;
     }
     let Some(value) = serde_json::from_str::<serde_json::Value>(raw).ok() else {
         return false;
     };
-    find_json_string_field(&value, "task_status").is_some()
-        || find_json_string_field(&value, "task_id").is_some()
-        || find_json_string_field(&value, "history_id").is_some()
-        || find_json_string_field(&value, "history_record_id").is_some()
+    find_json_string_field(&value, "task_status")
+        .map(|status| {
+            matches!(
+                status.to_ascii_lowercase().as_str(),
+                "queueing" | "processing" | "generating" | "success" | "succeeded"
+            )
+        })
+        .unwrap_or(false)
 }
 
 /// 查询后更新退避状态
@@ -2249,6 +2682,7 @@ pub struct CommandPlan {
 pub enum DreaminaErrorKind {
     ConcurrencyLimit,
     ComplianceRequired,
+    NetworkUnavailable,
     Transient,
     Generic,
 }
@@ -2306,6 +2740,8 @@ pub fn resolve_task_inputs(
     let mut unresolved_mentions = Vec::new();
     let mut prompt_rewrites = Vec::new();
     let mentions = extract_mentions(&task.prompt);
+    let mut mentioned_image_asset_ids = Vec::new();
+    let mut mentioned_audio_asset_ids = Vec::new();
 
     for asset_id in &task.image_asset_ids {
         push_asset_id(
@@ -2337,26 +2773,26 @@ pub fn resolve_task_inputs(
                         mention.as_str(),
                         task,
                         &asset_by_id,
-                        &image_asset_ids,
+                        &mentioned_image_asset_ids,
                     )
                 });
             if let Some(candidate) = candidate {
                 match candidate.kind {
                     AssetKind::Image => {
-                        push_unique(&mut image_asset_ids, candidate.asset_id.clone());
-                        let index = image_asset_ids
+                        push_unique(&mut mentioned_image_asset_ids, candidate.asset_id.clone());
+                        let index = mentioned_image_asset_ids
                             .iter()
                             .position(|id| id == &candidate.asset_id)
-                            .unwrap_or(image_asset_ids.len() - 1)
+                            .unwrap_or(mentioned_image_asset_ids.len() - 1)
                             + 1;
                         push_prompt_rewrite(&mut prompt_rewrites, mention, format!("图{index}"));
                     }
                     AssetKind::Audio => {
-                        push_unique(&mut audio_asset_ids, candidate.asset_id.clone());
-                        let index = audio_asset_ids
+                        push_unique(&mut mentioned_audio_asset_ids, candidate.asset_id.clone());
+                        let index = mentioned_audio_asset_ids
                             .iter()
                             .position(|id| id == &candidate.asset_id)
-                            .unwrap_or(audio_asset_ids.len() - 1)
+                            .unwrap_or(mentioned_audio_asset_ids.len() - 1)
                             + 1;
                         push_prompt_rewrite(&mut prompt_rewrites, mention, format!("音频{index}"));
                     }
@@ -2365,6 +2801,12 @@ pub fn resolve_task_inputs(
                 push_unique(&mut unresolved_mentions, mention);
             }
         }
+    }
+    if !mentioned_image_asset_ids.is_empty() {
+        image_asset_ids = mentioned_image_asset_ids;
+    }
+    if !mentioned_audio_asset_ids.is_empty() {
+        audio_asset_ids = mentioned_audio_asset_ids;
     }
 
     validate_input_counts(&image_asset_ids, &audio_asset_ids)?;
@@ -2540,6 +2982,9 @@ fn apply_submit_error_retry_state(
 fn compact_submit_error_detail(kind: &str, message: &str) -> String {
     match kind {
         "ConcurrencyLimit" => "并发任务仍在生成中，已自动排队等待下次重试。".to_string(),
+        "NetworkUnavailable" => {
+            "网络暂不可用或登录刷新失败，已等待网络恢复后自动重试。".to_string()
+        }
         "Transient" => "提交时遇到临时网络或平台错误，已自动排队等待下次重试。".to_string(),
         _ => message.trim().to_string(),
     }
@@ -2548,14 +2993,41 @@ fn compact_submit_error_detail(kind: &str, message: &str) -> String {
 fn compact_failed_submit_error_detail(kind: &str, message: &str) -> String {
     match kind {
         "ConcurrencyLimit" => "并发任务仍在生成中，已自动排队等待下次重试。".to_string(),
+        "NetworkUnavailable" => {
+            "网络暂不可用或登录刷新失败，已等待网络恢复后自动重试。".to_string()
+        }
         "Transient" => "提交时遇到临时网络或平台错误，自动重试已达上限，已标记失败。".to_string(),
         _ => message.trim().to_string(),
     }
 }
 
+fn compact_query_retry_error_detail(kind: &str, message: &str) -> String {
+    match kind {
+        "ConcurrencyLimit" => "并发任务仍在生成中，已等待下次自动查询。".to_string(),
+        "NetworkUnavailable" => {
+            "网络暂不可用或登录刷新失败，已等待网络恢复后自动查询。".to_string()
+        }
+        "Transient" => "查询时遇到临时网络或平台错误，已等待下次自动查询。".to_string(),
+        _ => message.trim().to_string(),
+    }
+}
+
+fn is_waitable_query_error(kind: &DreaminaErrorKind, next_status: &str) -> bool {
+    next_status == "retry_wait"
+        && matches!(
+            kind,
+            DreaminaErrorKind::ConcurrencyLimit
+                | DreaminaErrorKind::NetworkUnavailable
+                | DreaminaErrorKind::Transient
+        )
+}
+
 fn should_merge_retry_execution_record(status: &str, error_kind: &str) -> bool {
     matches!(status, "retry_wait" | "failed")
-        && matches!(error_kind, "ConcurrencyLimit" | "Transient")
+        && matches!(
+            error_kind,
+            "ConcurrencyLimit" | "NetworkUnavailable" | "Transient"
+        )
 }
 
 fn execution_record_model_version(record: &TaskExecutionRecord) -> &str {
@@ -2641,6 +3113,18 @@ pub fn compact_retry_execution_records_for_display(data: &mut AppData) -> usize 
     removed
 }
 
+fn is_network_unavailable_error(lower_text: &str) -> bool {
+    let authsdk_refresh_failed = lower_text.contains("authsdk")
+        && lower_text.contains("refresh failed")
+        && (lower_text.contains("protocol transport") || lower_text.contains("do request"));
+    authsdk_refresh_failed
+        || lower_text.contains("network is unreachable")
+        || lower_text.contains("no such host")
+        || lower_text.contains("could not resolve host")
+        || lower_text.contains("temporary failure in name resolution")
+        || lower_text.contains("name resolution failed")
+}
+
 pub fn classify_dreamina_error(
     message: &str,
     settings: &SchedulerSettings,
@@ -2661,6 +3145,15 @@ pub fn classify_dreamina_error(
             kind: DreaminaErrorKind::ComplianceRequired,
             next_status: "blocked".to_string(),
             retry_after_seconds: None,
+            show_modal: false,
+            message: text,
+        };
+    }
+    if is_network_unavailable_error(&lower_text) {
+        return ClassifiedDreaminaError {
+            kind: DreaminaErrorKind::NetworkUnavailable,
+            next_status: "retry_wait".to_string(),
+            retry_after_seconds: Some(settings.concurrency_retry_delay_seconds),
             show_modal: false,
             message: text,
         };
@@ -2749,16 +3242,15 @@ pub fn parse_query_output(output: &str) -> QueryOutput {
     let queue_info = parsed
         .as_ref()
         .and_then(|v| v.get("queue_info"))
-        .and_then(|qi| {
-            Some(QueueInfo {
-                queue_idx: qi.get("queue_idx").and_then(|v| v.as_u64()),
-                priority: qi.get("priority").and_then(|v| v.as_u64()),
-                queue_status: qi
-                    .get("queue_status")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                queue_length: qi.get("queue_length").and_then(|v| v.as_u64()),
-            })
+        .and_then(|qi| qi.as_object())
+        .map(|qi| QueueInfo {
+            queue_idx: qi.get("queue_idx").and_then(|v| v.as_u64()),
+            priority: qi.get("priority").and_then(|v| v.as_u64()),
+            queue_status: qi
+                .get("queue_status")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            queue_length: qi.get("queue_length").and_then(|v| v.as_u64()),
         });
     QueryOutput {
         gen_status: parsed
@@ -2988,7 +3480,9 @@ pub fn create_role(input: CreateRoleInput) -> Role {
         name: input.name,
         aliases: input.aliases,
         tags: input.tags,
+        series: input.series,
         description: input.description,
+        disabled: input.disabled,
         asset_ids: input.asset_ids,
         created_at: now.clone(),
         updated_at: now,
@@ -3359,8 +3853,20 @@ pub fn queue_mcp_video_tasks(
 ) -> Result<Vec<McpQueuedVideoTask>, SchedulerError> {
     let mut working = data.clone();
     let mut queued = Vec::new();
-    for item in input.items {
-        let merged = merge_mcp_video_defaults(item, &input.start_at, &input.defaults);
+    let alternate_fast_model = input
+        .defaults
+        .alternate_fast_model
+        .unwrap_or(input.alternate_fast_model);
+    for (index, item) in input.items.into_iter().enumerate() {
+        let item_has_explicit_model = item.model.is_some();
+        let mut merged = merge_mcp_video_defaults(item, &input.start_at, &input.defaults);
+        if alternate_fast_model && !item_has_explicit_model {
+            merged.model = Some(if index % 2 == 0 {
+                "standard".to_string()
+            } else {
+                "fast".to_string()
+            });
+        }
         queued.push(queue_mcp_video_task(&mut working, assets_dir, merged)?);
     }
     *data = working;
@@ -3528,11 +4034,7 @@ pub fn backfill_execution_records_from_attempts(data: &mut AppData) -> usize {
             else {
                 continue;
             };
-            if !record
-                .query_records
-                .iter()
-                .any(|query| query.id == attempt.id)
-            {
+            if !query_record_exists(&record.query_records, attempt) {
                 record.query_records.push(attempt.clone());
             }
             let raw = format!("{}\n{}", attempt.stdout, attempt.stderr);
@@ -3570,6 +4072,11 @@ pub fn backfill_execution_records_from_attempts(data: &mut AppData) -> usize {
                         record.result_urls = task.result_urls.clone();
                     }
                     record.status = "succeeded".to_string();
+                    if !task.finished_at.trim().is_empty() {
+                        record.finished_at = task.finished_at.clone();
+                    }
+                    record.error_kind.clear();
+                    record.error_detail.clear();
                 }
             }
         }
@@ -3582,6 +4089,11 @@ pub fn backfill_execution_records_from_attempts(data: &mut AppData) -> usize {
 pub fn recover_tasks_on_load(data: &mut AppData) {
     let settings = data.settings.clone();
     for task in &mut data.tasks {
+        normalize_active_execution_records(task);
+        if !expire_stale_historical_execution_records(task, Utc::now()).is_empty() {
+            task.updated_at = now_rfc3339();
+        }
+        reconcile_task_with_active_execution(task);
         // 清理旧数据中残留的"应用重启，查询中断"文案（迁移兼容）
         for rec in &mut task.execution_records {
             if rec.error_detail == "应用重启，查询中断" {
@@ -3942,9 +4454,13 @@ fn execution_record_model_queue_kind(record: &TaskExecutionRecord) -> ModelQueue
 fn latest_retry_wait_execution_record(task: &ScheduledTask) -> Option<&TaskExecutionRecord> {
     task.execution_records
         .iter()
-        .rev()
-        .find(|record| record.status == "retry_wait")
-        .or_else(|| latest_execution_record(task))
+        .filter(|record| record.status == "retry_wait")
+        .max_by(|left, right| record_sort_time(left).cmp(record_sort_time(right)))
+        .or_else(|| {
+            task.execution_records
+                .iter()
+                .max_by(|left, right| record_sort_time(left).cmp(record_sort_time(right)))
+        })
 }
 
 fn submit_queue_kind_for_task(task: &ScheduledTask) -> ModelQueueKind {
@@ -3953,7 +4469,52 @@ fn submit_queue_kind_for_task(task: &ScheduledTask) -> ModelQueueKind {
             .map(execution_record_model_queue_kind)
             .unwrap_or_else(|| task_model_queue_kind(task));
     }
+    if matches!(
+        task.status.as_str(),
+        "submitting" | "submitted" | "querying"
+    ) && !task.submit_id.trim().is_empty()
+    {
+        if let Some(record) = task
+            .execution_records
+            .iter()
+            .find(|record| record.submit_id == task.submit_id)
+        {
+            return execution_record_model_queue_kind(record);
+        }
+    }
     task_model_queue_kind(task)
+}
+
+fn lane_enabled(settings: &SchedulerSettings, kind: ModelQueueKind) -> bool {
+    match kind {
+        ModelQueueKind::Standard => settings.standard_lane_enabled,
+        ModelQueueKind::Fast => settings.fast_lane_enabled,
+    }
+}
+
+fn set_lane_enabled(
+    data: &mut AppData,
+    kind: ModelQueueKind,
+    enabled: bool,
+) -> Result<(), SchedulerError> {
+    let (standard_enabled, fast_enabled) = match kind {
+        ModelQueueKind::Standard => (enabled, data.settings.fast_lane_enabled),
+        ModelQueueKind::Fast => (data.settings.standard_lane_enabled, enabled),
+    };
+    if !standard_enabled && !fast_enabled {
+        return Err(SchedulerError::Io("至少保留一条车道".to_string()));
+    }
+    data.settings.standard_lane_enabled = standard_enabled;
+    data.settings.fast_lane_enabled = fast_enabled;
+    Ok(())
+}
+
+fn parse_lane_kind(value: &str) -> Result<ModelQueueKind, SchedulerError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "standard" | "seedance2.0" => Ok(ModelQueueKind::Standard),
+        "fast" | "seedance2.0fast" => Ok(ModelQueueKind::Fast),
+        other => Err(SchedulerError::Io(format!("未知车道：{other}"))),
+    }
 }
 
 fn active_remote_queue_kinds(data: &AppData) -> HashSet<ModelQueueKind> {
@@ -3964,7 +4525,7 @@ fn active_remote_queue_kinds(data: &AppData) -> HashSet<ModelQueueKind> {
                 && !task.submit_id.trim().is_empty()
                 && !task.auto_query_stopped)
         {
-            kinds.insert(task_model_queue_kind(task));
+            kinds.insert(submit_queue_kind_for_task(task));
         }
         for record in task
             .execution_records
@@ -3977,26 +4538,34 @@ fn active_remote_queue_kinds(data: &AppData) -> HashSet<ModelQueueKind> {
     kinds
 }
 
+fn retry_wait_task_has_concurrency_cooldown(
+    task: &ScheduledTask,
+    now: DateTime<Utc>,
+    queue_kind: ModelQueueKind,
+) -> bool {
+    if task.status != "retry_wait"
+        || submit_queue_kind_for_task(task) != queue_kind
+        || is_due(task.next_run_at.as_deref(), now)
+    {
+        return false;
+    }
+    is_concurrency_limit(&task.last_error)
+        || latest_retry_wait_execution_record(task)
+            .map(|record| {
+                record.error_kind == "ConcurrencyLimit"
+                    || is_concurrency_limit(&record.error_detail)
+            })
+            .unwrap_or(false)
+}
+
 fn has_concurrency_cooldown_for_queue(
     data: &AppData,
     now: DateTime<Utc>,
     queue_kind: ModelQueueKind,
 ) -> bool {
-    data.tasks.iter().any(|task| {
-        if task.status != "retry_wait"
-            || submit_queue_kind_for_task(task) != queue_kind
-            || is_due(task.next_run_at.as_deref(), now)
-        {
-            return false;
-        }
-        is_concurrency_limit(&task.last_error)
-            || latest_retry_wait_execution_record(task)
-                .map(|record| {
-                    record.error_kind == "ConcurrencyLimit"
-                        || is_concurrency_limit(&record.error_detail)
-                })
-                .unwrap_or(false)
-    })
+    data.tasks
+        .iter()
+        .any(|task| retry_wait_task_has_concurrency_cooldown(task, now, queue_kind))
 }
 
 fn model_queue_available(
@@ -4005,8 +4574,254 @@ fn model_queue_available(
     active_kinds: &HashSet<ModelQueueKind>,
     queue_kind: ModelQueueKind,
 ) -> bool {
-    !active_kinds.contains(&queue_kind)
+    lane_enabled(&data.settings, queue_kind)
+        && !active_kinds.contains(&queue_kind)
         && !has_concurrency_cooldown_for_queue(data, now, queue_kind)
+}
+
+fn task_next_query_at(task: &ScheduledTask, now: DateTime<Utc>) -> String {
+    task.last_auto_query_at
+        .as_ref()
+        .and_then(|last_at| {
+            let interval = query_interval_secs(task);
+            DateTime::parse_from_rfc3339(last_at)
+                .ok()
+                .map(|t| t.with_timezone(&Utc) + Duration::seconds(interval as i64))
+        })
+        .map(|next| next.to_rfc3339())
+        .unwrap_or_else(|| now.to_rfc3339())
+}
+
+fn record_next_query_at(record: &TaskExecutionRecord, now: DateTime<Utc>) -> String {
+    record
+        .query_records
+        .last()
+        .and_then(|last_query| {
+            DateTime::parse_from_rfc3339(&last_query.finished_at)
+                .or_else(|_| DateTime::parse_from_rfc3339(&last_query.started_at))
+                .ok()
+                .map(|t| t.with_timezone(&Utc) + Duration::seconds(60))
+        })
+        .map(|next| next.to_rfc3339())
+        .unwrap_or_else(|| now.to_rfc3339())
+}
+
+fn execution_record_queue_info(record: &TaskExecutionRecord) -> Option<QueueInfo> {
+    record
+        .query_records
+        .iter()
+        .rev()
+        .find_map(|attempt| parse_query_output(&attempt.stdout).queue_info)
+}
+
+fn active_lane_occupant(
+    data: &AppData,
+    now: DateTime<Utc>,
+    queue_kind: ModelQueueKind,
+) -> Option<(String, String, String, Option<u64>, Option<u64>, String)> {
+    if let Some(task) =
+        data.tasks
+            .iter()
+            .filter(|task| {
+                (task.status == "querying" || task.status == "submitted")
+                    && !task.submit_id.trim().is_empty()
+                    && !task.auto_query_stopped
+                    && submit_queue_kind_for_task(task) == queue_kind
+                    && task.queue_info.as_ref().is_some_and(|queue| {
+                        queue.queue_idx.is_some() || queue.queue_length.is_some()
+                    })
+            })
+            .max_by(|left, right| left.last_auto_query_at.cmp(&right.last_auto_query_at))
+    {
+        let qi = task.queue_info.as_ref();
+        return Some((
+            task.id.clone(),
+            task.title.clone(),
+            task.submit_id.clone(),
+            qi.and_then(|q| q.queue_idx),
+            qi.and_then(|q| q.queue_length),
+            task_next_query_at(task, now),
+        ));
+    }
+
+    for task in &data.tasks {
+        if task.auto_query_stopped {
+            continue;
+        }
+        if let Some((record, qi)) = task.execution_records.iter().find_map(|record| {
+            if !is_active_execution_record(record)
+                || execution_record_model_queue_kind(record) != queue_kind
+            {
+                return None;
+            }
+            let qi = execution_record_queue_info(record)?;
+            (qi.queue_idx.is_some() || qi.queue_length.is_some()).then_some((record, qi))
+        }) {
+            return Some((
+                task.id.clone(),
+                task.title.clone(),
+                record.submit_id.clone(),
+                qi.queue_idx,
+                qi.queue_length,
+                record_next_query_at(record, now),
+            ));
+        }
+    }
+
+    if let Some(task) = data.tasks.iter().find(|task| {
+        (task.status == "submitting"
+            || ((task.status == "querying" || task.status == "submitted")
+                && !task.submit_id.trim().is_empty()
+                && !task.auto_query_stopped))
+            && submit_queue_kind_for_task(task) == queue_kind
+    }) {
+        let qi = task.queue_info.as_ref();
+        return Some((
+            task.id.clone(),
+            task.title.clone(),
+            task.submit_id.clone(),
+            qi.and_then(|q| q.queue_idx),
+            qi.and_then(|q| q.queue_length),
+            task_next_query_at(task, now),
+        ));
+    }
+
+    for task in &data.tasks {
+        if task.auto_query_stopped {
+            continue;
+        }
+        if let Some(record) = task.execution_records.iter().find(|record| {
+            is_active_execution_record(record)
+                && execution_record_model_queue_kind(record) == queue_kind
+        }) {
+            let qi = execution_record_queue_info(record);
+            return Some((
+                task.id.clone(),
+                task.title.clone(),
+                record.submit_id.clone(),
+                qi.as_ref().and_then(|q| q.queue_idx),
+                qi.as_ref().and_then(|q| q.queue_length),
+                record_next_query_at(record, now),
+            ));
+        }
+    }
+
+    None
+}
+
+fn compute_lane_status(data: &AppData, now: DateTime<Utc>) -> Vec<LaneStatus> {
+    let active_kinds = active_remote_queue_kinds(data);
+    let queue_kinds = [ModelQueueKind::Standard, ModelQueueKind::Fast];
+
+    queue_kinds
+        .iter()
+        .map(|&kind| {
+            let model_version = match kind {
+                ModelQueueKind::Standard => "seedance2.0",
+                ModelQueueKind::Fast => FAST_FALLBACK_MODEL_VERSION,
+            };
+            let kind_str = match kind {
+                ModelQueueKind::Standard => "standard",
+                ModelQueueKind::Fast => "fast",
+            };
+
+            let enabled = lane_enabled(&data.settings, kind);
+            let is_active = enabled && active_kinds.contains(&kind);
+            let is_cooling_down = enabled && has_concurrency_cooldown_for_queue(data, now, kind);
+            let active_occupant = active_lane_occupant(data, now, kind);
+
+            let (
+                current_task_id,
+                current_task_title,
+                submit_id,
+                queue_position,
+                queue_length,
+                active_next_check_at,
+            ) = active_occupant.unwrap_or_else(|| {
+                (
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    None,
+                    None,
+                    now.to_rfc3339(),
+                )
+            });
+
+            let cooldown_tasks: Vec<&ScheduledTask> = data
+                .tasks
+                .iter()
+                .filter(|task| retry_wait_task_has_concurrency_cooldown(task, now, kind))
+                .collect();
+
+            // Compute next_check_at
+            let next_check_at = if is_active {
+                active_next_check_at
+            } else if is_cooling_down {
+                // Cooling down: next check = earliest concurrency cooldown end
+                cooldown_tasks
+                    .iter()
+                    .filter_map(|t| t.next_run_at.as_ref())
+                    .min()
+                    .cloned()
+                    .unwrap_or_else(|| now.to_rfc3339())
+            } else {
+                // Available/looking: next check = earliest due task for this lane
+                data.tasks
+                    .iter()
+                    .filter(|t| {
+                        (t.status == "queued"
+                            || t.status == "retry_wait"
+                            || t.status == "scheduled")
+                            && submit_queue_kind_for_task(t) == kind
+                    })
+                    .filter_map(|t| t.next_run_at.as_ref())
+                    .min()
+                    .cloned()
+                    .unwrap_or_else(|| now.to_rfc3339())
+            };
+
+            // Count waiting tasks for this lane
+            let waiting_task_count = data
+                .tasks
+                .iter()
+                .filter(|t| {
+                    matches!(
+                        t.status.as_str(),
+                        "queued" | "retry_wait" | "scheduled" | "draft"
+                    ) && submit_queue_kind_for_task(t) == kind
+                })
+                .count() as u32;
+
+            // Cooldown reason
+            let cooldown_reason = if is_cooling_down {
+                let hit_count = cooldown_tasks.len();
+                if hit_count > 0 {
+                    format!("并发限制，{} 个任务等待重试", hit_count)
+                } else {
+                    "并发限制冷却中".to_string()
+                }
+            } else {
+                String::new()
+            };
+
+            LaneStatus {
+                queue_kind: kind_str.to_string(),
+                model_version: model_version.to_string(),
+                enabled,
+                is_active,
+                is_cooling_down,
+                cooldown_reason,
+                current_task_id,
+                current_task_title,
+                submit_id,
+                queue_position,
+                queue_length,
+                next_check_at,
+                waiting_task_count,
+            }
+        })
+        .collect()
 }
 
 fn is_due_for_submit(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
@@ -4073,7 +4888,13 @@ fn is_idle_failed_retry_due(
     now: DateTime<Utc>,
     retry_delay_seconds: u64,
 ) -> bool {
-    if task.status != "failed" || !needs_more_successful_submits(task) {
+    if task.status != "failed"
+        || !needs_more_successful_submits(task)
+        || task
+            .execution_records
+            .iter()
+            .any(is_active_execution_record)
+    {
         return false;
     }
     let Some(latest) = latest_execution_record(task) else {
@@ -4144,19 +4965,13 @@ fn next_due_submit_task_id_for_queue(
         .iter()
         .enumerate()
         .filter(|(_, task)| {
-            queue_kind
-                .map(|kind| submit_queue_kind_for_task(task) == kind)
-                .unwrap_or(true)
-                && needs_more_successful_submits(task)
-                && is_due_for_submit(task, now)
+            needs_more_successful_submits(task)
+                && queue_kind
+                    .map(|kind| task_is_due_for_target_queue(task, now, kind))
+                    .unwrap_or_else(|| is_due_for_submit(task, now))
         })
         .min_by(|(left_index, left), (right_index, right)| {
-            successful_execution_count(left)
-                .cmp(&successful_execution_count(right))
-                .then_with(|| due_sort_key(left).cmp(&due_sort_key(right)))
-                .then_with(|| queue_started_sort_key(left).cmp(&queue_started_sort_key(right)))
-                .then_with(|| left.created_at.cmp(&right.created_at))
-                .then_with(|| left_index.cmp(right_index))
+            compare_submit_candidates(data, *left_index, left, *right_index, right)
         })
         .map(|(_, task)| task.id.clone())
 }
@@ -4171,22 +4986,80 @@ fn next_idle_failed_retry_task_id_for_queue(
         .iter()
         .enumerate()
         .filter(|(_, task)| {
-            queue_kind
-                .map(|kind| submit_queue_kind_for_task(task) == kind)
-                .unwrap_or(true)
-                && is_idle_failed_retry_due(task, now, retry_delay_seconds)
+            let _ = queue_kind;
+            is_idle_failed_retry_due(task, now, retry_delay_seconds)
         })
         .min_by(|(left_index, left), (right_index, right)| {
-            successful_execution_count(left)
-                .cmp(&successful_execution_count(right))
-                .then_with(|| {
+            compare_submit_candidates(data, *left_index, left, *right_index, right).then_with(
+                || {
                     retryable_failed_execution_count(left, "Transient")
                         .cmp(&retryable_failed_execution_count(right, "Transient"))
-                })
-                .then_with(|| left.created_at.cmp(&right.created_at))
-                .then_with(|| left_index.cmp(right_index))
+                },
+            )
         })
         .map(|(_, task)| task.id.clone())
+}
+
+fn task_queue_priority(data: &AppData, task_id: &str) -> u8 {
+    data.task_priorities
+        .get(task_id)
+        .copied()
+        .unwrap_or(0)
+        .min(2)
+}
+
+fn is_generation_precheck_retry_wait(task: &ScheduledTask) -> bool {
+    task.status == "retry_wait"
+        && latest_retry_wait_execution_record(task)
+            .map(|record| {
+                record.error_kind == "GenerationPrecheck"
+                    || is_generation_precheck_failure(&record.error_detail)
+            })
+            .unwrap_or_else(|| is_generation_precheck_failure(&task.last_error))
+}
+
+fn compare_submit_candidates(
+    data: &AppData,
+    left_index: usize,
+    left: &ScheduledTask,
+    right_index: usize,
+    right: &ScheduledTask,
+) -> std::cmp::Ordering {
+    let left_review_retry = is_generation_precheck_retry_wait(left);
+    let right_review_retry = is_generation_precheck_retry_wait(right);
+    let left_priority = task_queue_priority(data, &left.id);
+    let right_priority = task_queue_priority(data, &right.id);
+    left_review_retry
+        .cmp(&right_review_retry)
+        .then_with(|| right_priority.cmp(&left_priority))
+        .then_with(|| successful_execution_count(left).cmp(&successful_execution_count(right)))
+        .then_with(|| {
+            if left_priority == 0 && right_priority == 0 {
+                left.id.cmp(&right.id)
+            } else {
+                queue_started_sort_key(left).cmp(&queue_started_sort_key(right))
+            }
+        })
+        .then_with(|| due_sort_key(left).cmp(&due_sort_key(right)))
+        .then_with(|| left.created_at.cmp(&right.created_at))
+        .then_with(|| left_index.cmp(&right_index))
+}
+
+fn set_task_queue_priority(
+    data: &mut AppData,
+    task_id: &str,
+    priority: u8,
+) -> Result<u8, SchedulerError> {
+    if !data.tasks.iter().any(|task| task.id == task_id) {
+        return Err(SchedulerError::Io(format!("找不到任务：{task_id}")));
+    }
+    let priority = priority.min(2);
+    if priority == 0 {
+        data.task_priorities.remove(task_id);
+    } else {
+        data.task_priorities.insert(task_id.to_string(), priority);
+    }
+    Ok(priority)
 }
 
 fn next_submit_task_id_for_queue(
@@ -4203,56 +5076,37 @@ fn next_submit_task_id_for_available_queues(
     now: DateTime<Utc>,
     active_kinds: &HashSet<ModelQueueKind>,
 ) -> Option<SubmitQueueSelection> {
-    let normal_selection = [ModelQueueKind::Standard, ModelQueueKind::Fast]
-        .iter()
-        .copied()
-        .filter(|kind| model_queue_available(data, now, active_kinds, *kind))
-        .filter_map(|kind| {
-            next_submit_task_id_for_queue(data, now, Some(kind)).map(|task_id| {
-                SubmitQueueSelection {
-                    task_id,
-                    target_queue_kind: kind,
-                }
-            })
-        })
-        .min_by(|left_selection, right_selection| {
-            let left = data
-                .tasks
-                .iter()
-                .find(|task| task.id == left_selection.task_id);
-            let right = data
-                .tasks
-                .iter()
-                .find(|task| task.id == right_selection.task_id);
-            match (left, right) {
-                (Some(left), Some(right)) => successful_execution_count(left)
-                    .cmp(&successful_execution_count(right))
-                    .then_with(|| due_sort_key(left).cmp(&due_sort_key(right)))
-                    .then_with(|| queue_started_sort_key(left).cmp(&queue_started_sort_key(right)))
-                    .then_with(|| left.created_at.cmp(&right.created_at)),
-                _ => std::cmp::Ordering::Equal,
-            }
-        });
-
-    if normal_selection.is_some() {
-        return normal_selection;
-    }
-
-    let fast_available = model_queue_available(data, now, active_kinds, ModelQueueKind::Fast);
-    let standard_blocked = active_kinds.contains(&ModelQueueKind::Standard)
-        || has_concurrency_cooldown_for_queue(data, now, ModelQueueKind::Standard);
-    let has_due_fast =
-        next_submit_task_id_for_queue(data, now, Some(ModelQueueKind::Fast)).is_some();
-    if fast_available && standard_blocked && !has_due_fast {
-        return next_submit_task_id_for_queue(data, now, Some(ModelQueueKind::Standard)).map(
-            |task_id| SubmitQueueSelection {
+    for kind in [ModelQueueKind::Standard, ModelQueueKind::Fast] {
+        if !model_queue_available(data, now, active_kinds, kind) {
+            continue;
+        }
+        if let Some(task_id) = next_submit_task_id_for_queue(data, now, Some(kind)) {
+            return Some(SubmitQueueSelection {
                 task_id,
-                target_queue_kind: ModelQueueKind::Fast,
-            },
-        );
+                target_queue_kind: kind,
+            });
+        }
     }
 
     None
+}
+
+fn task_is_due_for_target_queue(
+    task: &ScheduledTask,
+    now: DateTime<Utc>,
+    target_queue_kind: ModelQueueKind,
+) -> bool {
+    let is_concurrency_retry = is_concurrency_limit(&task.last_error)
+        || latest_retry_wait_execution_record(task)
+            .map(|record| {
+                record.error_kind == "ConcurrencyLimit"
+                    || is_concurrency_limit(&record.error_detail)
+            })
+            .unwrap_or(false);
+    let can_switch_from_cooling_lane = task.status == "retry_wait"
+        && is_concurrency_retry
+        && submit_queue_kind_for_task(task) != target_queue_kind;
+    can_switch_from_cooling_lane || is_due_for_submit(task, now)
 }
 
 fn apply_planned_submit_completion(task: &mut ScheduledTask) {
@@ -4422,25 +5276,6 @@ where
     }
 
     let now = Utc::now();
-    if let Some((task_id, submit_id)) = next_due_fast_query_target(data, now) {
-        return query_task_submit_id_once_with_runner(data, &task_id, &submit_id, &mut runner)
-            .map(Some);
-    }
-
-    if let Some(task_id) = data
-        .tasks
-        .iter()
-        .find(|task| is_fast_fallback_due(task, now))
-        .map(|task| task.id.clone())
-    {
-        return submit_fast_fallback_once_with_runner(data, &task_id, &mut runner).map(Some);
-    }
-
-    if let Some((task_id, submit_id)) = next_due_initial_current_query_target(data, now) {
-        return query_task_submit_id_once_with_runner(data, &task_id, &submit_id, &mut runner)
-            .map(Some);
-    }
-
     for task in data
         .tasks
         .iter_mut()
@@ -4452,10 +5287,9 @@ where
 
     let active_kinds = active_remote_queue_kinds(data);
     if let Some(selection) = next_submit_task_id_for_available_queues(data, now, &active_kinds) {
-        let model_version_override = if selection.target_queue_kind == ModelQueueKind::Fast {
-            Some(FAST_FALLBACK_MODEL_VERSION)
-        } else {
-            None
+        let model_version_override = match selection.target_queue_kind {
+            ModelQueueKind::Standard => Some("seedance2.0"),
+            ModelQueueKind::Fast => Some(FAST_FALLBACK_MODEL_VERSION),
         };
 
         return submit_task_once_with_runner(
@@ -4465,6 +5299,16 @@ where
             &mut runner,
         )
         .map(Some);
+    }
+
+    if let Some((task_id, submit_id)) = next_due_initial_current_query_target(data, now) {
+        return query_task_submit_id_once_with_runner(data, &task_id, &submit_id, &mut runner)
+            .map(Some);
+    }
+
+    if let Some((task_id, submit_id)) = next_due_execution_query_target(data, now) {
+        return query_task_submit_id_once_with_runner(data, &task_id, &submit_id, &mut runner)
+            .map(Some);
     }
 
     if let Some((task_id, submit_id)) = next_due_current_query_target(data, now) {
@@ -4586,6 +5430,7 @@ pub fn delete_task_from_data(data: &mut AppData, task_id: &str) -> Result<(), Sc
     if data.tasks.len() == before {
         return Err(SchedulerError::Io(format!("找不到任务：{task_id}")));
     }
+    data.task_priorities.remove(task_id);
     Ok(())
 }
 
@@ -4748,66 +5593,15 @@ pub fn peek_due_task_cli(data: &AppData) -> Result<Option<DueTaskCli>, DueTaskBu
         return Ok(None);
     }
     let now = Utc::now();
-    // 优先处理已提交、正在排队的任务；未到查询退避时阻塞新提交。
-    if let Some((task_id, submit_id)) = next_due_fast_query_target(data, now) {
-        let args = vec![
-            "query_result".to_string(),
-            format!("--submit_id={submit_id}"),
-        ];
-        return Ok(Some(DueTaskCli {
-            task_id,
-            args,
-            action: DueTaskCliAction::Query { submit_id },
-        }));
-    }
-    if let Some(task) = data
-        .tasks
-        .iter()
-        .find(|task| is_fast_fallback_due(task, now))
-    {
-        let draft = fast_fallback_draft(task);
-        let resolved = resolve_task_inputs(&draft, &data.assets, &data.roles).map_err(|error| {
-            DueTaskBuildError {
-                task_id: task.id.clone(),
-                task_title: task.title.clone(),
-                message: format!("构建 Fast 兜底提交输入失败：{error}"),
-            }
-        })?;
-        let args =
-            build_multimodal2video_args(&draft, &resolved).map_err(|error| DueTaskBuildError {
-                task_id: task.id.clone(),
-                task_title: task.title.clone(),
-                message: format!("构建 Fast 兜底提交命令失败：{error}"),
-            })?;
-        return Ok(Some(DueTaskCli {
-            task_id: task.id.clone(),
-            args,
-            action: DueTaskCliAction::FastFallbackSubmit,
-        }));
-    }
-    if let Some((task_id, submit_id)) = next_due_initial_current_query_target(data, now) {
-        let args = vec![
-            "query_result".to_string(),
-            format!("--submit_id={submit_id}"),
-        ];
-        return Ok(Some(DueTaskCli {
-            task_id,
-            args,
-            action: DueTaskCliAction::Query { submit_id },
-        }));
-    }
     // 找下一个待提交任务；普通任务优先，队列空闲时再补试瞬时失败任务。
     let active_kinds = active_remote_queue_kinds(data);
     if let Some(selection) = next_submit_task_id_for_available_queues(data, now, &active_kinds) {
         let Some(task) = data.tasks.iter().find(|task| task.id == selection.task_id) else {
             return Ok(None);
         };
-        let model_version_override = if selection.target_queue_kind == ModelQueueKind::Fast
-            && task_model_queue_kind(task) != ModelQueueKind::Fast
-        {
-            Some(FAST_FALLBACK_MODEL_VERSION.to_string())
-        } else {
-            None
+        let model_version_override = match selection.target_queue_kind {
+            ModelQueueKind::Standard => Some("seedance2.0".to_string()),
+            ModelQueueKind::Fast => Some(FAST_FALLBACK_MODEL_VERSION.to_string()),
         };
         let mut params = task.params.clone();
         if let Some(model_version) = &model_version_override {
@@ -4846,6 +5640,30 @@ pub fn peek_due_task_cli(data: &AppData) -> Result<Option<DueTaskCli>, DueTaskBu
             action: DueTaskCliAction::Submit {
                 model_version_override,
             },
+        }));
+    }
+
+    if let Some((task_id, submit_id)) = next_due_initial_current_query_target(data, now) {
+        let args = vec![
+            "query_result".to_string(),
+            format!("--submit_id={submit_id}"),
+        ];
+        return Ok(Some(DueTaskCli {
+            task_id,
+            args,
+            action: DueTaskCliAction::Query { submit_id },
+        }));
+    }
+
+    if let Some((task_id, submit_id)) = next_due_execution_query_target(data, now) {
+        let args = vec![
+            "query_result".to_string(),
+            format!("--submit_id={submit_id}"),
+        ];
+        return Ok(Some(DueTaskCli {
+            task_id,
+            args,
+            action: DueTaskCliAction::Query { submit_id },
         }));
     }
 
@@ -5079,7 +5897,13 @@ where
         .execution_records
         .iter()
         .find(|record| record.submit_id == submit_id)
-        .map(|record| is_fast_execution_record(record))
+        .map(is_fast_execution_record)
+        .unwrap_or(false);
+    let queried_record_was_active = data.tasks[task_index]
+        .execution_records
+        .iter()
+        .find(|record| record.submit_id == submit_id)
+        .map(is_active_execution_record)
         .unwrap_or(false);
 
     let started_at = now_rfc3339();
@@ -5091,44 +5915,84 @@ where
     let (stdout, stderr) = match runner(&args) {
         Ok(output) => output,
         Err(message) => {
+            let finished = now_rfc3339();
+            let duration_secs = calc_duration_seconds(&started_at, &finished);
+            let classified = classify_dreamina_error(&message, &data.settings);
+            let waitable = is_waitable_query_error(&classified.kind, &classified.next_status);
+            let error_kind = format!("{:?}", classified.kind);
+            let error_detail = if waitable {
+                compact_query_retry_error_detail(&error_kind, &message)
+            } else {
+                message.clone()
+            };
+            let attempt_status = if waitable { "retry_wait" } else { "failed" };
             if is_current_submit {
-                data.tasks[task_index].status = "failed".to_string();
-                data.tasks[task_index].last_error = message.clone();
-                data.tasks[task_index].updated_at = now_rfc3339();
+                if waitable {
+                    if !matches!(
+                        data.tasks[task_index].status.as_str(),
+                        "querying" | "submitted"
+                    ) {
+                        data.tasks[task_index].status = "querying".to_string();
+                    }
+                    data.tasks[task_index].last_error = error_detail.clone();
+                    data.tasks[task_index].auto_query_stopped = false;
+                    update_query_backoff(&mut data.tasks[task_index]);
+                } else {
+                    data.tasks[task_index].status = "failed".to_string();
+                    data.tasks[task_index].last_error = message.clone();
+                    data.tasks[task_index].finished_at = finished.clone();
+                    data.tasks[task_index].queue_info = None;
+                    data.tasks[task_index].next_run_at = None;
+                }
+                data.tasks[task_index].updated_at = finished.clone();
             }
             if let Some(rec) = data.tasks[task_index]
                 .execution_records
                 .iter_mut()
                 .find(|r| r.submit_id == submit_id)
             {
-                let finished = now_rfc3339();
-                rec.status = "failed".to_string();
-                rec.error_detail = message.clone();
-                rec.finished_at = finished.clone();
+                if waitable {
+                    rec.error_kind = error_kind.clone();
+                    rec.error_detail = error_detail.clone();
+                } else {
+                    rec.status = "failed".to_string();
+                    rec.error_detail = message.clone();
+                    rec.error_kind = error_kind.clone();
+                    rec.finished_at = finished.clone();
+                }
                 rec.query_records.push(TaskAttempt {
                     id: format!("qr_{}", Uuid::new_v4().simple()),
                     started_at,
                     finished_at: finished,
-                    status: "failed".to_string(),
+                    status: attempt_status.to_string(),
                     command_preview: args,
                     stdout: String::new(),
                     stderr: String::new(),
-                    error_kind: String::new(),
-                    duration_seconds: 0.0,
-                    error_detail: message,
+                    error_kind,
+                    duration_seconds: duration_secs,
+                    error_detail,
                 });
                 sort_query_records_by_time(&mut rec.query_records);
             }
+            reconcile_task_with_active_execution(&mut data.tasks[task_index]);
             return Ok(data.tasks[task_index].clone());
         }
     };
     let raw = format!("{stdout}\n{stderr}");
     let parsed = parse_query_output(&raw);
+    let has_explicit_remote_progress = query_output_has_explicit_remote_progress(&parsed);
+    let historical_tracking_expired = !is_current_submit
+        && data.tasks[task_index]
+            .execution_records
+            .iter()
+            .find(|record| record.submit_id == submit_id)
+            .is_some_and(|record| execution_tracking_window_expired(record, Utc::now()));
     let status_text = parsed.gen_status.clone().unwrap_or_default().to_lowercase();
-    let final_status;
+    let mut final_status;
     let mut final_result_paths = Vec::new();
     let mut final_result_urls = Vec::new();
     let mut final_error_detail = String::new();
+    let mut final_error_kind = String::new();
     let mut final_queue_info = None;
 
     if status_text.contains("success")
@@ -5142,8 +6006,40 @@ where
         || status_text.contains("cancel")
         || parsed.error_code.map_or(false, |c| c >= 400)
     {
-        final_status = "failed".to_string();
-        final_error_detail = parsed.fail_reason.unwrap_or_else(|| raw.trim().to_string());
+        let failure_message = parsed.fail_reason.unwrap_or_else(|| raw.trim().to_string());
+        let classified = classify_dreamina_error(&failure_message, &data.settings);
+        if is_waitable_query_error(&classified.kind, &classified.next_status) {
+            final_status = "querying".to_string();
+            final_error_kind = format!("{:?}", classified.kind);
+            final_error_detail =
+                compact_query_retry_error_detail(&final_error_kind, &failure_message);
+            if is_current_submit {
+                data.tasks[task_index].auto_query_stopped = false;
+                update_query_backoff(&mut data.tasks[task_index]);
+            }
+        } else {
+            final_status = "failed".to_string();
+            final_error_detail = failure_message;
+        }
+        if final_status == "failed" && is_generation_precheck_failure(&final_error_detail) {
+            final_error_kind = "GenerationPrecheck".to_string();
+            let previous_failures = data.tasks[task_index]
+                .execution_records
+                .iter()
+                .filter(|record| {
+                    record.error_kind == final_error_kind
+                        && matches!(record.status.as_str(), "retry_wait" | "failed")
+                })
+                .count() as u32;
+            if is_current_submit && previous_failures < MAX_GENERATION_PRECHECK_RETRIES {
+                final_status = "retry_wait".to_string();
+                data.tasks[task_index].next_run_at = Some(
+                    (Utc::now()
+                        + Duration::seconds(data.settings.concurrency_retry_delay_seconds as i64))
+                    .to_rfc3339(),
+                );
+            }
+        }
     } else {
         // 无结果（仍在排队或处理中）
         // 如果 submitted_at 未设置（旧任务或遗漏），在第一次收到"仍在排队"时补填
@@ -5159,6 +6055,7 @@ where
             && is_past_no_remote_queue_info_wait(&data.tasks[task_index], now)
         {
             final_status = "failed".to_string();
+            final_error_kind = "RemoteProgressTimeout".to_string();
             final_error_detail = format!(
                 "查询超过 {} 分钟仍未返回远端队列信息，疑似提交未真正进入生成队列",
                 MAX_NO_REMOTE_QUEUE_INFO_MINUTES
@@ -5188,6 +6085,14 @@ where
             }
         }
     }
+    if final_status == "querying" && historical_tracking_expired && !has_explicit_remote_progress {
+        final_status = "query_timeout".to_string();
+        final_error_kind = "RemoteTrackingExpired".to_string();
+        final_error_detail = format!(
+            "远端超过 {} 分钟仅返回 querying 且无排队或生成进度，已停止自动追踪并释放本地车道；不代表生成失败。",
+            MAX_NO_REMOTE_QUEUE_INFO_MINUTES
+        );
+    }
     let finished = now_rfc3339();
     if is_current_submit {
         data.tasks[task_index].status = final_status.clone();
@@ -5202,11 +6107,16 @@ where
             data.tasks[task_index].finished_at = finished.clone();
             data.tasks[task_index].queue_info = None;
             data.tasks[task_index].last_error = final_error_detail.clone();
+            data.tasks[task_index].next_run_at = None;
         } else {
             data.tasks[task_index].queue_info = final_queue_info.clone();
             data.tasks[task_index].last_error = final_error_detail.clone();
+            if final_status == "retry_wait" && final_error_kind == "GenerationPrecheck" {
+                data.tasks[task_index].queued_at = Some(finished.clone());
+            }
         }
-    } else if is_fast_fallback_submit && final_status == "succeeded" {
+    } else if (is_fast_fallback_submit || queried_record_was_active) && final_status == "succeeded"
+    {
         data.tasks[task_index].status = "succeeded".to_string();
         data.tasks[task_index].submit_id = submit_id.clone();
         data.tasks[task_index].result_paths = final_result_paths.clone();
@@ -5217,29 +6127,30 @@ where
         data.tasks[task_index].updated_at = finished.clone();
     }
     let duration_secs = calc_duration_seconds(&started_at, &finished);
+    let query_record_id = format!("qr_{}", Uuid::new_v4().simple());
     let query_record = TaskAttempt {
-        id: format!("qr_{}", Uuid::new_v4().simple()),
+        id: query_record_id.clone(),
         started_at: started_at.clone(),
         finished_at: finished.clone(),
         status: final_status.clone(),
         command_preview: args.clone(),
         stdout: truncate_log(&stdout),
         stderr: truncate_log(&stderr),
-        error_kind: String::new(),
+        error_kind: final_error_kind.clone(),
         duration_seconds: duration_secs,
         error_detail: final_error_detail.clone(),
     };
     // 兼容旧字段：同时写入顶层 attempts
     if is_current_submit {
         data.tasks[task_index].attempts.push(TaskAttempt {
-            id: format!("attempt_{}", Uuid::new_v4().simple()),
+            id: query_record_id,
             started_at,
             finished_at: finished.clone(),
             status: final_status.clone(),
             command_preview: args,
             stdout: truncate_log(&stdout),
             stderr: truncate_log(&stderr),
-            error_kind: String::new(),
+            error_kind: final_error_kind.clone(),
             duration_seconds: duration_secs,
             error_detail: final_error_detail.clone(),
         });
@@ -5250,19 +6161,32 @@ where
         .iter_mut()
         .find(|r| r.submit_id == submit_id)
     {
-        rec.query_records.push(query_record);
+        if !query_record_exists(&rec.query_records, &query_record) {
+            rec.query_records.push(query_record);
+        }
         sort_query_records_by_time(&mut rec.query_records);
         rec.status = final_status.clone();
         if final_status == "succeeded" {
             rec.result_paths = final_result_paths;
             rec.result_urls = final_result_urls;
             rec.finished_at = finished;
-        } else if final_status == "failed" || final_status == "query_timeout" {
+            rec.error_kind.clear();
+            rec.error_detail.clear();
+        } else if matches!(
+            final_status.as_str(),
+            "failed" | "query_timeout" | "retry_wait"
+        ) {
             rec.error_detail = final_error_detail;
+            rec.error_kind = final_error_kind;
             rec.finished_at = finished;
         } else {
             rec.error_detail = final_error_detail;
+            rec.error_kind = final_error_kind;
+            rec.finished_at.clear();
         }
+    }
+    if data.tasks[task_index].status != "succeeded" {
+        reconcile_task_with_active_execution(&mut data.tasks[task_index]);
     }
     apply_planned_submit_completion(&mut data.tasks[task_index]);
     Ok(data.tasks[task_index].clone())
@@ -5410,6 +6334,7 @@ where
                     error_detail: display_error_detail,
                 },
             );
+            reconcile_task_with_active_execution(&mut data.tasks[task_index]);
             return Ok(data.tasks[task_index].clone());
         }
     };
@@ -5538,6 +6463,11 @@ where
         params: draft.params.clone(),
         temp_image_asset_ids: task.temp_image_asset_ids.clone(),
     };
+    let execution_finished_at = if matches!(final_status.as_str(), "querying" | "submitted") {
+        String::new()
+    } else {
+        finished.clone()
+    };
     upsert_submit_execution_record(
         &mut data.tasks[task_index],
         TaskExecutionRecord {
@@ -5545,7 +6475,7 @@ where
             submit_id: submit_id_now,
             status: final_status,
             started_at,
-            finished_at: finished,
+            finished_at: execution_finished_at,
             input_snapshot,
             command_preview: args,
             query_records: vec![],
@@ -5555,6 +6485,9 @@ where
             error_detail: display_error_detail,
         },
     );
+    if data.tasks[task_index].status != "succeeded" {
+        reconcile_task_with_active_execution(&mut data.tasks[task_index]);
+    }
     apply_planned_submit_completion(&mut data.tasks[task_index]);
     Ok(data.tasks[task_index].clone())
 }
@@ -5639,7 +6572,7 @@ fn build_mention_asset_index(
         }
     }
 
-    for role in roles {
+    for role in roles.iter().filter(|role| !role.disabled) {
         for asset_id in &role.asset_ids {
             if let Some(asset) = asset_by_id.get(asset_id.as_str()) {
                 insert_asset_mention_labels(&mut index, asset, Some(role));
@@ -6002,6 +6935,12 @@ fn is_concurrency_limit(message: &str) -> bool {
         || message.contains("并发限制")
 }
 
+fn is_generation_precheck_failure(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("pre-tns check did not pass")
+}
+
 fn dreamina_candidates() -> Vec<String> {
     let mut candidates = Vec::new();
     if let Ok(value) = std::env::var("DREAMINA_BIN") {
@@ -6240,6 +7179,43 @@ fn try_acquire_store_queue_lock(store: &AppStore, origin: &str) -> Option<StoreQ
 const MAX_QUERY_RECORDS_PER_EXECUTION: usize = 500;
 /// 每个任务保留的 attempts（尝试历史）上限。
 const MAX_ATTEMPTS_PER_TASK: usize = 50;
+
+fn query_attempt_semantic_key(attempt: &TaskAttempt) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        attempt.started_at,
+        attempt.finished_at,
+        attempt.status,
+        attempt.command_preview.join("\u{1e}"),
+        attempt.stdout,
+        attempt.stderr,
+        attempt.error_detail,
+    )
+}
+
+fn query_record_exists(records: &[TaskAttempt], candidate: &TaskAttempt) -> bool {
+    let candidate_key = query_attempt_semantic_key(candidate);
+    records.iter().any(|record| {
+        record.id == candidate.id || query_attempt_semantic_key(record) == candidate_key
+    })
+}
+
+fn dedupe_query_records(records: &mut Vec<TaskAttempt>) {
+    let mut seen_ids = HashSet::new();
+    let mut seen_keys = HashSet::new();
+    records.retain(|attempt| {
+        let key = query_attempt_semantic_key(attempt);
+        seen_ids.insert(attempt.id.clone()) && seen_keys.insert(key)
+    });
+}
+
+fn dedupe_all_query_records(data: &mut AppData) {
+    for task in &mut data.tasks {
+        for rec in &mut task.execution_records {
+            dedupe_query_records(&mut rec.query_records);
+        }
+    }
+}
 
 /// Sort a task's execution record query_records by started_at (chronological).
 fn sort_query_records_by_time(records: &mut Vec<TaskAttempt>) {
@@ -6636,6 +7612,8 @@ pub fn run() {
             commands::delete_imagegen_history_item_command,
             commands::clear_imagegen_history_command,
             commands::update_settings_command,
+            commands::set_lane_enabled_command,
+            commands::set_task_queue_priority_command,
             commands::pause_task_command,
             commands::resume_task_command,
             commands::reschedule_task_command,
@@ -7265,15 +8243,6 @@ pub mod commands {
         };
         if submit_id.trim().is_empty() {
             return Err("任务没有 submit_id，无法查询".to_string());
-        }
-        // 如果后台已在自动查询同一个 submit_id，跳过手动查询避免记录交叉
-        {
-            let snapshot = store.snapshot();
-            if let Some(t) = snapshot.tasks.iter().find(|t| t.id == task_id) {
-                if t.status == "querying" && t.submit_id == submit_id {
-                    return Ok(t.clone());
-                }
-            }
         }
         // 锁外：运行 CLI
         let args = vec![
@@ -8156,6 +9125,8 @@ pub mod commands {
                     ai_model_configs: input.ai_model_configs,
                     active_ai_model_id: input.active_ai_model_id,
                     prevent_sleep: input.prevent_sleep,
+                    standard_lane_enabled: input.standard_lane_enabled,
+                    fast_lane_enabled: input.fast_lane_enabled,
                     image_model_configs: input.image_model_configs,
                     active_image_model_id: input.active_image_model_id,
                     image_model_config: input.image_model_config,
@@ -8185,6 +9156,38 @@ pub mod commands {
                 Ok(data.settings.clone())
             })
             .map_err(|error| error.to_string())
+    }
+
+    #[tauri::command]
+    pub fn set_lane_enabled_command(
+        store: State<'_, AppStore>,
+        waker: State<'_, SchedulerWaker>,
+        queue_kind: String,
+        enabled: bool,
+    ) -> Result<SchedulerSettings, String> {
+        let kind = parse_lane_kind(&queue_kind).map_err(|error| error.to_string())?;
+        let settings = store
+            .mutate(|data| {
+                set_lane_enabled(data, kind, enabled)?;
+                Ok(data.settings.clone())
+            })
+            .map_err(|error| error.to_string())?;
+        waker.notify();
+        Ok(settings)
+    }
+
+    #[tauri::command]
+    pub fn set_task_queue_priority_command(
+        store: State<'_, AppStore>,
+        waker: State<'_, SchedulerWaker>,
+        task_id: String,
+        priority: u8,
+    ) -> Result<u8, String> {
+        let priority = store
+            .mutate(|data| set_task_queue_priority(data, &task_id, priority))
+            .map_err(|error| error.to_string())?;
+        waker.notify();
+        Ok(priority)
     }
 
     #[tauri::command]
@@ -8259,10 +9262,11 @@ pub mod commands {
     #[tauri::command]
     pub fn reschedule_task_command(
         store: State<'_, AppStore>,
+        waker: State<'_, SchedulerWaker>,
         task_id: String,
         new_scheduled_at: String,
     ) -> Result<ScheduledTask, String> {
-        store
+        let task = store
             .mutate(|data| {
                 let task = reschedule_task(data, &task_id, &new_scheduled_at)?;
                 append_task_log(
@@ -8288,7 +9292,9 @@ pub mod commands {
                 );
                 Ok(task)
             })
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        waker.notify();
+        Ok(task)
     }
 
     #[tauri::command]
@@ -8394,11 +9400,12 @@ pub mod commands {
     #[tauri::command]
     pub fn queue_tasks_with_batch_schedule_command(
         store: State<'_, AppStore>,
+        waker: State<'_, SchedulerWaker>,
         plan: Vec<BatchQueuePlanItem>,
         planned_submit_count: u32,
         alternate_fast_model: bool,
     ) -> Result<Vec<ScheduledTask>, String> {
-        store
+        let tasks = store
             .mutate(|data| {
                 let tasks = queue_tasks_with_batch_schedule(
                     data,
@@ -8448,7 +9455,9 @@ pub mod commands {
                 }
                 Ok(tasks)
             })
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        waker.notify();
+        Ok(tasks)
     }
 
     #[tauri::command]
@@ -8973,6 +9982,113 @@ mod tests {
         assert!(current_record.query_records.is_empty());
     }
 
+    fn make_pre_tns_querying_task(submit_id: &str) -> ScheduledTask {
+        let mut task = make_task_with_execution_records();
+        task.status = "querying".to_string();
+        task.submit_id = submit_id.to_string();
+        task.planned_submit_count = 1;
+        task.result_paths.clear();
+        task.result_urls.clear();
+        task.execution_records = vec![TaskExecutionRecord {
+            id: format!("rec-{submit_id}"),
+            submit_id: submit_id.to_string(),
+            status: "querying".to_string(),
+            started_at: "2026-04-30T10:00:00Z".to_string(),
+            finished_at: String::new(),
+            input_snapshot: TaskExecutionInputSnapshot::default(),
+            command_preview: vec![],
+            query_records: vec![],
+            result_paths: vec![],
+            result_urls: vec![],
+            error_kind: String::new(),
+            error_detail: String::new(),
+        }];
+        task
+    }
+
+    fn append_querying_execution_record(task: &mut ScheduledTask, submit_id: &str) {
+        task.status = "querying".to_string();
+        task.submit_id = submit_id.to_string();
+        task.finished_at.clear();
+        task.last_error.clear();
+        task.execution_records.push(TaskExecutionRecord {
+            id: format!("rec-{submit_id}"),
+            submit_id: submit_id.to_string(),
+            status: "querying".to_string(),
+            started_at: now_rfc3339(),
+            finished_at: String::new(),
+            input_snapshot: TaskExecutionInputSnapshot::default(),
+            command_preview: vec![],
+            query_records: vec![],
+            result_paths: vec![],
+            result_urls: vec![],
+            error_kind: String::new(),
+            error_detail: String::new(),
+        });
+    }
+
+    fn query_pre_tns_failure(data: &mut AppData, submit_id: &str) -> ScheduledTask {
+        query_task_submit_id_once_with_runner(data, "task-1", submit_id, |_| {
+            Ok((
+                r#"{"gen_status":"FAILED","fail_reason":"generation failed: pre-TNS check did not pass"}"#.to_string(),
+                String::new(),
+            ))
+        })
+        .expect("pre-TNS 查询失败应写回任务状态")
+    }
+
+    #[test]
+    fn pre_tns_generation_failure_retries_twice_then_stays_failed() {
+        let mut task = make_pre_tns_querying_task("sub-1");
+        task.queued_at = Some("2026-04-30T00:00:00Z".to_string());
+        let mut data = AppData {
+            settings: SchedulerSettings {
+                concurrency_retry_delay_seconds: 0,
+                ..SchedulerSettings::default()
+            },
+            tasks: vec![task],
+            ..AppData::default()
+        };
+
+        let first = query_pre_tns_failure(&mut data, "sub-1");
+        assert_eq!(first.status, "retry_wait");
+        assert_ne!(
+            first.queued_at.as_deref(),
+            Some("2026-04-30T00:00:00Z"),
+            "审核失败重新排队时应重置入队时间"
+        );
+        assert_eq!(
+            first.execution_records.last().unwrap().error_kind,
+            "GenerationPrecheck"
+        );
+        assert_eq!(
+            next_due_submit_task_id(&data, Utc::now()).as_deref(),
+            Some("task-1")
+        );
+
+        append_querying_execution_record(&mut data.tasks[0], "sub-2");
+        let second = query_pre_tns_failure(&mut data, "sub-2");
+        assert_eq!(second.status, "retry_wait");
+        assert_eq!(
+            next_due_submit_task_id(&data, Utc::now()).as_deref(),
+            Some("task-1")
+        );
+
+        append_querying_execution_record(&mut data.tasks[0], "sub-3");
+        let third = query_pre_tns_failure(&mut data, "sub-3");
+        assert_eq!(third.status, "failed");
+        assert_eq!(
+            third
+                .execution_records
+                .iter()
+                .filter(|record| record.error_kind == "GenerationPrecheck"
+                    && matches!(record.status.as_str(), "retry_wait" | "failed"))
+                .count(),
+            3
+        );
+        assert_eq!(next_due_submit_task_id(&data, Utc::now()), None);
+    }
+
     #[test]
     fn reschedule_draft_task_prepares_it_for_delayed_generation() {
         let mut task = make_task_with_execution_records();
@@ -9030,21 +10146,21 @@ mod tests {
     }
 
     #[test]
-    fn concurrency_retry_delay_default_is_fast_enough_for_hot_window() {
+    fn concurrency_retry_delay_default_is_five_minutes() {
         assert_eq!(
             SchedulerSettings::default().concurrency_retry_delay_seconds,
-            30
+            300
         );
     }
 
     #[test]
-    fn normalize_loaded_app_data_migrates_legacy_five_minute_concurrency_retry_delay() {
+    fn normalize_loaded_app_data_migrates_legacy_hot_concurrency_retry_delay() {
         let mut data = AppData::default();
-        data.settings.concurrency_retry_delay_seconds = 300;
+        data.settings.concurrency_retry_delay_seconds = 30;
 
         normalize_loaded_app_data(&mut data);
 
-        assert_eq!(data.settings.concurrency_retry_delay_seconds, 30);
+        assert_eq!(data.settings.concurrency_retry_delay_seconds, 300);
     }
 
     #[test]
@@ -9355,8 +10471,8 @@ mod tests {
     fn cap_attempt(id: usize) -> TaskAttempt {
         TaskAttempt {
             id: format!("att-{id}"),
-            started_at: String::new(),
-            finished_at: String::new(),
+            started_at: format!("2026-05-01T00:{:02}:00Z", id % 60),
+            finished_at: format!("2026-05-01T00:{:02}:01Z", id % 60),
             status: "queried".to_string(),
             command_preview: vec![],
             stdout: String::new(),
@@ -9482,6 +10598,49 @@ mod tests {
         let reloaded = AppStore::load(temp.path().to_path_buf()).snapshot();
         assert_eq!(reloaded.tasks.len(), 1);
         assert_eq!(reloaded.tasks[0].id, "compact-1");
+    }
+
+    #[test]
+    fn load_isolates_task_with_invalid_command_preview_type() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let good = make_queued_task_for_submit("good-task");
+        let bad = make_queued_task_for_submit("bad-task");
+        let mut value = serde_json::to_value(AppData {
+            tasks: vec![good, bad],
+            ..AppData::default()
+        })
+        .expect("serialize app data");
+        let tasks = value
+            .get_mut("tasks")
+            .and_then(|item| item.as_array_mut())
+            .expect("tasks array");
+        tasks[1]["command_preview"] = JsonValue::String("--prompt=broken".to_string());
+        std::fs::write(
+            temp.path().join("state.json"),
+            serde_json::to_string(&value).expect("serialize broken state"),
+        )
+        .expect("write state");
+
+        let reloaded = AppStore::load(temp.path().to_path_buf()).snapshot();
+
+        assert_eq!(reloaded.tasks.len(), 2, "坏任务不应导致任务库清空");
+        assert_eq!(reloaded.tasks[0].id, "good-task");
+        let isolated = reloaded
+            .tasks
+            .iter()
+            .find(|task| task.id == "bad-task")
+            .expect("bad task should remain visible");
+        assert_eq!(isolated.status, "schema_error");
+        assert!(isolated.next_run_at.is_none());
+        assert!(
+            isolated.last_error.contains("command_preview"),
+            "unexpected error: {}",
+            isolated.last_error
+        );
+        assert!(reloaded.logs.iter().any(|log| {
+            log.event_type == "task_schema_error_isolated"
+                && log.task_id.as_deref() == Some("bad-task")
+        }));
     }
 
     // ── should_process_now（空闲短路）─────────────────────────────────────
@@ -9817,6 +10976,351 @@ mod tests {
     }
 
     #[test]
+    fn finished_execution_record_does_not_hold_standard_lane() {
+        let now = DateTime::parse_from_rfc3339("2026-05-03T02:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut stale_standard = make_queued_task_for_submit("old-standard");
+        stale_standard.status = "succeeded".to_string();
+        stale_standard.execution_records.push(TaskExecutionRecord {
+            id: "rec-finished".to_string(),
+            submit_id: "finished-submit".to_string(),
+            status: "querying".to_string(),
+            started_at: "2026-05-02T01:00:00Z".to_string(),
+            finished_at: "2026-05-02T01:10:00Z".to_string(),
+            input_snapshot: TaskExecutionInputSnapshot::default(),
+            command_preview: vec![],
+            query_records: vec![],
+            result_paths: vec![],
+            result_urls: vec![],
+            error_kind: String::new(),
+            error_detail: String::new(),
+        });
+        let mut queued_standard = make_queued_task_for_submit("new-standard");
+        queued_standard.queued_at = Some("2026-05-03T01:00:00Z".to_string());
+        let data = AppData {
+            tasks: vec![stale_standard, queued_standard],
+            ..AppData::default()
+        };
+        let active_kinds = active_remote_queue_kinds(&data);
+
+        assert!(
+            !active_kinds.contains(&ModelQueueKind::Standard),
+            "finished execution records must not keep the standard lane busy"
+        );
+        let selection = next_submit_task_id_for_available_queues(&data, now, &active_kinds)
+            .expect("standard lane should accept the queued task");
+        assert_eq!(selection.task_id, "new-standard");
+        assert_eq!(selection.target_queue_kind, ModelQueueKind::Standard);
+    }
+
+    #[test]
+    fn succeeded_task_active_fast_record_keeps_fast_lane_occupied() {
+        let now = DateTime::parse_from_rfc3339("2026-05-03T02:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut completed = make_queued_task_for_submit("completed");
+        completed.status = "succeeded".to_string();
+        completed.submit_id = "standard-done".to_string();
+        completed.result_urls = vec!["https://example.com/result.mp4".to_string()];
+        completed.execution_records.push(TaskExecutionRecord {
+            id: "stale-fast".to_string(),
+            submit_id: "fast-stale".to_string(),
+            status: "querying".to_string(),
+            started_at: "2026-05-02T01:00:00Z".to_string(),
+            finished_at: String::new(),
+            input_snapshot: TaskExecutionInputSnapshot {
+                params: VideoParams {
+                    model_version: FAST_FALLBACK_MODEL_VERSION.to_string(),
+                    ..VideoParams::default()
+                },
+                ..TaskExecutionInputSnapshot::default()
+            },
+            command_preview: vec![],
+            query_records: vec![],
+            result_paths: vec![],
+            result_urls: vec![],
+            error_kind: "FastFallback".to_string(),
+            error_detail: String::new(),
+        });
+        let mut queued_fast = make_queued_task_for_submit("new-fast");
+        queued_fast.params.model_version = FAST_FALLBACK_MODEL_VERSION.to_string();
+        let data = AppData {
+            tasks: vec![completed, queued_fast],
+            ..AppData::default()
+        };
+        let active_kinds = active_remote_queue_kinds(&data);
+
+        assert!(
+            active_kinds.contains(&ModelQueueKind::Fast),
+            "a remote record must stay occupied until its own query finishes"
+        );
+        let selection = next_submit_task_id_for_available_queues(&data, now, &active_kinds)
+            .expect("an idle lane should accept the queued task");
+        assert_eq!(selection.task_id, "new-fast");
+        assert_eq!(selection.target_queue_kind, ModelQueueKind::Standard);
+    }
+
+    #[test]
+    fn fast_concurrency_retry_switches_immediately_to_idle_standard_lane() {
+        let now = DateTime::parse_from_rfc3339("2026-05-03T02:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut task = make_queued_task_for_submit("fast-cooling");
+        task.status = "retry_wait".to_string();
+        task.next_run_at = Some("2026-05-03T02:05:00Z".to_string());
+        task.last_error = "ExceedConcurrencyLimit".to_string();
+        task.params.model_version = FAST_FALLBACK_MODEL_VERSION.to_string();
+        task.execution_records.push(TaskExecutionRecord {
+            id: "fast-retry".to_string(),
+            submit_id: String::new(),
+            status: "retry_wait".to_string(),
+            started_at: "2026-05-03T01:59:00Z".to_string(),
+            finished_at: "2026-05-03T01:59:01Z".to_string(),
+            input_snapshot: TaskExecutionInputSnapshot {
+                params: VideoParams {
+                    model_version: FAST_FALLBACK_MODEL_VERSION.to_string(),
+                    ..VideoParams::default()
+                },
+                ..TaskExecutionInputSnapshot::default()
+            },
+            command_preview: vec![],
+            query_records: vec![],
+            result_paths: vec![],
+            result_urls: vec![],
+            error_kind: "ConcurrencyLimit".to_string(),
+            error_detail: "ExceedConcurrencyLimit".to_string(),
+        });
+        let data = AppData {
+            tasks: vec![task],
+            ..AppData::default()
+        };
+
+        let selection = next_submit_task_id_for_available_queues(&data, now, &HashSet::new())
+            .expect("idle standard lane should take over immediately");
+        assert_eq!(selection.task_id, "fast-cooling");
+        assert_eq!(selection.target_queue_kind, ModelQueueKind::Standard);
+    }
+
+    #[test]
+    fn disabled_standard_lane_routes_new_task_to_fast() {
+        let now = DateTime::parse_from_rfc3339("2026-05-03T02:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut data = AppData {
+            tasks: vec![make_queued_task_for_submit("fast-only")],
+            ..AppData::default()
+        };
+        data.settings.standard_lane_enabled = false;
+
+        let selection = next_submit_task_id_for_available_queues(&data, now, &HashSet::new())
+            .expect("enabled fast lane should accept the task");
+        assert_eq!(selection.target_queue_kind, ModelQueueKind::Fast);
+    }
+
+    #[test]
+    fn queue_priority_stars_choose_next_then_second() {
+        let now = DateTime::parse_from_rfc3339("2026-05-03T02:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut data = AppData {
+            tasks: vec![
+                make_queued_task_for_submit("normal"),
+                make_queued_task_for_submit("one-star"),
+                make_queued_task_for_submit("two-star"),
+            ],
+            ..AppData::default()
+        };
+        set_task_queue_priority(&mut data, "one-star", 1).unwrap();
+        set_task_queue_priority(&mut data, "two-star", 2).unwrap();
+
+        let first = next_submit_task_id_for_available_queues(&data, now, &HashSet::new())
+            .expect("two-star task should be selected");
+        assert_eq!(first.task_id, "two-star");
+
+        data.tasks.retain(|task| task.id != "two-star");
+        let second = next_submit_task_id_for_available_queues(&data, now, &HashSet::new())
+            .expect("one-star task should be selected second");
+        assert_eq!(second.task_id, "one-star");
+    }
+
+    #[test]
+    fn generation_precheck_retry_waits_behind_regular_queue_even_when_starred() {
+        let now = DateTime::parse_from_rfc3339("2026-05-03T02:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut review_retry = make_queued_task_for_submit("task-a-review-retry");
+        review_retry.status = "retry_wait".to_string();
+        review_retry.next_run_at = Some("2026-05-03T01:59:00Z".to_string());
+        review_retry.last_error = "generation failed: pre-TNS check did not pass".to_string();
+        review_retry.execution_records.push(TaskExecutionRecord {
+            id: "review-retry-record".to_string(),
+            submit_id: "review-submit".to_string(),
+            status: "retry_wait".to_string(),
+            started_at: "2026-05-03T01:58:00Z".to_string(),
+            finished_at: "2026-05-03T01:59:00Z".to_string(),
+            input_snapshot: TaskExecutionInputSnapshot::default(),
+            command_preview: vec![],
+            query_records: vec![],
+            result_paths: vec![],
+            result_urls: vec![],
+            error_kind: "GenerationPrecheck".to_string(),
+            error_detail: "generation failed: pre-TNS check did not pass".to_string(),
+        });
+        let regular = make_queued_task_for_submit("task-z-regular");
+        let mut data = AppData {
+            tasks: vec![review_retry, regular],
+            ..AppData::default()
+        };
+        set_task_queue_priority(&mut data, "task-a-review-retry", 2).unwrap();
+
+        let first = next_submit_task_id_for_available_queues(&data, now, &HashSet::new())
+            .expect("普通排队任务应先于审核重试");
+        assert_eq!(first.task_id, "task-z-regular");
+
+        data.tasks.retain(|task| task.id != "task-z-regular");
+        let second = next_submit_task_id_for_available_queues(&data, now, &HashSet::new())
+            .expect("没有普通任务后应执行审核重试");
+        assert_eq!(second.task_id, "task-a-review-retry");
+    }
+
+    #[test]
+    fn unstarred_queue_uses_stable_random_id_order_instead_of_fifo() {
+        let now = DateTime::parse_from_rfc3339("2026-05-03T02:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut older = make_queued_task_for_submit("task-z");
+        older.queued_at = Some("2026-05-03T00:00:00Z".to_string());
+        let mut newer = make_queued_task_for_submit("task-a");
+        newer.queued_at = Some("2026-05-03T01:00:00Z".to_string());
+        let data = AppData {
+            tasks: vec![older, newer],
+            ..AppData::default()
+        };
+
+        let selected = next_submit_task_id_for_available_queues(&data, now, &HashSet::new())
+            .expect("one task should be selected");
+        assert_eq!(selected.task_id, "task-a");
+    }
+
+    #[test]
+    fn recover_tasks_on_load_preserves_other_active_records() {
+        let mut completed = make_queued_task_for_submit("completed");
+        completed.status = "succeeded".to_string();
+        completed.submit_id = "standard-done".to_string();
+        completed.finished_at = "2026-05-03T01:00:00Z".to_string();
+        completed.result_urls = vec!["https://example.com/result.mp4".to_string()];
+        completed.execution_records = vec![
+            TaskExecutionRecord {
+                id: "standard-done-rec".to_string(),
+                submit_id: "standard-done".to_string(),
+                status: "succeeded".to_string(),
+                started_at: "2026-05-02T01:00:00Z".to_string(),
+                finished_at: "2026-05-03T01:00:00Z".to_string(),
+                input_snapshot: TaskExecutionInputSnapshot::default(),
+                command_preview: vec![],
+                query_records: vec![],
+                result_paths: vec![],
+                result_urls: vec!["https://example.com/result.mp4".to_string()],
+                error_kind: String::new(),
+                error_detail: String::new(),
+            },
+            TaskExecutionRecord {
+                id: "stale-fast".to_string(),
+                submit_id: "fast-stale".to_string(),
+                status: "querying".to_string(),
+                started_at: now_rfc3339(),
+                finished_at: String::new(),
+                input_snapshot: TaskExecutionInputSnapshot {
+                    params: VideoParams {
+                        model_version: FAST_FALLBACK_MODEL_VERSION.to_string(),
+                        ..VideoParams::default()
+                    },
+                    ..TaskExecutionInputSnapshot::default()
+                },
+                command_preview: vec![],
+                query_records: vec![],
+                result_paths: vec![],
+                result_urls: vec![],
+                error_kind: "FastFallback".to_string(),
+                error_detail: String::new(),
+            },
+        ];
+        let mut data = AppData {
+            tasks: vec![completed],
+            ..AppData::default()
+        };
+
+        recover_tasks_on_load(&mut data);
+
+        let stale = data.tasks[0]
+            .execution_records
+            .iter()
+            .find(|record| record.id == "stale-fast")
+            .expect("stale fast record");
+        assert_eq!(stale.status, "querying");
+        assert!(stale.finished_at.is_empty());
+        assert!(stale.error_detail.is_empty());
+        assert!(active_remote_queue_kinds(&data).contains(&ModelQueueKind::Fast));
+    }
+
+    #[test]
+    fn recover_tasks_on_load_releases_stale_fast_record_without_remote_progress() {
+        let mut completed = make_queued_task_for_submit("completed-with-stale-fast");
+        completed.status = "succeeded".to_string();
+        completed.submit_id = "completed-submit".to_string();
+        completed.result_urls = vec!["https://example.com/completed.mp4".to_string()];
+        completed.finished_at = "2026-07-01T01:00:00Z".to_string();
+        completed.execution_records.push(TaskExecutionRecord {
+            id: "stale-fast-querying".to_string(),
+            submit_id: "stale-fast-submit".to_string(),
+            status: "querying".to_string(),
+            started_at: "2026-07-01T00:00:00Z".to_string(),
+            finished_at: String::new(),
+            input_snapshot: TaskExecutionInputSnapshot {
+                params: VideoParams {
+                    model_version: FAST_FALLBACK_MODEL_VERSION.to_string(),
+                    ..VideoParams::default()
+                },
+                ..TaskExecutionInputSnapshot::default()
+            },
+            command_preview: vec![],
+            query_records: vec![TaskAttempt {
+                id: "stale-fast-query".to_string(),
+                started_at: "2026-07-01T07:00:00Z".to_string(),
+                finished_at: "2026-07-01T07:00:01Z".to_string(),
+                status: "querying".to_string(),
+                command_preview: vec![
+                    "query_result".to_string(),
+                    "--submit_id=stale-fast-submit".to_string(),
+                ],
+                stdout: r#"{"gen_status":"querying"}"#.to_string(),
+                stderr: String::new(),
+                error_kind: String::new(),
+                duration_seconds: 1.0,
+                error_detail: String::new(),
+            }],
+            result_paths: vec![],
+            result_urls: vec![],
+            error_kind: String::new(),
+            error_detail: String::new(),
+        });
+        let mut data = AppData {
+            tasks: vec![completed],
+            ..AppData::default()
+        };
+
+        recover_tasks_on_load(&mut data);
+
+        let task = &data.tasks[0];
+        let record = &task.execution_records[0];
+        assert_eq!(task.status, "succeeded");
+        assert_eq!(record.status, "query_timeout");
+        assert!(!record.finished_at.is_empty());
+        assert!(!active_remote_queue_kinds(&data).contains(&ModelQueueKind::Fast));
+    }
+
+    #[test]
     fn submit_5xx_first_time_goes_to_retry_wait() {
         let mut data = AppData {
             tasks: vec![make_queued_task_for_submit("t5xx")],
@@ -10006,6 +11510,7 @@ mod tests {
     #[test]
     fn query_with_api_error_code_marks_task_failed_immediately() {
         let mut task = make_task_with_execution_records();
+        task.execution_records.clear();
         task.id = "task-err".to_string();
         task.submit_id = "sub-err".to_string();
         task.status = "querying".to_string();
@@ -10046,6 +11551,115 @@ mod tests {
             "error message should be stored in last_error: {}",
             result.last_error
         );
+    }
+
+    #[test]
+    fn querying_without_queue_info_after_ten_minutes_marks_failed() {
+        let mut task = make_task_with_execution_records();
+        task.execution_records.clear();
+        task.id = "task-live-no-queue-info".to_string();
+        task.submit_id = "sub-live-no-queue-info".to_string();
+        task.status = "querying".to_string();
+        task.submitted_at = Some((Utc::now() - Duration::minutes(11)).to_rfc3339());
+        task.execution_records.push(TaskExecutionRecord {
+            id: "rec-live-no-queue-info".to_string(),
+            submit_id: task.submit_id.clone(),
+            status: "querying".to_string(),
+            started_at: now_rfc3339(),
+            finished_at: String::new(),
+            input_snapshot: TaskExecutionInputSnapshot::default(),
+            command_preview: vec![],
+            query_records: vec![],
+            result_paths: vec![],
+            result_urls: vec![],
+            error_kind: String::new(),
+            error_detail: String::new(),
+        });
+        let mut data = AppData {
+            tasks: vec![task],
+            ..AppData::default()
+        };
+
+        let result = query_task_submit_id_once_with_runner(
+            &mut data,
+            "task-live-no-queue-info",
+            "sub-live-no-queue-info",
+            |_args| {
+                Ok((
+                    r#"{"submit_id":"sub-live-no-queue-info","gen_status":"querying"}"#.to_string(),
+                    String::new(),
+                ))
+            },
+        )
+        .expect("query should succeed");
+
+        assert_eq!(result.status, "failed");
+        assert!(result.last_error.contains("10 分钟"));
+        assert_eq!(
+            result.execution_records.last().unwrap().error_kind,
+            "RemoteProgressTimeout"
+        );
+    }
+
+    #[test]
+    fn async_submit_execution_record_remains_active() {
+        let mut data = AppData {
+            tasks: vec![make_queued_task_for_submit("task-active-submit")],
+            assets: vec![make_test_image_asset()],
+            ..AppData::default()
+        };
+
+        let result = submit_task_once_with_runner(
+            &mut data,
+            "task-active-submit",
+            Some("seedance2.0"),
+            |_args| {
+                Ok((
+                    r#"{"submit_id":"sub-active","gen_status":"querying"}"#.to_string(),
+                    String::new(),
+                ))
+            },
+        )
+        .expect("submit should succeed");
+
+        let record = result.execution_records.last().expect("execution record");
+        assert_eq!(record.status, "querying");
+        assert!(record.finished_at.is_empty());
+        assert!(is_active_execution_record(record));
+        assert!(active_remote_queue_kinds(&data).contains(&ModelQueueKind::Standard));
+    }
+
+    #[test]
+    fn recover_failed_task_with_live_record_restores_querying() {
+        let mut task = make_migration_task("failed", "本地误判失败");
+        task.finished_at = now_rfc3339();
+        task.execution_records.push(TaskExecutionRecord {
+            id: "rec-still-live".to_string(),
+            submit_id: "sub-still-live".to_string(),
+            status: "querying".to_string(),
+            started_at: "2026-07-10T07:00:00Z".to_string(),
+            finished_at: "2026-07-10T07:00:01Z".to_string(),
+            input_snapshot: TaskExecutionInputSnapshot::default(),
+            command_preview: vec![],
+            query_records: vec![],
+            result_paths: vec![],
+            result_urls: vec![],
+            error_kind: String::new(),
+            error_detail: String::new(),
+        });
+        let mut data = AppData {
+            tasks: vec![task],
+            ..AppData::default()
+        };
+
+        recover_tasks_on_load(&mut data);
+
+        let task = &data.tasks[0];
+        assert_eq!(task.status, "submitted");
+        assert_eq!(task.submit_id, "sub-still-live");
+        assert!(task.finished_at.is_empty());
+        assert!(task.last_error.is_empty());
+        assert!(is_active_execution_record(&task.execution_records[0]));
     }
 
     // ── update_query_backoff ───────────────────────────────────────────────
@@ -10340,5 +11954,330 @@ mod tests {
         let mut data = AppData::default();
         touch_asset_last_used(&mut data, &[], &[]);
         // no panic
+    }
+
+    #[test]
+    fn dedupe_query_records_removes_same_query_with_different_ids() {
+        let mut records = vec![
+            TaskAttempt {
+                id: "legacy-attempt".to_string(),
+                started_at: "2026-07-05T10:17:42Z".to_string(),
+                finished_at: "2026-07-05T10:17:42Z".to_string(),
+                status: "querying".to_string(),
+                command_preview: vec!["query_result".to_string(), "--submit_id=sid".to_string()],
+                stdout: r#"{"queue_info":{"queue_idx":1242,"queue_length":567978,"queue_status":"Queueing"}}"#.to_string(),
+                stderr: String::new(),
+                error_kind: String::new(),
+                duration_seconds: 0.0,
+                error_detail: String::new(),
+            },
+            TaskAttempt {
+                id: "query-record".to_string(),
+                started_at: "2026-07-05T10:17:42Z".to_string(),
+                finished_at: "2026-07-05T10:17:42Z".to_string(),
+                status: "querying".to_string(),
+                command_preview: vec!["query_result".to_string(), "--submit_id=sid".to_string()],
+                stdout: r#"{"queue_info":{"queue_idx":1242,"queue_length":567978,"queue_status":"Queueing"}}"#.to_string(),
+                stderr: String::new(),
+                error_kind: String::new(),
+                duration_seconds: 0.0,
+                error_detail: String::new(),
+            },
+        ];
+        dedupe_query_records(&mut records);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "legacy-attempt");
+    }
+
+    #[test]
+    fn app_data_serializes_lane_status_as_camel_case() {
+        let mut data = AppData::default();
+        data.lane_status = vec![LaneStatus {
+            queue_kind: "standard".to_string(),
+            model_version: "seedance2.0".to_string(),
+            enabled: true,
+            is_active: false,
+            is_cooling_down: false,
+            cooldown_reason: String::new(),
+            current_task_id: String::new(),
+            current_task_title: String::new(),
+            submit_id: String::new(),
+            queue_position: None,
+            queue_length: None,
+            next_check_at: String::new(),
+            waiting_task_count: 0,
+        }];
+        let value = serde_json::to_value(&data).expect("serialize app data");
+        assert!(value.get("laneStatus").is_some());
+        assert!(value.get("lane_status").is_none());
+    }
+
+    #[test]
+    fn lane_status_prefers_active_task_with_queue_progress() {
+        let now = DateTime::parse_from_rfc3339("2026-07-11T00:55:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut no_progress = make_queued_task_for_submit("no-progress");
+        no_progress.title = "没有进度的活跃任务".to_string();
+        no_progress.status = "querying".to_string();
+        no_progress.submit_id = "sub-no-progress".to_string();
+
+        let mut with_progress = make_queued_task_for_submit("with-progress");
+        with_progress.title = "有进度的活跃任务".to_string();
+        with_progress.status = "querying".to_string();
+        with_progress.submit_id = "sub-with-progress".to_string();
+        with_progress.queue_info = Some(QueueInfo {
+            queue_idx: Some(6932),
+            priority: Some(1),
+            queue_status: Some("Queueing".to_string()),
+            queue_length: Some(298595),
+        });
+        let data = AppData {
+            tasks: vec![no_progress, with_progress],
+            ..AppData::default()
+        };
+
+        let standard = compute_lane_status(&data, now)
+            .into_iter()
+            .find(|lane| lane.queue_kind == "standard")
+            .expect("standard lane");
+        assert_eq!(standard.current_task_id, "with-progress");
+        assert_eq!(standard.queue_position, Some(6932));
+        assert_eq!(standard.queue_length, Some(298595));
+    }
+
+    #[test]
+    fn lane_status_uses_active_fast_execution_record_details() {
+        let now = DateTime::parse_from_rfc3339("2026-07-04T00:00:30Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut task = make_queued_task_for_submit("fast-record-task");
+        task.title = "标准任务的 Fast 兜底".to_string();
+        task.status = "submitted".to_string();
+        task.submit_id = "standard-sub".to_string();
+        task.submitted_at = Some("2026-07-04T00:00:00Z".to_string());
+        task.queue_info = Some(QueueInfo {
+            queue_idx: Some(200),
+            priority: None,
+            queue_status: Some("queueing".to_string()),
+            queue_length: Some(500),
+        });
+        task.execution_records = vec![TaskExecutionRecord {
+            id: "fast-rec".to_string(),
+            submit_id: "fast-sub".to_string(),
+            status: "querying".to_string(),
+            started_at: "2026-07-04T00:00:00Z".to_string(),
+            finished_at: String::new(),
+            input_snapshot: TaskExecutionInputSnapshot {
+                params: VideoParams {
+                    model_version: FAST_FALLBACK_MODEL_VERSION.to_string(),
+                    ..VideoParams::default()
+                },
+                ..TaskExecutionInputSnapshot::default()
+            },
+            command_preview: vec![],
+            query_records: vec![TaskAttempt {
+                id: "query-fast".to_string(),
+                started_at: "2026-07-04T00:00:10Z".to_string(),
+                finished_at: "2026-07-04T00:00:20Z".to_string(),
+                status: "querying".to_string(),
+                command_preview: vec![],
+                stdout:
+                    r#"{"queue_info":{"queue_idx":7,"queue_length":99,"queue_status":"queueing"}}"#
+                        .to_string(),
+                stderr: String::new(),
+                error_kind: String::new(),
+                duration_seconds: 0.0,
+                error_detail: String::new(),
+            }],
+            result_paths: vec![],
+            result_urls: vec![],
+            error_kind: String::new(),
+            error_detail: String::new(),
+        }];
+        let data = AppData {
+            tasks: vec![task],
+            ..AppData::default()
+        };
+
+        let statuses = compute_lane_status(&data, now);
+        let fast = statuses
+            .iter()
+            .find(|status| status.queue_kind == "fast")
+            .expect("fast lane status");
+        assert!(fast.is_active);
+        assert_eq!(fast.current_task_id, "fast-record-task");
+        assert_eq!(fast.current_task_title, "标准任务的 Fast 兜底");
+        assert_eq!(fast.submit_id, "fast-sub");
+        assert_eq!(fast.queue_position, Some(7));
+        assert_eq!(fast.queue_length, Some(99));
+        assert_eq!(fast.next_check_at, "2026-07-04T00:01:20+00:00");
+    }
+
+    #[test]
+    fn active_cross_lane_fast_submit_uses_matching_execution_record_lane_only() {
+        let now = DateTime::parse_from_rfc3339("2026-07-04T00:00:30Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut task = make_queued_task_for_submit("active-cross-lane-fast");
+        task.status = "querying".to_string();
+        task.submit_id = "fast-current-submit".to_string();
+        task.execution_records = vec![TaskExecutionRecord {
+            id: "fast-current-record".to_string(),
+            submit_id: "fast-current-submit".to_string(),
+            status: "querying".to_string(),
+            started_at: "2026-07-04T00:00:00Z".to_string(),
+            finished_at: "2026-07-04T00:00:01Z".to_string(),
+            input_snapshot: TaskExecutionInputSnapshot {
+                params: VideoParams {
+                    model_version: FAST_FALLBACK_MODEL_VERSION.to_string(),
+                    ..VideoParams::default()
+                },
+                ..TaskExecutionInputSnapshot::default()
+            },
+            command_preview: vec![],
+            query_records: vec![],
+            result_paths: vec![],
+            result_urls: vec![],
+            error_kind: String::new(),
+            error_detail: String::new(),
+        }];
+        let data = AppData {
+            tasks: vec![task],
+            ..AppData::default()
+        };
+
+        let statuses = compute_lane_status(&data, now);
+        let standard = statuses
+            .iter()
+            .find(|status| status.queue_kind == "standard")
+            .expect("standard lane status");
+        let fast = statuses
+            .iter()
+            .find(|status| status.queue_kind == "fast")
+            .expect("fast lane status");
+
+        assert!(!standard.is_active);
+        assert!(fast.is_active);
+        assert_eq!(fast.current_task_id, "active-cross-lane-fast");
+    }
+
+    #[test]
+    fn retry_wait_lane_uses_newest_record_timestamp_when_records_are_out_of_order() {
+        let now = DateTime::parse_from_rfc3339("2026-07-04T00:02:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut task = make_queued_task_for_submit("out-of-order-retry-records");
+        task.status = "retry_wait".to_string();
+        task.next_run_at = Some("2026-07-04T00:05:00Z".to_string());
+        task.execution_records = vec![
+            TaskExecutionRecord {
+                id: "new-fast-retry".to_string(),
+                submit_id: String::new(),
+                status: "retry_wait".to_string(),
+                started_at: "2026-07-04T00:01:00Z".to_string(),
+                finished_at: "2026-07-04T00:01:10Z".to_string(),
+                input_snapshot: TaskExecutionInputSnapshot {
+                    params: VideoParams {
+                        model_version: FAST_FALLBACK_MODEL_VERSION.to_string(),
+                        ..VideoParams::default()
+                    },
+                    ..TaskExecutionInputSnapshot::default()
+                },
+                command_preview: vec![],
+                query_records: vec![],
+                result_paths: vec![],
+                result_urls: vec![],
+                error_kind: "Transient".to_string(),
+                error_detail: String::new(),
+            },
+            TaskExecutionRecord {
+                id: "old-standard-retry-appended-later".to_string(),
+                submit_id: String::new(),
+                status: "retry_wait".to_string(),
+                started_at: "2026-07-04T00:00:00Z".to_string(),
+                finished_at: "2026-07-04T00:00:10Z".to_string(),
+                input_snapshot: TaskExecutionInputSnapshot::default(),
+                command_preview: vec![],
+                query_records: vec![],
+                result_paths: vec![],
+                result_urls: vec![],
+                error_kind: "Transient".to_string(),
+                error_detail: String::new(),
+            },
+        ];
+        let data = AppData {
+            tasks: vec![task],
+            ..AppData::default()
+        };
+
+        let statuses = compute_lane_status(&data, now);
+        let standard = statuses
+            .iter()
+            .find(|status| status.queue_kind == "standard")
+            .expect("standard lane status");
+        let fast = statuses
+            .iter()
+            .find(|status| status.queue_kind == "fast")
+            .expect("fast lane status");
+
+        assert_eq!(standard.waiting_task_count, 0);
+        assert_eq!(fast.waiting_task_count, 1);
+    }
+
+    #[test]
+    fn lane_status_cooldown_ignores_due_or_non_concurrency_retries() {
+        let now = DateTime::parse_from_rfc3339("2026-07-04T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let cooldown_end = (now + Duration::seconds(90)).to_rfc3339();
+        let transient_end = (now + Duration::seconds(10)).to_rfc3339();
+
+        let mut concurrency = make_queued_task_for_submit("concurrency");
+        concurrency.status = "retry_wait".to_string();
+        concurrency.next_run_at = Some(cooldown_end.clone());
+        concurrency.last_error = "ExceedConcurrencyLimit".to_string();
+
+        let mut transient = make_queued_task_for_submit("transient");
+        transient.status = "retry_wait".to_string();
+        transient.next_run_at = Some(transient_end);
+        transient.last_error = "temporary network error".to_string();
+
+        let mut due_concurrency = make_queued_task_for_submit("due-concurrency");
+        due_concurrency.status = "retry_wait".to_string();
+        due_concurrency.next_run_at = Some((now - Duration::seconds(5)).to_rfc3339());
+        due_concurrency.last_error = "ExceedConcurrencyLimit".to_string();
+
+        let data = AppData {
+            tasks: vec![transient, due_concurrency, concurrency],
+            ..AppData::default()
+        };
+        let statuses = compute_lane_status(&data, now);
+        let standard = statuses
+            .iter()
+            .find(|status| status.queue_kind == "standard")
+            .expect("standard lane status");
+
+        assert!(standard.is_cooling_down);
+        assert_eq!(standard.next_check_at, cooldown_end);
+        assert_eq!(standard.cooldown_reason, "并发限制，1 个任务等待重试");
+    }
+
+    #[test]
+    fn lane_settings_default_to_both_enabled() {
+        let settings = SchedulerSettings::default();
+        assert!(settings.standard_lane_enabled);
+        assert!(settings.fast_lane_enabled);
+    }
+
+    #[test]
+    fn disabling_the_last_lane_is_rejected() {
+        let mut data = AppData::default();
+        data.settings.fast_lane_enabled = false;
+        let error = set_lane_enabled(&mut data, ModelQueueKind::Standard, false)
+            .expect_err("the final enabled lane must not be disabled");
+        assert!(error.to_string().contains("至少保留一条车道"));
+        assert!(data.settings.standard_lane_enabled);
+        assert!(!data.settings.fast_lane_enabled);
     }
 }

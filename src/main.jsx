@@ -20,22 +20,12 @@ import {
   findLatestSuccessfulResultPath,
 } from './app-logic.js';
 import { buildMentionItems } from './mention-utils.js';
-import {
-  createEmptyImageGenForm,
-  filterMentionItemsForImageGen,
-  addReferenceAsset,
-  removeReferenceAsset,
-  applyMentionRefsToImageGenForm,
-  shouldSuppressImageContextMenu,
-  IMAGEGEN_MAX_REFERENCES,
-} from './imagegen-utils.js';
 import PromptMentionEditor from './components/PromptMentionEditor.jsx';
 import { applyEditorUpdate, applyMentionRefsToTaskForm } from './prompt-editor-utils.js';
 import {
   deriveCurrentExecutionRecord,
   deriveCurrentQueryRecords,
   deriveTaskHistory,
-  executionModelLabel,
   historyItemLabel,
   isInterruptNotice,
 } from './task-history-utils.js';
@@ -62,8 +52,18 @@ import {
   uniqueFilePaths,
   splitCsv as splitCsvUtil,
 } from './media-utils.js';
+import LaneStrip from './components/LaneStrip.jsx';
 import {
-  Activity,
+  getLaneStatuses,
+  getTaskRouteInfo,
+  formatTaskNextTime,
+  deriveNextAction,
+  deriveTimelineEvents,
+  selectKeyTimelineRecords,
+  laneLabel,
+  taskSubmitQueueKind,
+} from './lane-utils.js';
+import {
   AlertCircle,
   ArrowLeft,
   Bell,
@@ -80,21 +80,16 @@ import {
   Download,
   FileAudio,
   FolderOpen,
-  Gauge,
-  Grid,
   Image,
   ImagePlus,
-  LayoutList,
   ListChecks,
   Loader2,
-  Logs,
   MoreHorizontal,
   Pencil,
   Play,
   Plus,
   RefreshCcw,
   Save,
-  Search,
   Settings,
   ShieldCheck,
   Sparkles,
@@ -103,7 +98,6 @@ import {
   Upload,
   User,
   Coins,
-  Users,
   X,
   Zap,
   ZoomIn,
@@ -113,10 +107,7 @@ import {
   sortTasks,
   paginateTasks,
   formatPaginationLabel,
-  deriveTaskFlowSteps,
-  deriveTaskProgress,
   deriveTaskDispatchInfo,
-  getModelOptions,
   deriveQueueStats,
   canDeleteTask,
   getTaskResultItems,
@@ -125,7 +116,6 @@ import {
 } from './queue-view-utils.js';
 import {
   buildBatchQueuePlan,
-  canUseAlternatingFastQueue,
   canScheduleTask,
   formatSchedulePlanSummary,
   resolvePrepareGenerateOperation,
@@ -142,33 +132,7 @@ import { ToggleSwitch } from './components/ui/ToggleSwitch.jsx';
 import { NumberedSection } from './components/ui/NumberedSection.jsx';
 import { PasswordInput } from './components/ui/PasswordInput.jsx';
 import { CopyableInput } from './components/ui/CopyableInput.jsx';
-import { StatCard } from './components/ui/StatCard.jsx';
-import { SearchBox } from './components/ui/SearchBox.jsx';
-import { FilterSelect } from './components/ui/FilterSelect.jsx';
-import { InlineCopyButton } from './components/ui/InlineCopyButton.jsx';
-import { Pager } from './components/ui/Pager.jsx';
 import { resolveMediaSrc } from './media-src.js';
-import {
-  normalizeLogEntry,
-  deriveLogStats,
-  deriveCategoryCounts,
-  filterLogs,
-  paginateLogs,
-  deriveLogAssociations,
-  buildLogExportPayload,
-  findDefaultSelectedLogId,
-  getQuickLocationFilters,
-  deriveTaskOptions,
-  LOG_LEVELS,
-  LOG_SOURCES,
-  LEVEL_VARIANT_MAP,
-  SOURCE_LABEL_MAP,
-  CATEGORY_LABEL_MAP,
-  SIDEBAR_CATEGORIES,
-  QUICK_LOCATIONS,
-  TIME_RANGE_OPTIONS,
-  DEFAULT_PAGE_SIZE,
-} from './log-view-utils.js';
 import './styles.css';
 
 const ratios = ['9:16', '16:9', '1:1', '3:4', '4:3', '21:9'];
@@ -192,15 +156,13 @@ const defaultImageModelConfig = {
 const views = [
   { id: 'roles', label: '角色库', icon: User },
   { id: 'queue', label: '任务中心', icon: ListChecks },
-  { id: 'imagegen', label: '生图', icon: Image },
-  { id: 'logs', label: '日志', icon: Logs },
   { id: 'settings', label: '设置', icon: Settings },
 ];
 
 const emptyState = {
   settings: {
     concurrency_limit_policy: 'SilentRetry',
-    concurrency_retry_delay_seconds: 30,
+    concurrency_retry_delay_seconds: 300,
     concurrency_retry_max_attempts: 8,
     auto_query_enabled: true,
     poll_interval_seconds: 60,
@@ -217,6 +179,7 @@ const emptyState = {
   assets: [],
   roles: [],
   tasks: [],
+  taskPriorities: {},
   logs: [],
 };
 
@@ -259,9 +222,6 @@ function App() {
   const [lastTickAt, setLastTickAt] = useState(null);
   const [selectedTaskId, setSelectedTaskId] = useState('');
   const [selectedRoleId, setSelectedRoleId] = useState('');
-  const [roleSearchQuery, setRoleSearchQuery] = useState('');
-  const [roleActiveTab, setRoleActiveTab] = useState('all');
-  const [roleViewMode, setRoleViewMode] = useState('grid');
   const [roleEditor, setRoleEditor] = useState(null);
   const [dragActive, setDragActive] = useState(false);
   const [confirmModal, setConfirmModal] = useState(null);
@@ -288,9 +248,6 @@ function App() {
   const [editingTaskId, setEditingTaskId] = useState(null);
   const [savingTaskDraft, setSavingTaskDraft] = useState(false);
   const [savingTaskDraftPhase, setSavingTaskDraftPhase] = useState('');
-  // 图片生成预览项提升到 App 层，避免切 tab 后 ImageGenView 卸载导致状态丢失
-  // 历史记录从 state.imagegen_history 派生（后端持久化）
-  const [imageGenPreview, setImageGenPreview] = useState(null);
   const dropContextRef = useRef({ activeView, selectedRoleId, roleEditor });
 
   async function refreshState(options = {}) {
@@ -676,7 +633,9 @@ function App() {
           name: form.name.trim(),
           aliases: splitCsv(form.aliases),
           tags: splitCsv(form.tags),
+          series: form.series.trim(),
           description: form.description.trim(),
+          disabled: Boolean(form.disabled),
           asset_ids,
         },
       });
@@ -722,20 +681,6 @@ function App() {
     } finally {
       setSavingTaskDraft(false);
       setSavingTaskDraftPhase('');
-    }
-  }
-
-  async function submitTask(taskId) {
-    if (pendingTaskOps[taskId]?.submit) return;
-    setPendingTaskOps((prev) => ({ ...prev, [taskId]: { ...prev[taskId], submit: true } }));
-    try {
-      await invoke('submit_task_command', { taskId });
-      setFeedback('已执行一次提交');
-      await refreshState();
-    } catch (error) {
-      setFeedback(String(error));
-    } finally {
-      setPendingTaskOps((prev) => ({ ...prev, [taskId]: { ...prev[taskId], submit: false } }));
     }
   }
 
@@ -856,16 +801,6 @@ function App() {
     }
   }
 
-  async function clearLogs() {
-    try {
-      await invoke('clear_logs_command');
-      setFeedback('日志已清空');
-      await refreshState();
-    } catch (error) {
-      setFeedback(String(error));
-    }
-  }
-
   async function importTempImages() {
     const selected = await open({
       multiple: true,
@@ -951,7 +886,7 @@ function App() {
       const savedSettings = await invoke('update_settings_command', {
         input: {
           concurrency_limit_policy: 'SilentRetry',
-          concurrency_retry_delay_seconds: Number(settingsForm.concurrency_retry_delay_seconds) || 30,
+          concurrency_retry_delay_seconds: Number(settingsForm.concurrency_retry_delay_seconds) || 300,
           concurrency_retry_max_attempts: Number(settingsForm.concurrency_retry_max_attempts) || 8,
           auto_query_enabled: settingsForm.auto_query_enabled ?? true,
           poll_interval_seconds: Number(settingsForm.poll_interval_seconds) || 60,
@@ -968,6 +903,8 @@ function App() {
           image_model_configs: imageSettings.image_model_configs,
           active_image_model_id: imageSettings.active_image_model_id,
           prevent_sleep: settingsForm.prevent_sleep ?? true,
+          standard_lane_enabled: settingsForm.standard_lane_enabled !== false,
+          fast_lane_enabled: settingsForm.fast_lane_enabled !== false,
           image_model_config: imageSettings.image_model_config || null,
         },
       });
@@ -1112,12 +1049,6 @@ function App() {
             selectedRoleMedia={selectedRoleMedia}
             selectedRoleId={selectedRoleId}
             setSelectedRoleId={setSelectedRoleId}
-            roleSearchQuery={roleSearchQuery}
-            setRoleSearchQuery={setRoleSearchQuery}
-            roleActiveTab={roleActiveTab}
-            setRoleActiveTab={setRoleActiveTab}
-            roleViewMode={roleViewMode}
-            setRoleViewMode={setRoleViewMode}
             roleEditor={roleEditor}
             setRoleEditor={setRoleEditor}
           />
@@ -1131,7 +1062,6 @@ function App() {
             settings={state.settings}
             assetById={assetById}
             state={state}
-            submitTask={submitTask}
             queryTask={queryTask}
             pendingTaskOps={pendingTaskOps}
             pendingExecutionOps={pendingExecutionOps}
@@ -1152,22 +1082,6 @@ function App() {
             lastTickAt={lastTickAt}
           />
         ) : null}
-        {activeView === 'imagegen' ? (
-          <ImageGenView
-            settingsForm={settingsForm}
-            history={state.imagegen_history || []}
-            previewItem={imageGenPreview}
-            setPreviewItem={setImageGenPreview}
-            state={state}
-            assetById={assetById}
-            importTempImages={importTempImages}
-            pasteClipboardImage={pasteClipboardImage}
-            pasteSystemClipboardImage={pasteSystemClipboardImage}
-            refreshState={refreshState}
-            setFeedback={setFeedback}
-          />
-        ) : null}
-        {activeView === 'logs' ? <LogsView logs={state.logs} tasks={state.tasks} settings={state.settings} clearLogs={clearLogs} setActiveView={setActiveView} setSelectedTaskId={setSelectedTaskId} /> : null}
         {activeView === 'settings' ? (
           <SettingsView
             cli={cli}
@@ -1571,31 +1485,10 @@ function RolesView({
   selectedRoleMedia,
   selectedRoleId,
   setSelectedRoleId,
-  roleSearchQuery,
-  setRoleSearchQuery,
-  roleActiveTab,
-  setRoleActiveTab,
-  roleViewMode,
-  setRoleViewMode,
   roleEditor,
   setRoleEditor,
 }) {
-  const filteredRoles = useMemo(() => {
-    let list = state.roles;
-    if (roleSearchQuery.trim()) {
-      const q = roleSearchQuery.toLowerCase();
-      list = list.filter((r) =>
-        r.name?.toLowerCase().includes(q) ||
-        r.tags?.some((t) => t.toLowerCase().includes(q))
-      );
-    }
-    if (roleActiveTab === 'images') {
-      list = list.filter((r) => getRoleMedia(r, assetById).images.length > 0);
-    } else if (roleActiveTab === 'audios') {
-      list = list.filter((r) => getRoleMedia(r, assetById).audios.length > 0);
-    }
-    return list;
-  }, [state.roles, roleSearchQuery, roleActiveTab, assetById]);
+  const filteredRoles = state.roles;
 
   const handleNewRole = () => {
     setSelectedRoleId('');
@@ -1656,26 +1549,7 @@ function RolesView({
             <Plus size={15} /> 新建角色 <ChevronDown size={13} />
           </button>
         </div>
-        <div className="role-page-filter">
-          <div className="role-search-box">
-            <Search size={15} />
-            <input
-              value={roleSearchQuery}
-              onChange={(e) => setRoleSearchQuery(e.target.value)}
-              placeholder="搜索角色名称或标签"
-            />
-          </div>
-          <div className="role-tabs">
-            <button type="button" className={roleActiveTab === 'all' ? 'active' : ''} onClick={() => setRoleActiveTab('all')}>全部角色</button>
-            <button type="button" className={roleActiveTab === 'images' ? 'active' : ''} onClick={() => setRoleActiveTab('images')}>图片资源</button>
-            <button type="button" className={roleActiveTab === 'audios' ? 'active' : ''} onClick={() => setRoleActiveTab('audios')}>音频资源</button>
-          </div>
-          <div className="role-view-toggle">
-            <button type="button" className={roleViewMode === 'grid' ? 'active' : ''} onClick={() => setRoleViewMode('grid')}><Grid size={15} /></button>
-            <button type="button" className={roleViewMode === 'list' ? 'active' : ''} onClick={() => setRoleViewMode('list')}><LayoutList size={15} /></button>
-          </div>
-        </div>
-        <div className={`role-card-grid ${roleViewMode === 'list' ? 'list-mode' : ''}`}>
+        <div className="role-card-grid">
           {filteredRoles.map((role) => {
             const media = getRoleMedia(role, assetById);
             const isSelected = role.id === selectedRoleId;
@@ -1683,7 +1557,7 @@ function RolesView({
               <button
                 key={role.id}
                 type="button"
-                className={`role-card ${isSelected ? 'selected' : ''}`}
+                className={`role-card ${isSelected ? 'selected' : ''}${role.disabled ? ' disabled' : ''}`}
                 onClick={() => setSelectedRoleId(role.id)}
               >
                 <div className="role-card-avatar">
@@ -1693,10 +1567,12 @@ function RolesView({
                   <div className="role-card-head">
                     <strong>{role.name}</strong>
                     {isSelected ? <span className="role-default-badge">默认</span> : null}
+                    {role.disabled ? <span className="role-disabled-badge">已停用</span> : null}
                     <button type="button" className="role-card-more" onClick={(e) => { e.stopPropagation(); }}>
                       <MoreHorizontal size={15} />
                     </button>
                   </div>
+                  {role.series ? <p className="role-card-series">系列：{role.series}</p> : null}
                   <div className="role-card-tags">
                     {(role.tags || []).slice(0, 3).map((tag) => (
                       <span key={tag} className="role-tag-chip">{tag}</span>
@@ -1728,6 +1604,7 @@ function RolesView({
               <div className="role-detail-title-row">
                 <h3>{selectedRole.name}</h3>
                 <span className="role-default-badge">默认</span>
+                {selectedRole.disabled ? <span className="role-disabled-badge">已停用</span> : null}
                 <button type="button" className="icon-ghost" title="编辑" onClick={handleEditRole}><Pencil size={14} /></button>
                 <button type="button" className="icon-ghost" title="关闭" onClick={() => setSelectedRoleId('')}><X size={14} /></button>
               </div>
@@ -1741,6 +1618,7 @@ function RolesView({
               </div>
               <p className="role-detail-desc">{selectedRole.description || '暂无角色描述。'}</p>
               <div className="role-detail-meta">
+                {selectedRole.series ? <span>系列：{selectedRole.series}</span> : null}
                 <span>创建时间：{formatDate(selectedRole.created_at) || '-'}</span>
                 <span className="role-id-row">角色 ID：{shortRoleId(selectedRole.id)} <button type="button" className="icon-ghost mini" title="复制"><Copy size={11} /></button></span>
               </div>
@@ -1789,20 +1667,7 @@ function RolesView({
 
 // ── QueueView helper components ─────────────────────────────────────────────
 
-function StatCard2({ label, count, icon: Icon, color, sub, spin }) {
-  return (
-    <div className={`qc-stat-card ${color}`}>
-      <div className="qc-stat-icon"><Icon size={16} className={spin ? 'spin' : ''} /></div>
-      <div className="qc-stat-body">
-        <span className="qc-stat-count">{count}</span>
-        <span className="qc-stat-label">{label}</span>
-        {sub ? <span className="qc-stat-sub">{sub}</span> : null}
-      </div>
-    </div>
-  );
-}
-
-const TaskCard = React.memo(function TaskCard({ task, index, selected, selectedForBatch, assetById, roles, onSelect, onToggleSelection }) {
+const TaskCard = React.memo(function TaskCard({ task, index, selected, selectedForBatch, queuePriority = 0, assetById, roles, onSelect, onToggleSelection }) {
   const thumbPath = useMemo(() => {
     for (const id of (task.image_asset_ids || [])) {
       const a = assetById.get(id);
@@ -1817,7 +1682,13 @@ const TaskCard = React.memo(function TaskCard({ task, index, selected, selectedF
   }, [task, assetById, roles]);
 
   const dispatchInfo = useMemo(() => deriveTaskDispatchInfo(task), [task]);
+  const routeInfo = useMemo(() => getTaskRouteInfo(task), [task]);
+  const routeTime = useMemo(() => formatTaskNextTime(task), [task]);
   const handleClick = useCallback(() => onSelect(task.id), [onSelect, task.id]);
+
+  const isActive = ['submitting', 'submitted', 'querying'].includes(task.status);
+  const isDone = task.status === 'succeeded';
+  const isFailed = task.status === 'failed';
 
   return (
     <div className={`qc-task-row${selected ? ' selected' : ''}`} onClick={handleClick} role="button" tabIndex={0}
@@ -1843,45 +1714,27 @@ const TaskCard = React.memo(function TaskCard({ task, index, selected, selectedF
         )}
       </div>
       <div className="qc-task-info">
-        <span className="qc-task-title">{task.title || '未命名任务'}</span>
+        <span className="qc-task-title">
+          {queuePriority > 0 ? <em className="qc-task-priority">{'★'.repeat(queuePriority)}</em> : null}
+          {task.title || '未命名任务'}
+        </span>
         <span className="qc-task-sub">{task.params?.model_version || ''}{task.params?.ratio ? ` · ${task.params.ratio}` : ''}</span>
         {['queued', 'scheduled', 'retry_wait'].includes(task.status) ? (
           <span className="qc-task-dispatch-sub">{dispatchInfo.compactText}</span>
         ) : null}
       </div>
       <div className="qc-task-right">
-        <StatusBadge status={task.status} />
-        <span className={`qc-task-time${task.status === 'scheduled' ? ' scheduled' : ''}`}>
-          {task.status === 'scheduled' && task.scheduled_at
-            ? formatDate(task.scheduled_at)
-            : formatDatePart(task.updated_at, 'time')}
-        </span>
+        <StatusBadge task={task} />
+        <div className={`qc-route${routeInfo.kind === 'fast' ? ' fast' : ''}`}>
+          <b>{isActive ? '执行中' : `${routeInfo.label}车道`}</b>
+          {isDone || isFailed ? null : (
+            <span>{routeTime || dispatchInfo.nextText || '—'}</span>
+          )}
+        </div>
       </div>
     </div>
   );
 });
-
-function RingProgress({ percent, status }) {
-  const r = 30;
-  const cx = 38;
-  const cy = 38;
-  const circ = 2 * Math.PI * r;
-  const offset = circ - (Math.min(100, Math.max(0, percent)) / 100) * circ;
-  const isFailed = ['failed'].includes(status);
-  const isRunning = ['submitting', 'querying'].includes(status);
-  const stroke = isFailed ? '#f04444' : percent === 100 ? '#22c55e' : isRunning ? '#7168ff' : '#c7cbff';
-  return (
-    <svg width="76" height="76" className="qc-ring">
-      <circle cx={cx} cy={cy} r={r} fill="none" stroke="#edf1f8" strokeWidth="5" />
-      <circle cx={cx} cy={cy} r={r} fill="none" stroke={stroke} strokeWidth="5" strokeLinecap="round"
-        strokeDasharray={circ} strokeDashoffset={offset}
-        transform={`rotate(-90 ${cx} ${cy})`} style={{ transition: 'stroke-dashoffset 0.4s ease' }} />
-      <text x={cx} y={cy + 5} textAnchor="middle" fontSize="12" fontWeight="700" fill="#1f2944">
-        {isFailed ? '✗' : `${percent}%`}
-      </text>
-    </svg>
-  );
-}
 
 function isConcurrencyLimitMessage(message = '') {
   const original = String(message || '');
@@ -1894,6 +1747,14 @@ function isConcurrencyLimitMessage(message = '') {
     || original.includes('并发限制');
 }
 
+function parseAttemptQueueInfo(stdout) {
+  try {
+    return JSON.parse(stdout || '')?.queue_info || null;
+  } catch {
+    return null;
+  }
+}
+
 // ── QueueView ────────────────────────────────────────────────────────────────
 
 function QueueView({
@@ -1901,12 +1762,11 @@ function QueueView({
   settings,
   assetById,
   state,
-  submitTask,
   queryTask,
   pendingTaskOps = {},
   pendingExecutionOps = {},
   queryExecutionRecord = async () => {},
-  processQueueOnce,
+  processQueueOnce = async () => {},
   selectedTaskId,
   setSelectedTaskId,
   pauseTask,
@@ -1922,45 +1782,45 @@ function QueueView({
   lastTickAt,
 }) {
   // ── local state ──────────────────────────────────────────────────────────
-  const [searchQuery, setSearchQuery] = useState('');
-  const [statusTab, setStatusTab] = useState('all');
-  const [modelFilter, setModelFilter] = useState('all');
   const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(8);
+  const [pageSize, setPageSize] = useState(12);
   const [resourcePreview, setResourcePreview] = useState(null);
   const [selectedBatchIds, setSelectedBatchIds] = useState([]);
   const [selectedExecutionId, setSelectedExecutionId] = useState(null);
   const [scheduleModal, setScheduleModal] = useState(null);
   const [commandPreviewModal, setCommandPreviewModal] = useState(null);
+  const [recordsModal, setRecordsModal] = useState(null);
+  const [previewResultValue, setPreviewResultValue] = useState('');
+  const [pendingLaneKind, setPendingLaneKind] = useState('');
+  const [pendingProbeLaneKind, setPendingProbeLaneKind] = useState('');
+  const [pendingPriority, setPendingPriority] = useState(false);
 
   // ── derived data ─────────────────────────────────────────────────────────
   const stats = useMemo(() => deriveQueueStats(tasks), [tasks]);
-  const modelOptions = useMemo(() => getModelOptions(tasks), [tasks]);
   const filteredSorted = useMemo(
-    () => sortTasks(filterTasks(tasks, { searchQuery, statusTab, modelFilter })),
-    [tasks, searchQuery, statusTab, modelFilter]
+    () => sortTasks(filterTasks(tasks, {})),
+    [tasks]
   );
-  useEffect(() => { setPage(1); }, [searchQuery, statusTab, modelFilter]);
   const paged = useMemo(() => paginateTasks(filteredSorted, page, pageSize), [filteredSorted, page, pageSize]);
 
   const selectedTask = useMemo(
     () => tasks.find((t) => t.id === selectedTaskId) || null,
     [tasks, selectedTaskId]
   );
+  const selectedQueuePriority = selectedTask ? Number(state.taskPriorities?.[selectedTask.id] || 0) : 0;
 
   useEffect(() => {
-    if (!selectedTaskId && tasks.length) setSelectedTaskId(tasks[0].id);
-  }, [tasks]);
+    if (!paged.items.length) return;
+    if (!paged.items.some((task) => task.id === selectedTaskId)) {
+      setSelectedTaskId(paged.items[0].id);
+    }
+  }, [paged.items, selectedTaskId, setSelectedTaskId]);
 
-  const [showAttemptsModal, setShowAttemptsModal] = useState(false);
   const taskHistory = useMemo(() => deriveTaskHistory(selectedTask), [selectedTask]);
   const currentExecution = useMemo(
     () => deriveCurrentExecutionRecord(selectedTask, selectedExecutionId),
     [selectedTask, selectedExecutionId]
   );
-  const plannedCandidateCount = Math.max(1, Number(selectedTask?.planned_submit_count || 1));
-  const successfulCandidateCount = (selectedTask?.execution_records || [])
-    .filter((record) => record.status === 'succeeded').length;
   const executionView = useMemo(() => {
     if (!selectedTask || !currentExecution) return selectedTask;
     const isCurrentTaskSubmit = currentExecution.submit_id && currentExecution.submit_id === selectedTask.submit_id;
@@ -1982,8 +1842,6 @@ function QueueView({
       temp_image_asset_ids: snapshot.temp_image_asset_ids || selectedTask.temp_image_asset_ids,
     };
   }, [selectedTask, currentExecution]);
-  const flowSteps = useMemo(() => deriveTaskFlowSteps(executionView), [executionView]);
-  const progress = useMemo(() => deriveTaskProgress(executionView), [executionView]);
   const concurrencyCooldownUntil = useMemo(() => {
     const now = Date.now();
     return tasks
@@ -1998,11 +1856,20 @@ function QueueView({
     () => deriveTaskDispatchInfo(selectedTask, { concurrencyCooldownUntil }),
     [selectedTask, concurrencyCooldownUntil]
   );
-  const allAttempts = useMemo(
+  const laneStatuses = useMemo(() => {
+    return getLaneStatuses(state.laneStatus, tasks);
+  }, [state.laneStatus, tasks]);
+  const selectedNextAction = useMemo(
+    () => deriveNextAction(selectedTask, Date.now(), {
+      laneStatuses,
+      schedulerTickSeconds: state.settings?.poll_interval_seconds ?? 30,
+    }),
+    [selectedTask, laneStatuses, state.settings?.poll_interval_seconds]
+  );
+  const allQueryAttempts = useMemo(
     () => deriveCurrentQueryRecords(selectedTask, selectedExecutionId).slice().reverse(),
     [selectedTask, selectedExecutionId]
   );
-  const recentAttempts = useMemo(() => allAttempts.slice(0, 4), [allAttempts]);
   const commandText = useMemo(
     () => executionView?.command_preview?.join(' \\\n  ') || '',
     [executionView]
@@ -2011,6 +1878,9 @@ function QueueView({
     () => getCommandPreviewPresentation(commandText),
     [commandText]
   );
+  const selectedSubmitId = selectedTask?.submit_id || currentExecution?.submit_id || '';
+  const executionSubmittedAt = selectedTask?.submitted_at || currentExecution?.started_at || '';
+  const latestQueryAt = allQueryAttempts[0]?.finished_at || allQueryAttempts[0]?.started_at || '';
   const hitResources = useMemo(() => getTaskHitResources(executionView, assetById), [executionView, assetById]);
   const resultItems = useMemo(() => getTaskResultItems(executionView), [executionView]);
   const selectedBatchTasks = useMemo(
@@ -2025,7 +1895,9 @@ function QueueView({
   useEffect(() => {
     setResourcePreview(null);
     setCommandPreviewModal(null);
+    setRecordsModal(null);
     setSelectedExecutionId(null);
+    setPreviewResultValue('');
   }, [selectedTaskId]);
 
   useEffect(() => {
@@ -2044,7 +1916,52 @@ function QueueView({
     setActiveView('create');
     setFeedback(`已复制「${task.title || '未命名任务'}」，保存后会生成新任务`);
   };
+  const handleToggleLane = async (queueKind, enabled) => {
+    setPendingLaneKind(queueKind);
+    try {
+      await invoke('set_lane_enabled_command', { queueKind, enabled });
+      await refreshState();
+      setFeedback(`${laneLabel(queueKind)}车道已${enabled ? '开启' : '关闭'}`);
+    } catch (error) {
+      setFeedback(String(error));
+    } finally {
+      setPendingLaneKind('');
+    }
+  };
+  const handleProbeLane = async (lane) => {
+    if (!lane || pendingProbeLaneKind) return;
+    setPendingProbeLaneKind(lane.queueKind);
+    try {
+      if (lane.isActive && lane.currentTaskId && lane.submitId) {
+        await queryTask(lane.currentTaskId, lane.submitId);
+      } else {
+        await processQueueOnce();
+      }
+    } finally {
+      setPendingProbeLaneKind('');
+    }
+  };
+  const handleSetQueuePriority = async (priority) => {
+    if (!selectedTask || pendingPriority) return;
+    setPendingPriority(true);
+    try {
+      await invoke('set_task_queue_priority_command', {
+        taskId: selectedTask.id,
+        priority,
+      });
+      await refreshState();
+      setFeedback(priority === 2 ? '已设为下一位' : priority === 1 ? '已设为第二优先' : '已恢复稳定随机排队');
+    } catch (error) {
+      setFeedback(String(error));
+    } finally {
+      setPendingPriority(false);
+    }
+  };
   const handleDeleteTask = (task) => {
+    if (!canDeleteTask(task)) {
+      setFeedback('任务已开始生成或正在远端排队，暂不可删除');
+      return;
+    }
     askConfirm({
       message: `确认删除任务「${task.title || '未命名任务'}」？`,
       onConfirm: () => deleteTask(task.id),
@@ -2067,16 +1984,6 @@ function QueueView({
       },
     });
   };
-  const handleClearDone = () => {
-    const doneTasks = tasks.filter((t) => t.status === 'succeeded');
-    if (!doneTasks.length) return;
-    askConfirm({
-      message: `确认清空 ${doneTasks.length} 条已完成任务？此操作不可撤销。`,
-      onConfirm: async () => {
-        for (const t of doneTasks) await deleteTask(t.id);
-      },
-    });
-  };
   const toggleTaskSelection = useCallback((task) => {
     if (!canScheduleTask(task)) return;
     setSelectedBatchIds((ids) => ids.includes(task.id) ? ids.filter((id) => id !== task.id) : [...ids, task.id]);
@@ -2090,10 +1997,10 @@ function QueueView({
   };
   const openPrepareGenerate = (task) => {
     if (!task || !canScheduleTask(task)) {
-      setFeedback('当前任务正在执行或查询，暂不可准备生成');
+      setFeedback('当前任务正在执行或查询，暂不可排队');
       return;
     }
-    setScheduleModal({ mode: 'prepare', taskIds: [task.id], title: `准备生成「${task.title || '未命名任务'}」` });
+    setScheduleModal({ mode: 'prepare', taskIds: [task.id], title: `排队「${task.title || '未命名任务'}」` });
   };
   const openBatchSchedule = () => {
     const batchTasks = selectedBatchTasks.filter(canScheduleTask);
@@ -2106,10 +2013,9 @@ function QueueView({
       mode: 'batch',
       taskIds,
       title: `批量排队 ${taskIds.length} 个任务`,
-      allowAlternatingFastQueue: canUseAlternatingFastQueue(batchTasks),
     });
   };
-  const applySchedulePlan = async ({ scheduledAt, intervalMinutes, plannedSubmitCount, alternateFastModel }) => {
+  const applySchedulePlan = async ({ scheduledAt, intervalMinutes, plannedSubmitCount }) => {
     if (!scheduleModal?.taskIds?.length) return;
     try {
       const submitCount = Math.max(1, Math.min(10, Number(plannedSubmitCount || 1)));
@@ -2118,9 +2024,9 @@ function QueueView({
         await invoke('queue_tasks_with_batch_schedule_command', {
           plan,
           plannedSubmitCount: submitCount,
-          alternateFastModel: Boolean(alternateFastModel),
+          alternateFastModel: false,
         });
-        setFeedback(`已批量排队：${formatSchedulePlanSummary(plan)}${alternateFastModel ? ' · 交叉 Fast' : ''}`);
+        setFeedback(`已批量排队：${formatSchedulePlanSummary(plan)}`);
         setSelectedBatchIds([]);
       } else if (scheduleModal.mode === 'prepare') {
         await invoke('set_task_planned_submit_count_command', {
@@ -2129,8 +2035,8 @@ function QueueView({
         });
         const operation = resolvePrepareGenerateOperation({ scheduledAt });
         if (operation.type === 'submit') {
-          await submitTask(scheduleModal.taskIds[0]);
-          setFeedback('已开始生成');
+          await rescheduleTask(scheduleModal.taskIds[0], '');
+          setFeedback('已加入队列，调度器会自动选择空闲车道');
         } else {
           await rescheduleTask(scheduleModal.taskIds[0], operation.scheduledAt);
           setFeedback('已设置定时生成');
@@ -2156,21 +2062,16 @@ function QueueView({
     });
   };
 
-  // ── STATUS TAB DEFS ───────────────────────────────────────────────────────
-  const STATUS_TABS = [
-    { key: 'all', label: '全部', count: tasks.length },
-    { key: 'waiting', label: '等待', count: stats.waiting },
-    { key: 'running', label: '执行中', count: stats.running },
-    { key: 'retry', label: '重试', count: stats.retry },
-    { key: 'done', label: '已完成', count: stats.done },
-    { key: 'failed', label: '失败', count: stats.failed },
-  ];
-
   const handleNewTask = () => {
     setEditingTaskId(null);
     setTaskForm(createEmptyTaskForm());
     setActiveView('create');
   };
+  const handleSelectLaneTask = useCallback((taskId) => {
+    const taskIndex = filteredSorted.findIndex((task) => task.id === taskId);
+    if (taskIndex >= 0) setPage(Math.floor(taskIndex / pageSize) + 1);
+    setSelectedTaskId(taskId);
+  }, [filteredSorted, pageSize, setSelectedTaskId]);
 
   return (
     <div className="queue-center">
@@ -2194,74 +2095,38 @@ function QueueView({
         </button>
       </div>
 
-      {/* ── Stats ── */}
-      <div className="qc-stats">
-        <StatCard2 label="等待中" count={stats.waiting} icon={Clock3} color="waiting" />
-        <StatCard2 label="执行中" count={stats.running} icon={Loader2} color="running" spin={stats.running > 0} />
-        <StatCard2 label="重试中" count={stats.retry} icon={RefreshCcw} color="retry" />
-        <StatCard2 label="已完成" count={stats.done} icon={CheckCircle2} color="done" />
-        <StatCard2 label="失败" count={stats.failed} icon={AlertCircle} color="failed" />
-        <StatCard2 label="模型车道" count={2} icon={Gauge} color="neutral" sub="标准/Fast 独立" />
-      </div>
+      {/* ── Lane Strip (双车道状态) ── */}
+      <LaneStrip
+        laneStatuses={laneStatuses}
+        tasks={tasks}
+        nowMs={Date.now()}
+        queryIntervalSeconds={state.settings?.poll_interval_seconds ?? 30}
+        onToggleLane={handleToggleLane}
+        onProbeLane={handleProbeLane}
+        onSelectTask={handleSelectLaneTask}
+        assetById={assetById}
+        roles={state.roles}
+        pendingLaneKind={pendingLaneKind}
+        pendingProbeLaneKind={pendingProbeLaneKind}
+      />
 
-      {/* ── Toolbar ── */}
-      <div className="qc-toolbar">
-        <div className="qc-search-wrap">
-          <Search size={13} className="qc-search-icon" />
-          <input className="qc-search-input" placeholder="搜索任务名、提示词、submit_id…"
-            value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} />
-          {searchQuery ? (
-            <button type="button" className="qc-search-clear" onClick={() => setSearchQuery('')}><X size={11} /></button>
-          ) : null}
-        </div>
-        <select className="qc-select" value={modelFilter} onChange={(e) => setModelFilter(e.target.value)}>
-          <option value="all">全部模型</option>
-          {modelOptions.map((m) => <option key={m} value={m}>{m}</option>)}
-        </select>
-        <div className="qc-toolbar-sep" />
-        <button type="button" className="qc-btn" onClick={refreshState}><RefreshCcw size={13} /> 刷新</button>
-        <button type="button" className="qc-btn" onClick={handleClearDone} disabled={stats.done === 0}>
-          <Trash2 size={13} /> 清空已完成{stats.done > 0 ? `（${stats.done}）` : ''}
-        </button>
-        <button type="button" className="qc-btn" onClick={toggleSelectPage} disabled={!schedulablePagedIds.length}>
-          <CheckCircle2 size={13} /> {schedulablePagedIds.length && schedulablePagedIds.every((id) => selectedBatchIds.includes(id)) ? '取消本页' : '选择本页'}
-        </button>
-        <button type="button" className="qc-btn" onClick={openBatchSchedule} disabled={!selectedBatchTasks.length}>
-          <CalendarClock size={13} /> 批量排队{selectedBatchTasks.length ? `（${selectedBatchTasks.length}）` : ''}
-        </button>
-        <button type="button" className="qc-btn" onClick={() => setActiveView('settings')}><Settings size={13} /> 执行策略</button>
-        <div className="qc-toolbar-end">
-          <button type="button" className="qc-btn qc-btn-primary" onClick={processQueueOnce}><Play size={13} /> 运行一次</button>
-        </div>
-      </div>
-
-      {/* ── Three-column body ── */}
-      <div className="qc-body">
+      {/* ── Two-column body ── */}
+      <div className="qc-body-dual">
         {/* ── LEFT: task list ── */}
         <div className="qc-task-list">
-          <div className="qc-tabs">
-            {STATUS_TABS.map((tab) => (
-              <button key={tab.key} type="button"
-                className={`qc-tab${statusTab === tab.key ? ' active' : ''}`}
-                onClick={() => setStatusTab(tab.key)}>
-                {tab.label}
-                {tab.count > 0 ? <span className="qc-tab-badge">{tab.count}</span> : null}
-              </button>
-            ))}
-          </div>
           <div className="qc-task-rows">
             {paged.items.length ? paged.items.map((task, idx) => (
               <TaskCard key={task.id} task={task} index={paged.startIndex + idx + 1}
                 selected={task.id === selectedTaskId}
                 selectedForBatch={selectedBatchIds.includes(task.id)}
+                queuePriority={Number(state.taskPriorities?.[task.id] || 0)}
                 assetById={assetById} roles={state.roles}
                 onSelect={setSelectedTaskId}
                 onToggleSelection={toggleTaskSelection} />
             )) : (
               <div className="qc-empty">
                 <ClipboardList size={22} />
-                <p>{searchQuery || statusTab !== 'all' || modelFilter !== 'all'
-                  ? '无匹配任务' : '暂无任务，先创建一个'}</p>
+                <p>暂无任务，先创建一个</p>
               </div>
             )}
           </div>
@@ -2280,180 +2145,193 @@ function QueueView({
             </div>
             <select className="qc-select qc-page-size" value={pageSize}
               onChange={(e) => { setPageSize(Number(e.target.value)); setPage(1); }}>
-              <option value={8}>8 条/页</option>
               <option value={12}>12 条/页</option>
-              <option value={20}>20 条/页</option>
+              <option value={16}>16 条/页</option>
+              <option value={24}>24 条/页</option>
             </select>
           </div>
         </div>
 
-        {/* ── MIDDLE: task detail ── */}
-        <div className="qc-detail">
+        {/* ── RIGHT: actions + selected task panel ── */}
+        <div className="qc-detail-column">
+          <div className="qc-toolbar">
+            <button type="button" className="qc-btn" onClick={toggleSelectPage} disabled={!schedulablePagedIds.length}>
+              <CheckCircle2 size={13} /> {schedulablePagedIds.length && schedulablePagedIds.every((id) => selectedBatchIds.includes(id)) ? '取消本页' : '选择本页'}
+            </button>
+            <button type="button" className="qc-btn" onClick={openBatchSchedule} disabled={!selectedBatchTasks.length}>
+              <CalendarClock size={13} /> 批量排队{selectedBatchTasks.length ? `（${selectedBatchTasks.length}）` : ''}
+            </button>
+          </div>
+          <div className="qc-selected">
           {selectedTask ? (
-            <>
-              <div className="qc-detail-body">
-              {/* Flow steps */}
-              <section className="qc-section">
-                <h4 className="qc-section-title">本次执行流转</h4>
-                <div className="qc-flow-steps">
-                  {flowSteps.map((step, i) => (
-                    <React.Fragment key={step.key}>
-                      <div className={`qc-flow-step ${step.state}`}>
-                        <div className="qc-flow-dot">
-                          {step.state === 'done' ? <CheckCircle2 size={13} />
-                            : step.state === 'active' && step.spinning ? <Loader2 size={13} className="spin" />
-                            : step.state === 'active' ? <span className="qc-flow-active-dot" />
-                            : step.state === 'error' ? <AlertCircle size={13} />
-                            : <span className="qc-flow-hollow" />}
-                        </div>
-                        <span className="qc-flow-label">{step.label}</span>
+            <div className="qc-selected-body">
+              {/* thumbnail + title + note */}
+              <div className="qc-selected-top">
+                <div className="qc-selected-thumb">
+                  {(() => {
+                    for (const id of (selectedTask.image_asset_ids || [])) {
+                      const a = assetById.get(id);
+                      if (a?.stored_path) return <img src={resolveMediaSrc(a.stored_path)} alt="" />;
+                    }
+                    const role = state.roles.find((r) => r.id === (selectedTask.role_ids || [])[0]);
+                    if (role?.asset_ids?.length) {
+                      const a = assetById.get(role.asset_ids[0]);
+                      if (a?.stored_path) return <img src={resolveMediaSrc(a.stored_path)} alt="" />;
+                    }
+                    return <Image size={20} />;
+                  })()}
+                </div>
+                <div>
+                  <h3 className="qc-selected-title">{selectedTask.title || '未命名任务'}</h3>
+                  <p className="qc-selected-note">{selectedNextAction.reason || dispatchInfo.reason || (selectedTask.params?.model_version ? `${selectedTask.params.model_version} / ${selectedTask.params?.ratio || '—'}` : '')}</p>
+                </div>
+                <StatusBadge task={selectedTask} />
+              </div>
+
+              <div className="qc-selected-main-grid">
+                <div className="qc-selected-main-column">
+                  {/* Action card (下一步) */}
+                  {(() => {
+                    const nextAct = selectedNextAction;
+                    return nextAct.action ? (
+                      <div className="qc-action-card">
+                        <small>下一步</small>
+                        <b>{nextAct.action}</b>
+                        <p>{nextAct.reason}</p>
+                        {dispatchInfo.nextSummary ? (
+                          <div className="qc-action-eta">
+                            <Clock3 size={12} />
+                            <span>预计 {dispatchInfo.nextSummary}</span>
+                            <em>{dispatchInfo.nextText}</em>
+                          </div>
+                        ) : null}
                       </div>
-                      {i < flowSteps.length - 1 ? (
-                        <div className={`qc-flow-line${i < flowSteps.findIndex((s) => s.state !== 'done') - 1 ? ' filled' : ''}`} />
-                      ) : null}
-                    </React.Fragment>
-                  ))}
-                </div>
-              </section>
+                    ) : null;
+                  })()}
 
-              {/* Meta */}
-              <section className="qc-section">
-                <h4 className="qc-section-title">任务信息</h4>
-                <div className="qc-meta-grid">
-                  <span className="qc-meta-label">任务名</span>
-                  <span className="qc-meta-value">{selectedTask.title || '未命名任务'}</span>
-                  <span className="qc-meta-label">状态</span>
-                  <span className="qc-meta-value"><StatusBadge status={executionView?.status || selectedTask.status} task={executionView || selectedTask} /></span>
-                  <span className="qc-meta-label">模型</span>
-                  <span className="qc-meta-value">{selectedTask.params?.model_version || '-'}</span>
-                  <span className="qc-meta-label">宽高比</span>
-                  <span className="qc-meta-value">{selectedTask.params?.ratio || '-'}</span>
-                  <span className="qc-meta-label">成功候选</span>
-                  <span className="qc-meta-value">{successfulCandidateCount} / {plannedCandidateCount}</span>
-                  <span className="qc-meta-label">计划时间</span>
-                  <span className="qc-meta-value">
-                    {selectedTask.status === 'scheduled' && selectedTask.scheduled_at
-                      ? <span className={`qc-scheduled-pill${new Date(selectedTask.scheduled_at).getTime() <= Date.now() ? ' overdue' : ''}`}>
-                          {new Date(selectedTask.scheduled_at).getTime() <= Date.now()
-                            ? <>已到期，等待补偿提交 <AlertCircle size={12} /></>
-                            : `预计提交：${formatDate(selectedTask.scheduled_at)}`}
-                        </span>
-                      : '未定时'}
-                  </span>
-                  {['queued', 'scheduled', 'retry_wait'].includes(selectedTask.status) ? (
-                    <>
-                      <span className="qc-meta-label">提交尝试</span>
-                      <span className="qc-meta-value">{dispatchInfo.attemptCount} 次 / 目标 {dispatchInfo.plannedSubmitCount} 个候选</span>
-                      <span className="qc-meta-label">{dispatchInfo.nextLabel}</span>
-                      <span className="qc-meta-value">
-                        {dispatchInfo.nextAt ? formatDate(dispatchInfo.nextAt) : dispatchInfo.nextText}
-                      </span>
-                      <span className="qc-meta-label">等待原因</span>
-                      <span className="qc-meta-value">{dispatchInfo.reason || '-'}</span>
-                    </>
-                  ) : null}
-                  <span className="qc-meta-label">更新时间</span>
-                  <span className="qc-meta-value">{formatDate(selectedTask.updated_at) || '-'}</span>
-                  {currentExecution?.submit_id ? (
-                    <>
-                      <span className="qc-meta-label">submit_id</span>
-                      <span className="qc-meta-value qc-submit-id-row">
-                        <span className="qc-submit-id mono">{currentExecution.submit_id}</span>
-                        <button type="button" className="icon-ghost mini"
-                          onClick={() => navigator.clipboard.writeText(currentExecution.submit_id).catch(() => {})}>
-                          <Copy size={11} />
-                        </button>
-                      </span>
-                    </>
-                  ) : null}
-                  {executionView?.status === 'querying' ? (
-                    <>
-                      <span className="qc-meta-label">轮询间隔</span>
-                      <span className="qc-meta-value">{state.settings.poll_interval_seconds ?? 60} 秒 / 次</span>
-                    </>
-                  ) : null}
-                </div>
-              </section>
+                  {/* Recent events + query attempts */}
+                  {(() => {
+                    const allEvents = deriveTimelineEvents(selectedTask);
+                    const keyRecords = selectKeyTimelineRecords(allEvents, allQueryAttempts, 5);
+                    const allRecordCount = allEvents.length + allQueryAttempts.length;
+                    const hasHiddenRecords = allRecordCount > keyRecords.length;
+                    if (!keyRecords.length) return null;
+                    return (
+                      <div className="qc-timeline">
+                        <div className="qc-section-inline-head">
+                          <h4>最近记录与查询</h4>
+                          <div className="qc-section-inline-actions">
+                            <span className="qc-record-count">显示 {keyRecords.length} / {allRecordCount}</span>
+                            {hasHiddenRecords ? (
+                              <button type="button" className="qc-mini-link" onClick={() => setRecordsModal({
+                                title: selectedTask.title || '未命名任务',
+                                events: allEvents,
+                                queryAttempts: allQueryAttempts,
+                              })}>
+                                查看全部记录（{allRecordCount}）
+                              </button>
+                            ) : null}
+                          </div>
+                        </div>
+                        <div className="qc-timeline-stream">
+                          {keyRecords.map((record) => {
+                            if (record.kind === 'event') {
+                              const evt = record.event;
+                              return (
+                                <div key={record.id} className="qc-timeline-event">
+                                  <time>{evt.time}</time>
+                                  <div>
+                                    <b>{evt.title}</b>
+                                    <span>{evt.detail}</span>
+                                  </div>
+                                </div>
+                              );
+                            }
+                            const attempt = record.attempt;
+                            const qi = attempt.status === 'querying' ? parseAttemptQueueInfo(attempt.stdout) : null;
+                            return (
+                              <div key={record.id} className="qc-recent-query-row compact">
+                                <span className={`qc-recent-query-dot ${attempt.status === 'failed' ? 'fail' : attempt.status === 'succeeded' ? 'done' : 'running'}`} />
+                                <time>{formatDatePart(attempt.finished_at || attempt.started_at, 'time') || '—'}</time>
+                                <b>查询 {statusLabel(attempt.status)}</b>
+                                {qi ? <span>#{qi.queue_idx ?? '-'} / {qi.queue_length ?? '-'} {qi.queue_status || ''}</span> : <span>—</span>}
+                                {attempt.error_detail ? <span className="qc-recent-query-error">{attempt.error_detail}</span> : null}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })()}
 
-              {/* Command */}
-              {commandPresentation.hasCommand ? (
-                <section className="qc-section">
-                  <div className="qc-section-head">
-                    <h4 className="qc-section-title">命令预览</h4>
-                    <div className="qc-command-actions">
-                      <button
-                        type="button"
-                        className="qc-command-toggle"
-                        onClick={openCommandPreview}
-                      >
-                        <Copy size={13} />
-                        {commandPresentation.actionLabel}
+                  {/* Command preview */}
+                  {commandPresentation.hasCommand ? (
+                    <section className="qc-section">
+                      <h4 className="qc-section-title">命令预览</h4>
+                      <button type="button" className="qc-command-collapsed" onClick={openCommandPreview}>
+                        <Command size={13} />
+                        <span>{commandPresentation.hint}</span>
                       </button>
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    className="qc-command-collapsed"
-                    onClick={openCommandPreview}
-                  >
-                    <Command size={13} />
-                    <span>{commandPresentation.hint}</span>
-                  </button>
-                </section>
-              ) : null}
+                    </section>
+                  ) : null}
 
-              {/* Hit resources */}
-              <section className="qc-section">
-                <h4 className="qc-section-title">命中资源</h4>
-                {hitResources.length ? (
-                  <div className="qc-resource-grid">
-                    {hitResources.map(({ type, displayType, label, asset }) => (
-                      <button
-                        key={`${displayType}:${asset.id}`}
-                        type="button"
-                        className={`qc-resource-item ${type} ${displayType}`}
-                        title={`预览${label}：${asset.name || asset.id.slice(0, 8)}`}
-                        onClick={() => setResourcePreview({ type, displayType, asset })}
-                      >
-                        {type === 'image' && asset.stored_path ? (
-                          <img src={resolveMediaSrc(asset.stored_path)} alt="" className="qc-resource-thumb" />
-                        ) : (
-                          <div className="qc-resource-icon">{type === 'audio' ? <FileAudio size={16} /> : <Image size={16} />}</div>
-                        )}
-                        <span className="qc-resource-tag">{label}</span>
-                        <span className="qc-resource-name">{asset.name || asset.id.slice(0, 8)}</span>
-                      </button>
-                    ))}
-                  </div>
-                ) : <p className="qc-empty-sm">无命中资源</p>}
-              </section>
+                  {/* Hit resources */}
+                  {hitResources.length > 0 ? (
+                    <section className="qc-section">
+                      <h4 className="qc-section-title">命中资源</h4>
+                      <div className="qc-resource-grid">
+                        {hitResources.map(({ type, displayType, label, asset }) => (
+                          <button
+                            key={`${displayType}:${asset.id}`}
+                            type="button"
+                            className={`qc-resource-item ${type} ${displayType}`}
+                            title={`预览${label}：${asset.name || asset.id.slice(0, 8)}`}
+                            onClick={() => setResourcePreview({ type, displayType, asset })}
+                          >
+                            {type === 'image' && asset.stored_path ? (
+                              <img src={resolveMediaSrc(asset.stored_path)} alt="" className="qc-resource-thumb" />
+                            ) : (
+                              <div className="qc-resource-icon">{type === 'audio' ? <FileAudio size={16} /> : <Image size={16} />}</div>
+                            )}
+                            <span className="qc-resource-tag">{label}</span>
+                            <span className="qc-resource-name">{asset.name || asset.id.slice(0, 8)}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </section>
+                  ) : null}
 
               {/* Results */}
-              {resultItems.length ? (
+              {resultItems.length > 0 ? (
                 <section className="qc-section">
                   <h4 className="qc-section-title">生成结果</h4>
-                  {resultItems.map((item) => (
-                    <div key={`${item.kind}:${item.value}`} className="qc-result-card">
-                      {item.kind === 'path' ? (
-                        <video
-                          className="qc-result-video"
-                          src={convertFileSrc(item.value)}
-                          controls
-                          preload="metadata"
-                        />
-                      ) : (
-                        <video
-                          className="qc-result-video"
-                          src={item.value}
-                          controls
-                          preload="metadata"
-                        />
-                      )}
-                      <div className="qc-result-row">
-                        <span className="mono qc-result-path" title={item.value}>{item.label}</span>
-                        {item.kind === 'path' ? (
-                          <button type="button" className="icon-ghost mini" title="打开所在目录"
-                            onClick={async () => { try { await invoke('open_result_dir_command', { path: item.value }); } catch (e) { setFeedback(String(e)); } }}>
+	                  {resultItems.map((item) => (
+	                    <div key={`${item.kind}:${item.value}`} className="qc-result-card">
+	                      {previewResultValue === item.value ? (
+	                        <video
+	                          className="qc-result-video"
+	                          src={item.kind === 'path' ? convertFileSrc(item.value) : item.value}
+	                          controls
+	                          preload="none"
+	                        />
+	                      ) : (
+	                        <div className="qc-result-placeholder">
+	                          <Play size={14} />
+	                          <span>视频结果已就绪，按需预览</span>
+	                        </div>
+	                      )}
+	                      <div className="qc-result-row">
+	                        <span className="mono qc-result-path" title={item.value}>{item.label}</span>
+	                        <button
+	                          type="button"
+	                          className="qc-mini-link qc-result-preview-btn"
+	                          onClick={() => setPreviewResultValue((value) => value === item.value ? '' : item.value)}
+	                        >
+	                          {previewResultValue === item.value ? '收起' : '预览'}
+	                        </button>
+	                        {item.kind === 'path' ? (
+	                          <button type="button" className="icon-ghost mini" title="打开所在目录"
+	                            onClick={async () => { try { await invoke('open_result_dir_command', { path: item.value }); } catch (e) { setFeedback(String(e)); } }}>
                             <FolderOpen size={12} />
                           </button>
                         ) : (
@@ -2477,15 +2355,9 @@ function QueueView({
                       <div
                         key={item.id}
                         className={`qc-history-item${currentExecution?.id === item.id ? ' selected' : ''}`}
-                        role="button"
-                        tabIndex={0}
+                        role="button" tabIndex={0}
                         onClick={() => setSelectedExecutionId(item.id)}
-                        onKeyDown={(event) => {
-                          if (event.key === 'Enter' || event.key === ' ') {
-                            event.preventDefault();
-                            setSelectedExecutionId(item.id);
-                          }
-                        }}
+                        onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setSelectedExecutionId(item.id); } }}
                       >
                         <div className="qc-history-header">
                           <span className="qc-history-label">{historyItemLabel(item, taskHistory.length - idx)}</span>
@@ -2494,34 +2366,17 @@ function QueueView({
                           {item.finished_at ? <span className="qc-history-time">{item.finished_at.slice(0, 16).replace('T', ' ')}</span> : null}
                           <div className="qc-history-item-actions">
                             {item.submit_id ? (
-                              <button
-                                type="button"
-                                className="icon-ghost mini"
-                                title={`查询此次结果（${item.submit_id.slice(0, 8)}）`}
+                              <button type="button" className="icon-ghost mini" title={`查询此次结果（${item.submit_id.slice(0, 8)}）`}
                                 disabled={pendingExecutionOps[item.id]?.query}
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  queryExecutionRecord(selectedTask.id, item.id, item.submit_id);
-                                }}
-                              >
-                                {pendingExecutionOps[item.id]?.query
-                                  ? <Loader2 size={11} className="spin" />
-                                  : <RefreshCcw size={11} />}
+                                onClick={(event) => { event.stopPropagation(); queryExecutionRecord(selectedTask.id, item.id, item.submit_id); }}>
+                                {pendingExecutionOps[item.id]?.query ? <Loader2 size={11} className="spin" /> : <RefreshCcw size={11} />}
                               </button>
                             ) : null}
-                            <button
-                              type="button"
-                              className="icon-ghost mini danger"
-                              title="删除此条执行记录"
+                            <button type="button" className="icon-ghost mini danger" title="删除此条执行记录"
                               onClick={(event) => {
                                 event.stopPropagation();
-                                handleDeleteExecutionRecord(
-                                  selectedTask.id,
-                                  item.id,
-                                  historyItemLabel(item, taskHistory.length - idx)
-                                );
-                              }}
-                            >
+                                handleDeleteExecutionRecord(selectedTask.id, item.id, historyItemLabel(item, taskHistory.length - idx));
+                              }}>
                               <Trash2 size={11} />
                             </button>
                           </div>
@@ -2556,194 +2411,125 @@ function QueueView({
                   </div>
                 </section>
               ) : null}
-              </div>
 
-              {/* Actions */}
-              <div className="qc-detail-actions">
-                <button type="button" className="qc-btn" onClick={() => handleEditTask(selectedTask)}>
-                  <Pencil size={13} /> 编辑
-                </button>
-                <button type="button" className="qc-btn" onClick={() => handleDuplicateTask(selectedTask)}>
-                  <Copy size={13} /> 复制
-                </button>
-                <button type="button" className="qc-btn qc-btn-primary" onClick={() => openPrepareGenerate(selectedTask)}
-                  disabled={!canScheduleTask(selectedTask) || pendingTaskOps[selectedTask.id]?.submit}>
-                  {pendingTaskOps[selectedTask.id]?.submit
-                    ? <><Loader2 size={13} className="spin" /> 提交中</>
-                    : <><Play size={13} /> 准备生成</>}
-                </button>
-                <button type="button" className="qc-btn" onClick={() => queryTask(selectedTask.id, currentExecution?.submit_id || null)}
-                  disabled={!currentExecution?.submit_id || pendingTaskOps[selectedTask.id]?.query}>
-                  {pendingTaskOps[selectedTask.id]?.query
-                    ? <><Loader2 size={13} className="spin" /> 查询中</>
-                    : <><RefreshCcw size={13} /> 查询本次结果</>}
-                </button>
-                {['scheduled', 'queued', 'retry_wait'].includes(selectedTask.status) ? (
-                  <button type="button" className="qc-btn" onClick={() => pauseTask(selectedTask.id)}>暂停</button>
-                ) : null}
-                {selectedTask.status === 'paused' ? (
-                  <>
-                    <button type="button" className="qc-btn" onClick={() => resumeTask(selectedTask.id, 'immediate')}>立即恢复</button>
-                    {selectedTask.scheduled_at ? (
-                      <button type="button" className="qc-btn" onClick={() => resumeTask(selectedTask.id, 'scheduled')}>按计划恢复</button>
+                </div>
+
+                <aside className="qc-selected-side-panel">
+                  <div className="qc-priority-picker">
+                    <span><Star size={12} /> 排队优先</span>
+                    <div role="group" aria-label="排队优先级">
+                      <button type="button" className={selectedQueuePriority === 0 ? 'active' : ''}
+                        disabled={pendingPriority} onClick={() => handleSetQueuePriority(0)}>随机</button>
+                      <button type="button" className={selectedQueuePriority === 1 ? 'active' : ''}
+                        disabled={pendingPriority} onClick={() => handleSetQueuePriority(1)}>★ 第二优先</button>
+                      <button type="button" className={selectedQueuePriority === 2 ? 'active' : ''}
+                        disabled={pendingPriority} onClick={() => handleSetQueuePriority(2)}>★★ 下一位</button>
+                    </div>
+                  </div>
+                  <div className="qc-selected-actions qc-selected-actions-stack">
+                    <button type="button" className="qc-btn qc-btn-primary" onClick={() => openPrepareGenerate(selectedTask)}
+                      disabled={!canScheduleTask(selectedTask) || pendingTaskOps[selectedTask.id]?.submit}>
+                      {pendingTaskOps[selectedTask.id]?.submit ? <><Loader2 size={13} className="spin" /> 排队中</> : <><Play size={13} /> 排队</>}
+                    </button>
+                    <button type="button" className="qc-btn" onClick={() => queryTask(selectedTask.id, selectedSubmitId || null)}
+                      disabled={!selectedSubmitId || pendingTaskOps[selectedTask.id]?.query}>
+                      {pendingTaskOps[selectedTask.id]?.query ? <><Loader2 size={13} className="spin" /> 查询中</> : <><RefreshCcw size={13} /> 查询本次结果</>}
+                    </button>
+                    <button type="button" className="qc-btn" onClick={() => handleEditTask(selectedTask)}><Pencil size={13} /> 编辑</button>
+                    <button type="button" className="qc-btn" onClick={() => handleDuplicateTask(selectedTask)}><Copy size={13} /> 复制</button>
+                    {['scheduled', 'queued', 'retry_wait'].includes(selectedTask.status) ? (
+                      <button type="button" className="qc-btn" onClick={() => pauseTask(selectedTask.id)}>暂停</button>
                     ) : null}
-                  </>
-                ) : null}
-                {selectedTask.status === 'scheduled' ? (
-                  <button
-                    type="button"
-                    className="qc-btn"
-                    onClick={() => askConfirm({
-                      title: '取消预定',
-                      body: '只取消计划时间，任务、执行记录和素材不会被删除。取消后任务回到待生成状态。',
-                      confirmText: '取消预定',
-                      onConfirm: async () => {
-                        await rescheduleTask(selectedTask.id, '');
-                        setFeedback('已取消预定');
-                      },
-                    })}
-                  >
-                    <X size={13} /> 取消预定
-                  </button>
-                ) : null}
-                {canDeleteTask(selectedTask) ? (
-                  <button type="button" className="qc-btn qc-btn-danger" onClick={() => handleDeleteTask(selectedTask)}>
-                    <Trash2 size={13} /> 删除任务
-                  </button>
-                ) : null}
+                    {selectedTask.status === 'paused' ? (<>
+                      <button type="button" className="qc-btn" onClick={() => resumeTask(selectedTask.id, 'immediate')}>立即恢复</button>
+                      {selectedTask.scheduled_at ? <button type="button" className="qc-btn" onClick={() => resumeTask(selectedTask.id, 'scheduled')}>按计划恢复</button> : null}
+                    </>) : null}
+                    {selectedTask.status === 'scheduled' ? (
+                      <button type="button" className="qc-btn" onClick={() => askConfirm({
+                        title: '取消预定', body: '只取消计划时间，任务、执行记录和素材不会被删除。取消后任务回到待生成状态。', confirmText: '取消预定',
+                        onConfirm: async () => { await rescheduleTask(selectedTask.id, ''); setFeedback('已取消预定'); },
+                      })}><X size={13} /> 取消预定</button>
+                    ) : null}
+                    <button type="button" className="qc-btn qc-btn-danger" onClick={() => handleDeleteTask(selectedTask)}><Trash2 size={13} /> 删除任务</button>
+                  </div>
+
+                  <div>
+                    <h4 className="qc-overview-title">执行概览</h4>
+                    <div className="qc-summary-grid qc-summary-grid-side">
+                      <div className="qc-detail-item">
+                        <span>提交状态</span>
+                        <b>{statusLabel(executionView?.status || selectedTask.status)}</b>
+                        <small>{selectedTask.auto_query_stopped ? '自动查询已停止' : '—'}</small>
+                      </div>
+                      <div className="qc-detail-item">
+                        <span>本地入队</span>
+                        <b>{formatDatePart(selectedTask.queued_at || selectedTask.created_at, 'time') || '—'}</b>
+                        <small>{formatDatePart(selectedTask.queued_at || selectedTask.created_at, 'date') || '—'}</small>
+                      </div>
+                      <div className="qc-detail-item">
+                        <span>远端提交</span>
+                        <b>{formatDatePart(executionSubmittedAt, 'time') || '—'}</b>
+                        <small>{selectedSubmitId ? `submit #${selectedSubmitId.slice(0, 8)}` : '尚未拿到 submit id'}</small>
+                      </div>
+                      <div className="qc-detail-item">
+                        <span>最近查询</span>
+                        <b>{formatDatePart(latestQueryAt, 'time') || '—'}</b>
+                        <small>{allQueryAttempts.length ? `共 ${allQueryAttempts.length} 次查询` : '暂无查询记录'}</small>
+                      </div>
+                      <div className="qc-detail-item">
+                        <span>远端队列</span>
+                        <b>{executionView?.queue_info ? `#${executionView.queue_info.queue_idx ?? '-'} / ${executionView.queue_info.queue_length ?? '-'}` : '—'}</b>
+                        <small>{executionView?.queue_info?.queue_status || '暂无队列信息'}</small>
+                      </div>
+                      <div className="qc-detail-item">
+                        <span>重试次数</span>
+                        <b>{selectedTask.attempt_count ?? 0}</b>
+                        <small>{selectedTask.consecutive_no_result_queries ? `连续 ${selectedTask.consecutive_no_result_queries} 次无结果` : '—'}</small>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="qc-strategy-box">
+                    <h4>排队参数</h4>
+                    <div className="qc-strategy-row"><span>模型</span><b>{selectedTask.params?.model_version || '—'}</b></div>
+                    <div className="qc-strategy-row"><span>计划生成</span><b>{selectedTask.planned_submit_count || 1} 次</b></div>
+                    <div className="qc-strategy-row"><span>查询间隔</span><b>{state.settings?.poll_interval_seconds ?? 30} 秒</b></div>
+                    <div className="qc-strategy-row"><span>并发重试</span><b>{selectedTask.concurrency_retry_count || 0} 次</b></div>
+                  </div>
+
+                  <div className="qc-health-hint">
+                    {executionView?.status === 'succeeded' ? (
+                      <span className="qc-health done"><CheckCircle2 size={12} /> 任务已成功完成</span>
+                    ) : ['failed'].includes(executionView?.status) ? (
+                      <span className="qc-health fail"><AlertCircle size={12} /> 任务失败，可重新提交</span>
+                    ) : executionView?.status === 'submitted' && selectedTask?.auto_query_stopped ? (
+                      <span className="qc-health fail"><AlertCircle size={12} /> 自动查询已停止（等待超过 4 小时），请手动查询</span>
+                    ) : executionView?.status === 'submitted' ? (
+                      <span className="qc-health running"><Clock3 size={12} /> 已提交，等待自动查询</span>
+                    ) : executionView?.status === 'querying' ? (
+                      <span className="qc-health running"><Loader2 size={12} className="spin" /> {executionView.queue_info ? '排队等待生成中' : '查询结果中'}</span>
+                    ) : executionView?.status === 'submitting' ? (
+                      <span className="qc-health running"><Loader2 size={12} className="spin" /> 提交中</span>
+                    ) : executionView?.status === 'retry_wait' ? (
+                      <span className="qc-health retry"><RefreshCcw size={12} /> {selectedNextAction.reason || dispatchInfo.reason || '等待重试'}</span>
+                    ) : executionView?.status === 'queued' ? (
+                      <span className="qc-health idle"><Clock3 size={12} /> {selectedNextAction.reason || dispatchInfo.reason || '等待调度器空闲'}</span>
+                    ) : executionView?.status === 'scheduled' ? (
+                      <span className="qc-health idle"><Clock3 size={12} /> {selectedNextAction.reason || dispatchInfo.reason || '等待预定开始时间'}</span>
+                    ) : (
+                      <span className="qc-health idle"><Clock3 size={12} /> 等待调度</span>
+                    )}
+                  </div>
+                </aside>
               </div>
-            </>
+            </div>
           ) : (
             <div className="qc-empty qc-empty-panel">
               <ClipboardList size={28} />
               <p>选择任务查看详情</p>
             </div>
           )}
-        </div>
-
-        {/* ── RIGHT: execution monitor ── */}
-        <div className="qc-monitor">
-          {selectedTask ? (
-            <>
-              <section className="qc-section">
-                <h4 className="qc-section-title">执行监控</h4>
-                <div className="qc-progress-area">
-                  <RingProgress percent={progress.percent} status={executionView?.status || selectedTask.status} />
-                  <div className="qc-progress-info">
-                    <span className="qc-stage">{progress.stage}</span>
-                    <div className="qc-progress-bar-track">
-                      <div className="qc-progress-bar-fill" style={{ width: `${progress.percent}%` }} />
-                    </div>
-                    {selectedTask.status !== 'succeeded' && (
-                      <>
-                        <div className="qc-monitor-meta-row">
-                          <span>提交尝试</span>
-                          <span>{dispatchInfo.attemptCount} 次</span>
-                        </div>
-                        <div className="qc-monitor-meta-row">
-                          <span>并发等待</span>
-                          <span>{dispatchInfo.concurrencyRetryText}</span>
-                        </div>
-                        {['queued', 'scheduled', 'retry_wait'].includes(selectedTask.status) ? (
-                          <div className="qc-monitor-meta-row">
-                            <span>{dispatchInfo.nextLabel}</span>
-                            <span>{dispatchInfo.nextAt ? formatDatePart(dispatchInfo.nextAt, 'time') : dispatchInfo.nextText}</span>
-                          </div>
-                        ) : null}
-                      </>
-                    )}
-                    {executionView?.status === 'querying' && executionView.queue_info ? (
-                    <div className="qc-queue-progress">
-                      <div className="qc-queue-progress-head">
-                        <span className="qc-queue-label">排队位置</span>
-                        <span className="qc-queue-pos">
-                          <b>#{executionView.queue_info.queue_idx ?? '-'}</b>
-                          <em> / {executionView.queue_info.queue_length != null ? executionView.queue_info.queue_length.toLocaleString() : '-'}</em>
-                        </span>
-                      </div>
-                      <div className="qc-queue-bar-track">
-                        <div className="qc-queue-bar-fill" style={{
-                          width: `${executionView.queue_info.queue_idx != null && executionView.queue_info.queue_length
-                            ? Math.max(2, Math.round((1 - executionView.queue_info.queue_idx / executionView.queue_info.queue_length) * 100))
-                            : 0}%`
-                        }} />
-                      </div>
-                      <div className="qc-queue-sub">
-                        <span>优先级 {executionView.queue_info.priority ?? '-'}</span>
-                        <span>{executionView.queue_info.queue_status ?? ''}</span>
-                      </div>
-                    </div>
-                  ) : null}
-                  <div className="qc-monitor-meta-row">
-                      <span>更新</span>
-                      <span>{formatDatePart(selectedTask.updated_at, 'time') || '-'}</span>
-                    </div>
-                  </div>
-                </div>
-              </section>
-
-              <section className="qc-section">
-                <div className="qc-section-head">
-                  <h4 className="qc-section-title">查询记录</h4>
-                  {allAttempts.length > 4 ? (
-                    <button type="button" className="qc-link-btn" onClick={() => setShowAttemptsModal(true)}>
-                      查看全部 ({allAttempts.length})
-                    </button>
-                  ) : null}
-                </div>
-                {recentAttempts.length ? (
-                  <div className="qc-attempt-log">
-                    {recentAttempts.map((attempt) => <AttemptRow key={attempt.id} attempt={attempt} />)}
-                  </div>
-                ) : <p className="qc-empty-sm">暂无查询记录</p>}
-              </section>
-              {showAttemptsModal ? (
-                <AttemptsModal attempts={allAttempts} onClose={() => setShowAttemptsModal(false)} />
-              ) : null}
-
-              <section className="qc-section">
-                <h4 className="qc-section-title">异常与重试策略</h4>
-                {executionView?.last_error ? (
-                  <p className="qc-error-text">{executionView.last_error}</p>
-                ) : null}
-                <div className="qc-retry-grid">
-                  <span>等待条件</span><span>远端并发已满</span>
-                  <span>处理方式</span><span>持续静默等待并重试</span>
-                  <span>停止条件</span><span>提交成功或手动停止任务</span>
-                  <span>临时上传错误</span><span>最多自动重试 3 次</span>
-                </div>
-              </section>
-
-              <div className="qc-health-hint">
-                {executionView?.status === 'succeeded' ? (
-                  <span className="qc-health done"><CheckCircle2 size={12} /> 任务已成功完成</span>
-                ) : ['failed'].includes(executionView?.status) ? (
-                  <span className="qc-health fail"><AlertCircle size={12} /> 任务失败，可重新提交</span>
-                ) : executionView?.status === 'submitted' && selectedTask?.auto_query_stopped ? (
-                  <span className="qc-health fail"><AlertCircle size={12} /> 自动查询已停止（等待超过 4 小时），请手动查询</span>
-                ) : executionView?.status === 'submitted' ? (
-                  <span className="qc-health running"><Clock3 size={12} /> 已提交，等待自动查询</span>
-                ) : executionView?.status === 'querying' ? (
-                  <span className="qc-health running"><Loader2 size={12} className="spin" /> {executionView.queue_info ? '排队等待生成中' : '查询结果中'}</span>
-                ) : executionView?.status === 'submitting' ? (
-                  <span className="qc-health running"><Loader2 size={12} className="spin" /> 提交中</span>
-                ) : executionView?.status === 'retry_wait' ? (
-                  <span className="qc-health retry"><RefreshCcw size={12} /> {dispatchInfo.reason || '等待重试'}</span>
-                ) : executionView?.status === 'queued' ? (
-                  <span className="qc-health idle"><Clock3 size={12} /> {dispatchInfo.reason || '等待调度器空闲'}</span>
-                ) : executionView?.status === 'scheduled' ? (
-                  <span className="qc-health idle"><Clock3 size={12} /> {dispatchInfo.reason || '等待预定开始时间'}</span>
-                ) : (
-                  <span className="qc-health idle"><Clock3 size={12} /> 等待调度</span>
-                )}
-              </div>
-            </>
-          ) : (
-            <div className="qc-empty qc-empty-panel">
-              <Gauge size={28} />
-              <p>选中任务后显示监控</p>
-            </div>
-          )}
+          </div>
         </div>
       </div>
       {resourcePreview?.type === 'image' && resourcePreview.asset?.stored_path ? (
@@ -2761,7 +2547,6 @@ function QueueView({
           title={scheduleModal.title}
           mode={scheduleModal.mode}
           taskCount={scheduleModal.taskIds.length}
-          allowAlternatingFastQueue={scheduleModal.allowAlternatingFastQueue}
           onClose={() => setScheduleModal(null)}
           onApply={applySchedulePlan}
         />
@@ -2771,6 +2556,14 @@ function QueueView({
           title={commandPreviewModal.title}
           commandText={commandPreviewModal.commandText}
           onClose={() => setCommandPreviewModal(null)}
+        />
+      ) : null}
+      {recordsModal ? (
+        <TaskRecordsModal
+          title={recordsModal.title}
+          events={recordsModal.events}
+          queryAttempts={recordsModal.queryAttempts}
+          onClose={() => setRecordsModal(null)}
         />
       ) : null}
     </div>
@@ -2802,278 +2595,86 @@ function CommandPreviewModal({ title, commandText, onClose }) {
   );
 }
 
-
-function LogsView({ logs, tasks, settings, clearLogs, setActiveView, setSelectedTaskId }) {
-  // ── 规范化 ──
-  const normalized = useMemo(() => (logs || []).map(normalizeLogEntry), [logs]);
-
-  // ── UI state ──
-  const [search, setSearch] = useState('');
-  const [levelFilter, setLevelFilter] = useState('');
-  const [sourceFilter, setSourceFilter] = useState('');
-  const [taskFilter, setTaskFilter] = useState('');
-  const [timeRange, setTimeRange] = useState('all');
-  const [category, setCategory] = useState('all');
-  const [selectedLogId, setSelectedLogId] = useState(null);
-  const [autoRefresh, setAutoRefresh] = useState(false);
-  const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
-
-  // ── 派生 ──
-  const stats = useMemo(() => deriveLogStats(normalized, settings?.log_retention_count || 500), [normalized, settings]);
-  const catCounts = useMemo(() => deriveCategoryCounts(normalized), [normalized]);
-  const filtered = useMemo(() => filterLogs(normalized, { search, level: levelFilter, source: sourceFilter, taskId: taskFilter, timeRange, category }), [normalized, search, levelFilter, sourceFilter, taskFilter, timeRange, category]);
-  const paginated = useMemo(() => paginateLogs(filtered, page, pageSize), [filtered, page, pageSize]);
-  const selectedLog = useMemo(() => normalized.find((l) => l.id === selectedLogId) || null, [normalized, selectedLogId]);
-  const associations = useMemo(() => deriveLogAssociations(normalized, selectedLog), [normalized, selectedLog]);
-  const taskOptions = useMemo(() => deriveTaskOptions(normalized), [normalized]);
-
-  // 默认选中
-  useEffect(() => {
-    if (!selectedLogId && normalized.length) {
-      setSelectedLogId(findDefaultSelectedLogId(normalized));
-    }
-  }, [normalized, selectedLogId]);
-
-  // 筛选变化时重置分页
-  useEffect(() => { setPage(1); }, [search, levelFilter, sourceFilter, taskFilter, timeRange, category]);
-
-  // 自动刷新
-  useEffect(() => {
-    if (!autoRefresh) return;
-    const id = setInterval(() => { /* 依赖现有 refreshState 机制 */ }, 3000);
-    return () => clearInterval(id);
-  }, [autoRefresh]);
-
-  // ── 操作 ──
-  function handleExport(fmt) {
-    const content = buildLogExportPayload(filtered, fmt);
-    const blob = new Blob([content], { type: fmt === 'json' ? 'application/json' : 'text/plain' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `logs.${fmt}`;
-    a.click();
-    URL.revokeObjectURL(url);
-  }
-
-  function handleCopyLog() {
-    if (!selectedLog) return;
-    const text = buildLogExportPayload([selectedLog], 'text');
-    navigator.clipboard.writeText(text);
-  }
-
-  function handleLocateTask() {
-    if (!selectedLog?.taskId) return;
-    const task = tasks?.find((t) => t.id === selectedLog.taskId);
-    if (task) {
-      setSelectedTaskId(task.id);
-      setActiveView('queue');
-    }
-  }
-
-  function handleViewContext() {
-    if (!selectedLog?.taskId && !selectedLog?.submitId) return;
-    if (selectedLog.taskId) setTaskFilter(selectedLog.taskId);
-  }
-
-  function handleClearFilters() {
-    setSearch(''); setLevelFilter(''); setSourceFilter(''); setTaskFilter(''); setTimeRange('all'); setCategory('all');
-  }
-
-  function handleQuickLocation(key) {
-    const f = getQuickLocationFilters(key);
-    if (f.level) setLevelFilter(f.level);
-    if (f.timeRange) setTimeRange(f.timeRange);
-  }
-
-  // ── 级别/来源选项 ──
-  const levelOptions = [{ key: '', label: '全部级别' }, ...LOG_LEVELS.map((l) => ({ key: l, label: l.toUpperCase() }))];
-  const sourceOptions = [{ key: '', label: '全部来源' }, ...LOG_SOURCES.map((s) => ({ key: s, label: SOURCE_LABEL_MAP[s] || s }))];
-  const taskFilterOptions = [{ key: '', label: '全部任务' }, ...taskOptions.map((t) => ({ key: t.id, label: t.title }))];
-
+function TaskRecordsModal({ title, events = [], queryAttempts = [], onClose }) {
   return (
-    <div className="log-center">
-      {/* 标题区 */}
-      <div className="log-center__header">
-        <div>
-          <h2 className="log-center__title">日志中心</h2>
-          <p className="log-center__subtitle">查看任务执行日志、CLI 输出、错误信息与系统事件</p>
-        </div>
-        <div className="log-center__header-actions">
-          <button type="button" className="outline-button" onClick={clearLogs}>清空日志</button>
-        </div>
-      </div>
-
-      {/* 统计卡片 */}
-      <div className="log-center__stats">
-        <StatCard icon="List" title="今日日志" value={stats.today} tone="info" />
-        <StatCard icon="AlertCircle" title="错误" value={stats.errors} tone="error" />
-        <StatCard icon="AlertTriangle" title="警告" value={stats.warnings} tone="warn" />
-        <StatCard icon="Info" title="信息" value={stats.infos} tone="success" />
-        <StatCard icon="ShieldCheck" title="日志保留" value={stats.retention} />
-      </div>
-
-      {/* 筛选工具栏 */}
-      <div className="log-center__toolbar">
-        <SearchBox value={search} onChange={setSearch} placeholder="搜索日志内容、submit_id、任务名..." />
-        <FilterSelect value={levelFilter} onChange={setLevelFilter} options={levelOptions} label="级别" />
-        <FilterSelect value={sourceFilter} onChange={setSourceFilter} options={sourceOptions} label="来源" />
-        <FilterSelect value={taskFilter} onChange={setTaskFilter} options={taskFilterOptions} label="任务" />
-        <FilterSelect value={timeRange} onChange={setTimeRange} options={TIME_RANGE_OPTIONS} label="时间" />
-        <ToggleSwitch checked={autoRefresh} onChange={setAutoRefresh} label="自动刷新" />
-        <button type="button" className="outline-button" onClick={() => handleExport('json')} title="导出 JSON"><Download size={14} /> 导出</button>
-        <button type="button" className="outline-button" onClick={handleClearFilters}>清空筛选</button>
-      </div>
-
-      {/* 主体三栏 */}
-      <div className="log-center__body">
-        {/* 左侧分类 */}
-        <aside className="log-center__sidebar">
-          <div className="log-center__sidebar-section">
-            <h3 className="log-center__sidebar-heading">分类</h3>
-            {SIDEBAR_CATEGORIES.map((cat) => (
-              <button
-                key={cat.key}
-                type="button"
-                className={`log-center__sidebar-item${category === cat.key ? ' active' : ''}`}
-                onClick={() => setCategory(cat.key)}
-              >
-                <span>{cat.label}</span>
-                <em>{catCounts[cat.key] || 0}</em>
-              </button>
-            ))}
+    <div className="modal-backdrop command-preview-modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="task-records-dialog" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+        <header className="command-preview-dialog-head">
+          <div>
+            <span>完整记录</span>
+            <h3>{title || '未命名任务'}</h3>
           </div>
-          <div className="log-center__sidebar-section">
-            <h3 className="log-center__sidebar-heading">快速定位</h3>
-            {QUICK_LOCATIONS.map((ql) => (
-              <button
-                key={ql.key}
-                type="button"
-                className="log-center__sidebar-item"
-                onClick={() => handleQuickLocation(ql.key)}
-              >
-                <span>{ql.label}</span>
-              </button>
-            ))}
-          </div>
-        </aside>
+          <button type="button" className="icon-ghost" onClick={onClose}><X size={16} /></button>
+        </header>
 
-        {/* 中间表格 */}
-        <div className="log-center__table-wrap">
-          <table className="log-center__table">
-            <thead>
-              <tr>
-                <th className="log-center__th--time">时间</th>
-                <th className="log-center__th--level">级别</th>
-                <th className="log-center__th--source">来源</th>
-                <th className="log-center__th--task">任务 / submit_id</th>
-                <th className="log-center__th--msg">摘要</th>
-              </tr>
-            </thead>
-            <tbody>
-              {paginated.items.length ? paginated.items.map((log) => (
-                <tr
-                  key={log.id}
-                  className={`log-center__row${selectedLogId === log.id ? ' selected' : ''}`}
-                  onClick={() => setSelectedLogId(log.id)}
-                >
-                  <td className="log-center__td--time">{log.timestamp ? log.timestamp.slice(11, 19) : '-'}</td>
-                  <td className="log-center__td--level">
-                    <StatusPill variant={LEVEL_VARIANT_MAP[log.level] || 'neutral'}>{log.level}</StatusPill>
-                  </td>
-                  <td className="log-center__td--source">{SOURCE_LABEL_MAP[log.source] || log.source}</td>
-                  <td className="log-center__td--task">
-                    {log.taskTitle ? <span className="log-center__task-name">{log.taskTitle}</span> : null}
-                    {log.submitId ? <span className="log-center__submit-id">{log.submitId}</span> : null}
-                    {!log.taskTitle && !log.submitId ? '-' : null}
-                  </td>
-                  <td className="log-center__td--msg">{log.message}</td>
-                </tr>
-              )) : (
-                <tr><td colSpan={5} className="log-center__empty">无匹配日志</td></tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-
-        {/* 右侧详情 */}
-        <aside className="log-center__detail">
-          {selectedLog ? (
-            <div className="log-center__detail-inner">
-              <div className="log-center__detail-header">
-                <StatusPill variant={LEVEL_VARIANT_MAP[selectedLog.level] || 'neutral'}>{selectedLog.level}</StatusPill>
-                <InlineCopyButton text={selectedLog.message} title="复制消息" />
-              </div>
-              <div className="log-center__detail-fields">
-                <div className="log-center__detail-field"><span className="log-center__detail-label">时间</span><span className="log-center__detail-value">{selectedLog.timestamp || '-'}</span></div>
-                <div className="log-center__detail-field"><span className="log-center__detail-label">来源</span><span className="log-center__detail-value">{SOURCE_LABEL_MAP[selectedLog.source] || selectedLog.source}</span></div>
-                {selectedLog.taskTitle ? <div className="log-center__detail-field"><span className="log-center__detail-label">任务</span><span className="log-center__detail-value">{selectedLog.taskTitle}</span></div> : null}
-                {selectedLog.submitId ? <div className="log-center__detail-field"><span className="log-center__detail-label">submit_id</span><span className="log-center__detail-value">{selectedLog.submitId}<InlineCopyButton text={selectedLog.submitId} /></span></div> : null}
-                {selectedLog.module ? <div className="log-center__detail-field"><span className="log-center__detail-label">模块</span><span className="log-center__detail-value">{selectedLog.module}</span></div> : null}
-                {selectedLog.errorDetail ? <div className="log-center__detail-field"><span className="log-center__detail-label">错误详情</span><span className="log-center__detail-value log-center__detail-value--error">{selectedLog.errorDetail}</span></div> : null}
-              </div>
-              {selectedLog.detail ? (
-                <div className="log-center__detail-block">
-                  <h4 className="log-center__detail-block-title">日志详情</h4>
-                  <pre className="log-center__detail-pre">{selectedLog.detail}</pre>
-                </div>
-              ) : null}
-              {selectedLog.rawOutput || selectedLog.stdout || selectedLog.stderr ? (
-                <div className="log-center__detail-block">
-                  <h4 className="log-center__detail-block-title">原始输出</h4>
-                  {selectedLog.stdout ? <pre className="log-center__detail-pre">{selectedLog.stdout}</pre> : null}
-                  {selectedLog.stderr ? <pre className="log-center__detail-pre log-center__detail-pre--err">{selectedLog.stderr}</pre> : null}
-                  {selectedLog.rawOutput ? <pre className="log-center__detail-pre">{selectedLog.rawOutput}</pre> : null}
-                </div>
-              ) : null}
-              {associations.length ? (
-                <div className="log-center__detail-block">
-                  <h4 className="log-center__detail-block-title">关联事件</h4>
-                  {associations.map((a) => (
-                    <div key={a.id} className="log-center__assoc-item" onClick={() => setSelectedLogId(a.id)}>
-                      <StatusPill variant={LEVEL_VARIANT_MAP[a.level] || 'neutral'}>{a.level}</StatusPill>
-                      <span className="log-center__assoc-msg">{a.message}</span>
-                    </div>
-                  ))}
-                </div>
-              ) : null}
-              <div className="log-center__detail-actions">
-                <button type="button" className="outline-button" onClick={handleCopyLog}>复制日志</button>
-                {selectedLog.taskId ? <button type="button" className="gradient-button" onClick={handleLocateTask}>定位任务</button> : null}
-                {(selectedLog.taskId || selectedLog.submitId) ? <button type="button" className="outline-button" onClick={handleViewContext}>查看上下文</button> : null}
-              </div>
+        <div className="task-records-dialog-body">
+          <section className="task-records-section">
+            <div className="task-records-section-head">
+              <b>执行记录</b>
+              <span>{events.length} 条</span>
             </div>
-          ) : (
-            <div className="log-center__detail-empty">选择日志查看详情</div>
-          )}
-        </aside>
-      </div>
+            {events.length ? (
+              <div className="task-records-list">
+                {events.map((evt, index) => (
+                  <div key={`${evt.time}:${evt.title}:${index}`} className="qc-timeline-event task-records-event">
+                    <time>{evt.time}</time>
+                    <div>
+                      <b>{evt.title}</b>
+                      <span>{evt.detail}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="task-records-empty">暂无执行记录</p>
+            )}
+          </section>
 
-      {/* 分页 */}
-      <Pager
-        page={paginated.page}
-        totalPages={paginated.totalPages}
-        total={paginated.total}
-        pageSize={paginated.pageSize}
-        onPageChange={setPage}
-        onPageSizeChange={(s) => { setPageSize(s); setPage(1); }}
-      />
+          <section className="task-records-section">
+            <div className="task-records-section-head">
+              <b>查询记录</b>
+              <span>{queryAttempts.length} 条</span>
+            </div>
+            {queryAttempts.length ? (
+              <div className="task-records-list">
+                {queryAttempts.map((attempt) => {
+                  const qi = attempt.status === 'querying' ? parseAttemptQueueInfo(attempt.stdout) : null;
+                  return (
+                    <div key={attempt.id} className="qc-recent-query-row compact">
+                      <span className={`qc-recent-query-dot ${attempt.status === 'failed' ? 'fail' : attempt.status === 'succeeded' ? 'done' : 'running'}`} />
+                      <time>{formatDatePart(attempt.finished_at || attempt.started_at, 'time') || '—'}</time>
+                      <b>查询 {statusLabel(attempt.status)}</b>
+                      {qi ? <span>#{qi.queue_idx ?? '-'} / {qi.queue_length ?? '-'} {qi.queue_status || ''}</span> : <span>—</span>}
+                      {attempt.error_detail ? <span className="qc-recent-query-error">{attempt.error_detail}</span> : null}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <p className="task-records-empty">暂无查询记录</p>
+            )}
+          </section>
+        </div>
+
+        <footer className="task-records-dialog-actions">
+          <button type="button" className="gradient-button" onClick={onClose}>返回</button>
+        </footer>
+      </section>
     </div>
   );
 }
 
-function SchedulePickerModal({ title, mode = 'single', taskCount = 1, allowAlternatingFastQueue = false, onClose, onApply }) {
+
+function SchedulePickerModal({ title, mode = 'single', taskCount = 1, onClose, onApply }) {
   const isBatch = mode === 'batch';
   const isPrepare = mode === 'prepare';
-  const isMultiTask = isBatch;
   const today = formatDateInputValue(new Date());
   const tomorrowDate = new Date();
   tomorrowDate.setDate(tomorrowDate.getDate() + 1);
   const defaultQuietTime = '02:00';
   const defaultQuietDate = new Date();
   defaultQuietDate.setHours(2, 0, 0, 0);
-  const [scheduleMode, setScheduleMode] = useState(isMultiTask ? 'relative' : 'immediate');
+  const [scheduleMode, setScheduleMode] = useState('immediate');
   const [relativeHours, setRelativeHours] = useState(2);
   const [day, setDay] = useState(defaultQuietDate.getTime() > Date.now() ? 'today' : 'tomorrow');
   const [quietTime, setQuietTime] = useState(defaultQuietTime);
@@ -3081,14 +2682,13 @@ function SchedulePickerModal({ title, mode = 'single', taskCount = 1, allowAlter
   const [customTime, setCustomTime] = useState('02:00');
   const [intervalMinutes, setIntervalMinutes] = useState(0);
   const [plannedSubmitCount, setPlannedSubmitCount] = useState(1);
-  const [alternateFastModel, setAlternateFastModel] = useState(false);
   const [error, setError] = useState('');
 
   const scheduleOptions = [
     {
       key: 'immediate',
-      label: isBatch ? '立即排队' : isPrepare ? '立即生成' : '立即提交',
-      hint: isBatch ? '清掉预定时间，立刻进入连续队列' : isPrepare ? '现在提交到即梦生成' : '移除计划时间，回到待提交',
+      label: '立即排队',
+      hint: isBatch ? '清掉预定时间，立刻进入连续队列' : '由调度器自动选择空闲车道',
     },
     { key: 'relative', label: '几小时后', hint: '适合临时错峰提交' },
     { key: 'dayTime', label: '今天 / 明天凌晨', hint: '常用夜间批量提交' },
@@ -3124,7 +2724,7 @@ function SchedulePickerModal({ title, mode = 'single', taskCount = 1, allowAlter
     }
     setApplying(true);
     try {
-      await onApply?.({ scheduledAt, intervalMinutes, plannedSubmitCount, alternateFastModel });
+      await onApply?.({ scheduledAt, intervalMinutes, plannedSubmitCount });
     } finally {
       setApplying(false);
     }
@@ -3135,7 +2735,7 @@ function SchedulePickerModal({ title, mode = 'single', taskCount = 1, allowAlter
       <section className="schedule-modal" role="dialog" aria-modal="true" onMouseDown={(e) => e.stopPropagation()}>
         <header className="schedule-modal-head">
           <div>
-            <span>{isBatch ? `批量排队 ${taskCount} 个任务` : isPrepare ? '准备生成' : '单个任务排期'}</span>
+            <span>{isBatch ? `批量排队 ${taskCount} 个任务` : '任务排队'}</span>
             <h3>{title || '安排提交时间'}</h3>
           </div>
           <button type="button" className="icon-ghost" onClick={onClose}><X size={16} /></button>
@@ -3200,19 +2800,6 @@ function SchedulePickerModal({ title, mode = 'single', taskCount = 1, allowAlter
                 <option value={60}>1 小时</option>
                 <option value={90}>1.5 小时</option>
               </select>
-            </label>
-          ) : null}
-          {isBatch && allowAlternatingFastQueue ? (
-            <label className="schedule-checkbox">
-              <input
-                type="checkbox"
-                checked={alternateFastModel}
-                onChange={(e) => setAlternateFastModel(e.target.checked)}
-              />
-              <span>
-                <strong>交叉 Fast 模型</strong>
-                <em>第 1 个标准，第 2 个 Fast，依次交替</em>
-              </span>
             </label>
           ) : null}
           <label>
@@ -3472,9 +3059,9 @@ function SettingsView({ cli, settingsForm, setSettingsForm, checkCli, checkCliUp
           <label>
             并发重试间隔（秒）
             <div className="settings-input-hint-row">
-              <input type="number" min="30" value={settingsForm.concurrency_retry_delay_seconds || 30}
+              <input type="number" min="300" value={settingsForm.concurrency_retry_delay_seconds || 300}
                 onChange={(e) => setSettingsForm({ ...settingsForm, concurrency_retry_delay_seconds: e.target.value })} />
-              <span className="settings-range-hint">30-3600</span>
+              <span className="settings-range-hint">300-3600</span>
             </div>
           </label>
         </NumberedSection>
@@ -3603,80 +3190,6 @@ function AiModelTestButton({ config }) {
   );
 }
 
-function parseAttemptQueueInfo(stdout) {
-  try { return JSON.parse(stdout)?.queue_info || null; } catch { return null; }
-}
-
-function AttemptRow({ attempt }) {
-  const dot = attempt.status === 'succeeded' ? 'done'
-    : ['submitting', 'querying'].includes(attempt.status) ? 'running'
-    : attempt.status === 'failed' ? 'fail' : 'idle';
-  const qi = attempt.status === 'querying' ? parseAttemptQueueInfo(attempt.stdout) : null;
-  const modelLabel = executionModelLabel(attempt);
-  return (
-    <div className="qc-attempt-row">
-      <span className={`qc-attempt-dot ${dot}`} />
-      <span className="qc-attempt-time">{formatDate(attempt.finished_at || attempt.started_at)}</span>
-      <span className="qc-attempt-label">
-        {statusLabel(attempt.status)}
-        {modelLabel ? ` · ${modelLabel}` : ''}
-        {qi ? (
-          <span className="qc-attempt-queue">
-            &nbsp;·&nbsp;<b>#{qi.queue_idx ?? '-'}</b>
-            <em> / {qi.queue_length != null ? qi.queue_length.toLocaleString() : '-'}</em>
-            {qi.queue_status ? <span className="qc-attempt-qs"> {qi.queue_status}</span> : null}
-          </span>
-        ) : null}
-        {attempt.error_kind ? ` · ${attempt.error_kind}` : ''}
-      </span>
-    </div>
-  );
-}
-
-function AttemptsModal({ attempts, onClose }) {
-  return (
-    <div className="attempts-modal-overlay" onClick={onClose}>
-      <div className="attempts-modal-card" onClick={(e) => e.stopPropagation()}>
-        <div className="attempts-modal-head">
-          <h4>全部查询记录（{attempts.length} 条）</h4>
-          <button type="button" className="icon-ghost" onClick={onClose}><X size={16} /></button>
-        </div>
-        <div className="attempts-modal-body">
-          {attempts.map((attempt) => {
-            const qi = attempt.status === 'querying' ? parseAttemptQueueInfo(attempt.stdout) : null;
-            const dot = attempt.status === 'succeeded' ? 'done'
-              : ['submitting', 'querying'].includes(attempt.status) ? 'running'
-              : attempt.status === 'failed' ? 'fail' : 'idle';
-            const modelLabel = executionModelLabel(attempt);
-            return (
-              <div key={attempt.id} className="attempts-modal-row">
-                <span className={`qc-attempt-dot ${dot}`} />
-                <div className="attempts-modal-row-main">
-                  <div className="attempts-modal-row-top">
-                    <span className="attempts-modal-label">
-                      {statusLabel(attempt.status)}
-                      {modelLabel ? ` · ${modelLabel}` : ''}
-                    </span>
-                    <span className="attempts-modal-time">{formatDate(attempt.finished_at || attempt.started_at)}</span>
-                  </div>
-                  {qi ? (
-                    <div className="attempts-modal-qi">
-                      <span>排队位置 <b>#{qi.queue_idx ?? '-'}</b> / {qi.queue_length != null ? qi.queue_length.toLocaleString() : '-'}</span>
-                      {qi.priority != null ? <span>优先级 {qi.priority}</span> : null}
-                      {qi.queue_status ? <span>{qi.queue_status}</span> : null}
-                    </div>
-                  ) : null}
-                  {attempt.error_detail ? <div className="attempts-modal-err">{attempt.error_detail}</div> : null}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function taskDisplayLabel(task) {
   if (!task) return '';
   const s = task.status || 'queued';
@@ -3710,7 +3223,7 @@ function StatusDot({ status, task }) {
   const dotClass = ['submitting', 'querying'].includes(normalized) ? 'running'
     : ['queued', 'scheduled', 'retry_wait'].includes(normalized) ? 'waiting'
     : normalized === 'succeeded' ? 'done'
-    : ['failed', 'blocked'].includes(normalized) ? 'fail'
+    : ['failed', 'blocked', 'schema_error'].includes(normalized) ? 'fail'
     : 'pending';
   return (
     <span className={`status-dot-pill ${normalized}`}>
@@ -4045,9 +3558,23 @@ function RoleEditPage({
                 <button type="button" className="add-tag-chip"><Plus size={14} /> 添加标签 <ChevronDown size={14} /></button>
               </div>
             </Field>
+            <Field label="系列">
+              <input value={roleForm.series} maxLength={80} onChange={(e) => setRoleForm({ ...roleForm, series: e.target.value })} placeholder="例如：两个显眼包、霸总和保镖" />
+            </Field>
             <Field label="别名">
               <input value={roleForm.aliases} onChange={(e) => setRoleForm({ ...roleForm, aliases: e.target.value })} placeholder="别名，逗号分隔" />
             </Field>
+            <label className="role-disabled-toggle">
+              <input
+                type="checkbox"
+                checked={Boolean(roleForm.disabled)}
+                onChange={(e) => setRoleForm({ ...roleForm, disabled: e.target.checked })}
+              />
+              <span>
+                <b>停用角色</b>
+                <em>停用后不会出现在资源管理器和 @ 素材选择中。</em>
+              </span>
+            </label>
             <Field label="角色描述">
               <div className="prompt-editor">
                 <textarea
@@ -4235,12 +3762,26 @@ function RoleEditModal({ mode, roleForm, setRoleForm, onSave, onCancel, chooseIn
               <button type="button" className="add-tag-chip"><Plus size={14} /> 添加标签 <ChevronDown size={14} /></button>
             </div>
           </Field>
+          <Field label="系列">
+            <input value={roleForm.series} maxLength={80} onChange={(e) => setRoleForm({ ...roleForm, series: e.target.value })} placeholder="例如：两个显眼包、霸总和保镖" />
+          </Field>
           <Field label="别名">
             <div className="input-with-count">
               <input value={roleForm.aliases} onChange={(e) => setRoleForm({ ...roleForm, aliases: e.target.value })} placeholder="别名，逗号分隔" />
               <span className="field-count">{roleForm.aliases.length}/50</span>
             </div>
           </Field>
+          <label className="role-disabled-toggle">
+            <input
+              type="checkbox"
+              checked={Boolean(roleForm.disabled)}
+              onChange={(e) => setRoleForm({ ...roleForm, disabled: e.target.checked })}
+            />
+            <span>
+              <b>停用角色</b>
+              <em>停用后不会出现在资源管理器和 @ 素材选择中。</em>
+            </span>
+          </label>
           <Field label="角色描述">
             <div className="prompt-editor">
               <textarea rows={3} value={roleForm.description} maxLength={1000}
@@ -4585,6 +4126,7 @@ function statusLabel(status) {
     succeeded: '成功',
     failed: '失败',
     blocked: '阻断',
+    schema_error: '数据异常',
     paused: '已暂停',
   };
   return labels[status] || status;
@@ -4595,520 +4137,6 @@ const IMAGE_SIZE_OPTIONS = [
   { value: '1024x1536', label: '2:3 · 1024×1536' },
   { value: '1536x1024', label: '3:2 · 1536×1024' },
 ];
-
-function imageGenItemSrc(item) {
-  if (!item?.storedPath) return '';
-  return resolveMediaSrc(item.storedPath);
-}
-
-function imageGenQueryMetaText(item) {
-  if (!item?.lastQueryAt) return '等待首次查询…';
-  const status = item.lastQueryStatus || 'unknown';
-  return `最近查询：${new Date(item.lastQueryAt).toLocaleTimeString()} · ${status}`;
-}
-
-function normalizeMentions(list) {
-  return list.map((item) => item.dataUrl || '');
-}
-
-function ImageGenView({
-  settingsForm,
-  history,
-  previewItem,
-  setPreviewItem,
-  state,
-  assetById,
-  importTempImages,
-  pasteClipboardImage,
-  pasteSystemClipboardImage,
-  refreshState,
-  setFeedback,
-}) {
-  const [imagegenForm, setImagegenForm] = useState(() => createEmptyImageGenForm());
-  const [generating, setGenerating] = useState(false);
-  const [error, setError] = useState('');
-  const [copyMsg, setCopyMsg] = useState('');
-  const [queryingImageIds, setQueryingImageIds] = useState({});
-  const [regeneratingImageIds, setRegeneratingImageIds] = useState({});
-  const [promptExpanded, setPromptExpanded] = useState(false);
-  const [imageModalSrc, setImageModalSrc] = useState(null);
-
-  useEffect(() => { setPromptExpanded(false); }, [previewItem?.id]);
-
-  const activeImageModel = normalizeImageModelSettingsForm(settingsForm).image_model_config;
-  const hasConfig = Boolean(activeImageModel?.api_key?.trim());
-  const promptIsEmpty = !imagegenForm.prompt?.trim();
-
-  // 预览项跟着 history 实时刷新（pending → completed 自动更新画面）
-  const livePreviewItem = useMemo(() => {
-    if (!previewItem) return null;
-    const fresh = history.find((h) => h.id === previewItem.id);
-    return fresh || previewItem;
-  }, [previewItem, history]);
-
-  // 用 ref 持有最新 refreshState，避免因函数引用变化导致 effect 反复重建
-  const refreshStateRef = useRef(refreshState);
-  refreshStateRef.current = refreshState;
-
-  // 只用 pendingIds 字符串作为 dep，而非整个 history 对象，避免 refreshState 后 history 引用
-  // 变化导致 effect cleanup→cancelled=true 把轮询提前终止
-  const pendingIds = useMemo(
-    () => history.filter((h) => h.status === 'pending').map((h) => h.id).join(','),
-    [history],
-  );
-
-  useEffect(() => {
-    if (!pendingIds) return;
-    const ids = pendingIds.split(',');
-    let cancelled = false;
-    let timer = null;
-    const tick = async () => {
-      for (const id of ids) {
-        if (cancelled) return;
-        try {
-          await invoke('query_image_task_command', { historyId: id });
-        } catch (err) {
-          console.warn('[imagegen] query task failed', id, err);
-        }
-      }
-      if (!cancelled) {
-        await refreshStateRef.current();
-        if (!cancelled) {
-          timer = setTimeout(tick, 3000);
-        }
-      }
-    };
-    timer = setTimeout(tick, 3000);
-    return () => {
-      cancelled = true;
-      if (timer) clearTimeout(timer);
-    };
-  }, [pendingIds]);
-
-  const mentionItems = useMemo(() => {
-    const items = buildMentionItems({
-      roles: state?.roles || [],
-      assetById: assetById || new Map(),
-      tempImagePaths: imagegenForm.temp_image_paths,
-      tempImageAssetIds: imagegenForm.temp_image_asset_ids,
-    });
-    return filterMentionItemsForImageGen(items);
-  }, [state?.roles, assetById, imagegenForm.temp_image_paths, imagegenForm.temp_image_asset_ids]);
-
-  const referenceAssets = useMemo(
-    () => (imagegenForm.image_asset_ids || []).map((id) => assetById?.get(id)).filter(Boolean),
-    [imagegenForm.image_asset_ids, assetById],
-  );
-
-  const handleEditorUpdate = useCallback(({ plainText, refs }) => {
-    if (refs?.imageAssetIds?.length) {
-      console.log('[imagegen] @mention imageAssetIds:', refs.imageAssetIds);
-    }
-    setImagegenForm((current) => {
-      const mentionIds = refs?.imageAssetIds || [];
-      const currentIds = current.image_asset_ids || [];
-      const toAdd = mentionIds.filter((id) => !currentIds.includes(id));
-      if (toAdd.length > 0) {
-        console.log('[imagegen] adding ids:', toAdd, 'new total:', [...currentIds, ...toAdd]);
-      }
-      if (toAdd.length === 0) {
-        // 仅文本变化，避免动 image_asset_ids 数组引用（防止编辑器联动重置）
-        if (current.prompt === plainText) return current;
-        return { ...current, prompt: plainText };
-      }
-      return {
-        ...current,
-        prompt: plainText,
-        image_asset_ids: [...currentIds, ...toAdd].slice(0, IMAGEGEN_MAX_REFERENCES),
-      };
-    });
-  }, []);
-
-  const handlePasteImageForEditor = useCallback(async (file) => {
-    const asset = await pasteClipboardImage(file);
-    setImagegenForm((current) => addReferenceAsset(current, asset));
-    return asset;
-  }, [pasteClipboardImage]);
-
-  const handlePasteSystemImageForEditor = useCallback(async () => {
-    const asset = await pasteSystemClipboardImage();
-    setImagegenForm((current) => addReferenceAsset(current, asset));
-    return asset;
-  }, [pasteSystemClipboardImage]);
-
-  async function handleAddTempImage() {
-    try {
-      const imported = await importTempImages();
-      if (!imported.length) return;
-      setImagegenForm((current) => {
-        let form = current;
-        for (const asset of imported) {
-          form = addReferenceAsset(form, asset);
-        }
-        return form;
-      });
-    } catch (err) {
-      setError(String(err));
-    }
-  }
-
-  async function generate() {
-    const promptText = imagegenForm.prompt?.trim();
-    if (!promptText) return;
-    setGenerating(true);
-    setError('');
-    try {
-      const refIds = (imagegenForm.image_asset_ids || []).length > 0
-        ? imagegenForm.image_asset_ids
-        : undefined;
-      const item = await invoke('generate_image_command', {
-        prompt: promptText,
-        size: imagegenForm.size,
-        referenceAssetIds: refIds,
-      });
-      await refreshState();
-      setPreviewItem(item);
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setGenerating(false);
-    }
-  }
-
-  async function downloadItem(item) {
-    try {
-      const path = await invoke('download_imagegen_image_command', { historyId: item.id });
-      setError('');
-      setFeedback(`已保存图片：${path}`);
-    } catch (err) {
-      setError(`下载图片失败：${String(err)}`);
-    }
-  }
-
-  async function copyItem(item) {
-    try {
-      await invoke('copy_imagegen_image_command', { historyId: item.id });
-      setCopyMsg(item.id);
-      setTimeout(() => setCopyMsg(''), 2000);
-    } catch (err) {
-      setError(`复制图片失败：${String(err)}`);
-    }
-  }
-
-  async function retryQueryItem(item) {
-    setQueryingImageIds((prev) => ({ ...prev, [item.id]: true }));
-    setError('');
-    try {
-      const updated = await invoke('retry_query_image_task_command', { historyId: item.id });
-      await refreshState();
-      setPreviewItem(updated);
-    } catch (err) {
-      await refreshState();
-      setError(`重新查询失败：${String(err)}`);
-    } finally {
-      setQueryingImageIds((prev) => ({ ...prev, [item.id]: false }));
-    }
-  }
-
-  async function regenerateItem(item) {
-    setRegeneratingImageIds((prev) => ({ ...prev, [item.id]: true }));
-    setError('');
-    try {
-      const updated = await invoke('regenerate_image_command', { historyId: item.id });
-      await refreshState();
-      setPreviewItem(updated);
-    } catch (err) {
-      await refreshState();
-      setError(`重新生成失败：${String(err)}`);
-    } finally {
-      setRegeneratingImageIds((prev) => ({ ...prev, [item.id]: false }));
-    }
-  }
-
-  async function deleteItem(id) {
-    try {
-      await invoke('delete_imagegen_history_item_command', { id });
-      await refreshState();
-      if (previewItem?.id === id) setPreviewItem(null);
-    } catch (err) {
-      setError(String(err));
-    }
-  }
-
-  async function clearHistory() {
-    try {
-      await invoke('clear_imagegen_history_command');
-      await refreshState();
-      setPreviewItem(null);
-    } catch (err) {
-      setError(String(err));
-    }
-  }
-
-  function handleImageGenContextMenu(event) {
-    if (shouldSuppressImageContextMenu(event.target)) {
-      event.preventDefault();
-    }
-  }
-
-  return (
-    <div onContextMenu={handleImageGenContextMenu}>
-    <div className="imagegen-layout">
-      <div className="imagegen-main">
-        <div className="panel imagegen-panel">
-          <PanelHeading title="图片生成" />
-          {!hasConfig && (
-            <p className="imagegen-no-config">
-              <AlertCircle size={14} /> 请先在设置中配置「图片生成模型」API Key
-            </p>
-          )}
-          <div className="imagegen-form">
-            <div className="imagegen-input-row">
-              <div className="imagegen-ref-sidebar">
-                {referenceAssets.map((asset, idx) => (
-                  <div key={asset.id} className="imagegen-ref-thumb-wrap">
-                    <img
-                      src={resolveMediaSrc(asset.stored_path)}
-                      alt={asset.name}
-                      className="imagegen-ref-thumb"
-                    />
-                    <button
-                      type="button"
-                      className="imagegen-ref-remove"
-                      title="移除参考图"
-                      onClick={() => setImagegenForm((current) => removeReferenceAsset(current, asset.id, assetById))}
-                    >
-                      <X size={10} />
-                    </button>
-                  </div>
-                ))}
-                {referenceAssets.length < IMAGEGEN_MAX_REFERENCES && (
-                  <button type="button" className="imagegen-ref-add-btn" title="添加参考图" onClick={handleAddTempImage}>
-                    <ImagePlus size={15} />
-                  </button>
-                )}
-              </div>
-              <PromptMentionEditor
-                value={imagegenForm.prompt}
-                promptDoc={imagegenForm.prompt_doc}
-                mentionItems={mentionItems}
-                maxLength={8000}
-                placeholder="描述想要生成的图片，输入 @ 可引用素材图…"
-                onUpdate={handleEditorUpdate}
-                onPasteImage={handlePasteImageForEditor}
-                onPasteSystemImage={handlePasteSystemImageForEditor}
-                tempImagePaths={imagegenForm.temp_image_paths}
-              />
-            </div>
-            <div className="imagegen-controls">
-              <select
-                value={imagegenForm.size}
-                onChange={(e) => setImagegenForm((f) => ({ ...f, size: e.target.value }))}
-              >
-                {IMAGE_SIZE_OPTIONS.map((o) => (
-                  <option key={o.value} value={o.value}>{o.label}</option>
-                ))}
-              </select>
-              <button
-                type="button"
-                className="gradient-button"
-                onClick={generate}
-                disabled={generating || promptIsEmpty || !hasConfig}
-              >
-                {generating
-                  ? <><Loader2 size={14} className="spin" /> 生成中…</>
-                  : <><Sparkles size={14} /> 生成</>}
-              </button>
-            </div>
-            {error && <p className="imagegen-error"><AlertCircle size={13} /> {error}</p>}
-          </div>
-
-          {livePreviewItem && (
-            <div className="imagegen-preview">
-              <div className="imagegen-preview-header">
-                <span className="imagegen-preview-title">预览{livePreviewItem.status === 'pending' ? ' · 生成中' : livePreviewItem.status === 'failed' ? ' · 失败' : ''}</span>
-                <button type="button" className="icon-ghost" title="关闭" onClick={() => setPreviewItem(null)}>
-                  <X size={14} />
-                </button>
-              </div>
-              {livePreviewItem.status === 'pending' ? (
-                <div className="imagegen-preview-img imagegen-preview-pending">
-                  <Loader2 size={32} className="spin" />
-                  <span style={{marginTop:8, fontSize:12, color:'var(--muted)'}}>异步生成中，请稍候…</span>
-                  <span style={{marginTop:4, fontSize:12, color:'var(--muted)'}}>{imageGenQueryMetaText(livePreviewItem)}</span>
-                </div>
-              ) : livePreviewItem.status === 'failed' ? (
-                <div className="imagegen-preview-img imagegen-preview-pending">
-                  <AlertCircle size={32} style={{color:'#e03c3c'}} />
-                  <span style={{marginTop:8, fontSize:12, color:'#e03c3c', textAlign:'center', padding:'0 12px'}}>{livePreviewItem.error || '生成失败'}</span>
-                </div>
-              ) : (
-                <img
-                  src={imageGenItemSrc(livePreviewItem)}
-                  alt={livePreviewItem.prompt}
-                  className="imagegen-preview-img"
-                />
-              )}
-              {livePreviewItem.status === 'completed' && (
-                <div className="imagegen-preview-actions">
-                  <button type="button" className="outline-button" onClick={() => copyItem(livePreviewItem)}>
-                    <Copy size={13} /> {copyMsg === livePreviewItem.id ? '已复制！' : '复制图片'}
-                  </button>
-                  <button type="button" className="outline-button" onClick={() => setImageModalSrc(imageGenItemSrc(livePreviewItem))}>
-                    <ZoomIn size={13} /> 查看大图
-                  </button>
-                  <button type="button" className="outline-button" onClick={() => downloadItem(livePreviewItem)}>
-                    <Download size={13} /> 下载
-                  </button>
-                  <button type="button" className="outline-button" onClick={() => regenerateItem(livePreviewItem)} disabled={regeneratingImageIds[livePreviewItem.id]}>
-                    {regeneratingImageIds[livePreviewItem.id]
-                      ? <><Loader2 size={13} className="spin" /> 生成中…</>
-                      : <><Sparkles size={13} /> 重新生成</>}
-                  </button>
-                </div>
-              )}
-              {livePreviewItem.status === 'failed' && livePreviewItem.taskId && (
-                <div className="imagegen-preview-actions">
-                  <button type="button" className="outline-button" onClick={() => retryQueryItem(livePreviewItem)} disabled={queryingImageIds[livePreviewItem.id]}>
-                    {queryingImageIds[livePreviewItem.id]
-                      ? <><Loader2 size={13} className="spin" /> 查询中…</>
-                      : <><RefreshCcw size={13} /> 重新查询</>}
-                  </button>
-                  <button type="button" className="outline-button" onClick={() => regenerateItem(livePreviewItem)} disabled={regeneratingImageIds[livePreviewItem.id]}>
-                    {regeneratingImageIds[livePreviewItem.id]
-                      ? <><Loader2 size={13} className="spin" /> 生成中…</>
-                      : <><Sparkles size={13} /> 重新生成</>}
-                  </button>
-                </div>
-              )}
-              <p className="imagegen-preview-meta">{livePreviewItem.size} · {new Date(livePreviewItem.createdAt).toLocaleString()}</p>
-              {livePreviewItem.prompt && (
-                <div className="imagegen-preview-prompt-wrap">
-                  <div className="imagegen-preview-prompt-header">
-                    <span className="imagegen-preview-refs-label">提示词</span>
-                    <button
-                      type="button"
-                      className="icon-ghost mini"
-                      title="复制提示词"
-                      onClick={() => { navigator.clipboard.writeText(livePreviewItem.prompt).catch(() => {}); setCopyMsg(`prompt_${livePreviewItem.id}`); setTimeout(() => setCopyMsg(''), 2000); }}
-                    >
-                      {copyMsg === `prompt_${livePreviewItem.id}` ? <span style={{fontSize:10}}>已复制</span> : <Copy size={11} />}
-                    </button>
-                  </div>
-                  <div className={`imagegen-preview-prompt${promptExpanded ? ' expanded' : ''}`}>
-                    {livePreviewItem.prompt}
-                  </div>
-                  {livePreviewItem.prompt.length > 150 && (
-                    <button type="button" className="imagegen-prompt-toggle" onClick={() => setPromptExpanded((v) => !v)}>
-                      {promptExpanded ? '收起' : '展开全部'}
-                    </button>
-                  )}
-                </div>
-              )}
-              {livePreviewItem.referenceAssetIds?.length > 0 && (
-                <div className="imagegen-preview-refs">
-                  <span className="imagegen-preview-refs-label">参考图</span>
-                  <div className="imagegen-ref-list">
-                    {livePreviewItem.referenceAssetIds.map((id) => {
-                      const asset = assetById?.get(id);
-                      if (!asset) return null;
-                      return (
-                        <div key={id} className="imagegen-ref-thumb-wrap">
-                          <img src={resolveMediaSrc(asset.stored_path)} alt={asset.name} className="imagegen-ref-thumb" />
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      </div>
-
-      <div className="panel imagegen-history">
-        <PanelHeading
-          title={`历史记录（${history.length}）`}
-          action={history.length > 0
-            ? <button type="button" className="outline-button" onClick={clearHistory}>清空</button>
-            : null}
-        />
-        {history.length === 0 && <p className="empty-cell">暂无记录</p>}
-        <div className="imagegen-history-list">
-          {history.map((item) => (
-            <div
-              key={item.id}
-              className={`imagegen-history-item${previewItem?.id === item.id ? ' active' : ''}`}
-            >
-              <div className="imagegen-thumb-wrap">
-                {item.status === 'pending' ? (
-                  <div className="imagegen-thumb imagegen-thumb-pending"><Loader2 size={18} className="spin" /></div>
-                ) : item.status === 'failed' ? (
-                  <div className="imagegen-thumb imagegen-thumb-failed" title={item.error || '生成失败'}><AlertCircle size={18} /></div>
-                ) : (
-                  <>
-                    <img src={imageGenItemSrc(item)} alt={item.prompt} className="imagegen-thumb" />
-                    <button
-                      type="button"
-                      className="imagegen-thumb-zoom"
-                      title="查看大图"
-                      onClick={(e) => { e.stopPropagation(); setImageModalSrc(imageGenItemSrc(item)); }}
-                    >
-                      <ZoomIn size={14} />
-                    </button>
-                  </>
-                )}
-                {item.referenceAssetIds?.length > 0 && (
-                  <span className="imagegen-ref-badge">{item.referenceAssetIds.length}</span>
-                )}
-              </div>
-              <div className="imagegen-history-meta imagegen-history-meta-clickable" onClick={() => setPreviewItem(item)}>
-                <span className="imagegen-history-prompt">{item.prompt.length > 60 ? item.prompt.slice(0, 60) + '…' : item.prompt}</span>
-                <span className="imagegen-history-time">
-                  {new Date(item.createdAt).toLocaleString()} · {item.size}
-                  {item.status === 'pending' ? ` · ${imageGenQueryMetaText(item)}` : ''}
-                </span>
-              </div>
-              <div className="imagegen-history-actions" onClick={(e) => e.stopPropagation()}>
-                {item.status === 'completed' && (
-                  <>
-                    <button type="button" className="icon-ghost mini" title="复制" onClick={(e) => { e.preventDefault(); e.stopPropagation(); copyItem(item); }}>
-                      <Copy size={12} />
-                    </button>
-                    <button type="button" className="icon-ghost mini" title="下载" onClick={(e) => { e.preventDefault(); e.stopPropagation(); downloadItem(item); }}>
-                      <Download size={12} />
-                    </button>
-                    <button type="button" className="icon-ghost mini" title="重新生成" disabled={regeneratingImageIds[item.id]} onClick={(e) => { e.preventDefault(); e.stopPropagation(); regenerateItem(item); }}>
-                      {regeneratingImageIds[item.id] ? <Loader2 size={12} className="spin" /> : <Sparkles size={12} />}
-                    </button>
-                    <button type="button" className="icon-ghost mini" title="保存为角色" onClick={(e) => { e.preventDefault(); e.stopPropagation(); handleSaveAsRole(item.storedPath); }}>
-                      <User size={12} />
-                    </button>
-                  </>
-                )}
-                {item.status === 'failed' && item.taskId && (
-                  <>
-                    <button type="button" className="icon-ghost mini" title="重新查询" disabled={queryingImageIds[item.id]} onClick={(e) => { e.preventDefault(); e.stopPropagation(); retryQueryItem(item); }}>
-                      {queryingImageIds[item.id] ? <Loader2 size={12} className="spin" /> : <RefreshCcw size={12} />}
-                    </button>
-                    <button type="button" className="icon-ghost mini" title="重新生成" disabled={regeneratingImageIds[item.id]} onClick={(e) => { e.preventDefault(); e.stopPropagation(); regenerateItem(item); }}>
-                      {regeneratingImageIds[item.id] ? <Loader2 size={12} className="spin" /> : <Sparkles size={12} />}
-                    </button>
-                  </>
-                )}
-                <button type="button" className="icon-ghost mini" title="删除" onClick={(e) => { e.preventDefault(); e.stopPropagation(); deleteItem(item.id); }}>
-                  <Trash2 size={12} />
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-    </div>
-    <ImageModal src={imageModalSrc} alt="" onClose={() => setImageModalSrc(null)} onCopy={() => { const item = history.find(h => imageGenItemSrc(h) === imageModalSrc); if (item) return copyItem(item); }} />
-    </div>
-  );
-}
 
 class AppErrorBoundary extends React.Component {
   constructor(props) {

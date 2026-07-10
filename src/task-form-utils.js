@@ -101,7 +101,7 @@ export function getRoleEditorMedia(mode, selectedRoleMedia, roleForm) {
 }
 
 export function createEmptyRoleForm() {
-  return { id: '', name: '', aliases: '', tags: '', description: '', imagePath: '', audioPath: '' };
+  return { id: '', name: '', aliases: '', tags: '', series: '', description: '', disabled: false, imagePath: '', audioPath: '' };
 }
 
 export function roleToEditorForm(role) {
@@ -111,7 +111,9 @@ export function roleToEditorForm(role) {
     name: role.name || '',
     aliases: role.aliases?.join('，') || '',
     tags: role.tags?.join('，') || '',
+    series: role.series || '',
     description: role.description || '',
+    disabled: Boolean(role.disabled),
     imagePath: '',
     audioPath: '',
   };

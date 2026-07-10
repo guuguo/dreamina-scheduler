@@ -23,7 +23,7 @@ fn image_asset(id: &str, name: &str, path: &str) -> Asset {
         duration_seconds: None,
         created_at: String::new(),
         content_hash: None,
-    last_used_at: None,
+        last_used_at: None,
     }
 }
 
@@ -88,7 +88,7 @@ fn audio_asset(id: &str, name: &str, path: &str) -> Asset {
         duration_seconds: Some(4.0),
         created_at: String::new(),
         content_hash: None,
-    last_used_at: None,
+        last_used_at: None,
     }
 }
 
@@ -292,7 +292,8 @@ fn mcp_queue_videos_accepts_batch_aliases() {
         "startAt": "2026-06-22T12:00:00+08:00",
         "defaults": {
             "aspectRatio": "landscape",
-            "plannedSubmitCount": 2
+            "plannedSubmitCount": 2,
+            "alternateFastModel": true
         },
         "tasks": [
             {
@@ -309,6 +310,7 @@ fn mcp_queue_videos_accepts_batch_aliases() {
     assert_eq!(input.start_at.as_deref(), Some("2026-06-22T12:00:00+08:00"));
     assert_eq!(input.defaults.orientation.as_deref(), Some("landscape"));
     assert_eq!(input.defaults.planned_submit_count, Some(2));
+    assert_eq!(input.defaults.alternate_fast_model, Some(true));
     assert_eq!(
         input.items[0].image_paths,
         vec!["/tmp/act2_storyboard.png", "/tmp/characters.png"]
@@ -375,12 +377,14 @@ fn mcp_queue_videos_applies_batch_defaults_and_shared_start_time() {
         &assets_dir,
         McpQueueVideosInput {
             start_at: Some(start_at.clone()),
+            alternate_fast_model: false,
             defaults: McpVideoTaskDefaults {
                 orientation: Some("portrait".to_string()),
                 model: Some("standard".to_string()),
                 duration: Some(15),
                 video_resolution: Some("720p".to_string()),
                 planned_submit_count: Some(2),
+                alternate_fast_model: None,
             },
             items: vec![
                 McpVideoTaskInput {
@@ -415,6 +419,65 @@ fn mcp_queue_videos_applies_batch_defaults_and_shared_start_time() {
 }
 
 #[test]
+fn mcp_queue_videos_can_alternate_standard_and_fast_models() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let source_dir = temp.path().join("source");
+    let assets_dir = temp.path().join("assets");
+    std::fs::create_dir_all(&source_dir).expect("create source dir");
+    let image_a = source_dir.join("a.png");
+    let image_b = source_dir.join("b.png");
+    let image_c = source_dir.join("c.png");
+    std::fs::write(&image_a, b"fake-png-a").expect("write image a");
+    std::fs::write(&image_b, b"fake-png-b").expect("write image b");
+    std::fs::write(&image_c, b"fake-png-c").expect("write image c");
+    let mut data = AppData::default();
+
+    let queued = queue_mcp_video_tasks(
+        &mut data,
+        &assets_dir,
+        McpQueueVideosInput {
+            alternate_fast_model: true,
+            defaults: McpVideoTaskDefaults {
+                orientation: Some("portrait".to_string()),
+                model: Some("standard".to_string()),
+                duration: Some(15),
+                video_resolution: Some("720p".to_string()),
+                planned_submit_count: Some(1),
+                alternate_fast_model: None,
+            },
+            items: vec![
+                McpVideoTaskInput {
+                    title: "第一条".to_string(),
+                    prompt: "第一条 prompt".to_string(),
+                    image_paths: vec![image_a.to_string_lossy().to_string()],
+                    ..McpVideoTaskInput::default()
+                },
+                McpVideoTaskInput {
+                    title: "第二条".to_string(),
+                    prompt: "第二条 prompt".to_string(),
+                    image_paths: vec![image_b.to_string_lossy().to_string()],
+                    ..McpVideoTaskInput::default()
+                },
+                McpVideoTaskInput {
+                    title: "第三条显式标准".to_string(),
+                    prompt: "第三条 prompt".to_string(),
+                    image_paths: vec![image_c.to_string_lossy().to_string()],
+                    model: Some("standard".to_string()),
+                    ..McpVideoTaskInput::default()
+                },
+            ],
+            ..McpQueueVideosInput::default()
+        },
+    )
+    .expect("queue mcp batch with alternating fast model");
+
+    assert_eq!(queued.len(), 3);
+    assert_eq!(data.tasks[0].params.model_version, "seedance2.0");
+    assert_eq!(data.tasks[1].params.model_version, "seedance2.0fast");
+    assert_eq!(data.tasks[2].params.model_version, "seedance2.0");
+}
+
+#[test]
 fn command_uses_only_prompt_mentioned_assets_and_rewrites_mentions_inline() {
     let task = TaskDraft {
         title: "semantic mentions".to_string(),
@@ -433,7 +496,7 @@ fn command_uses_only_prompt_mentioned_assets_and_rewrites_mentions_inline() {
         scheduled_at: None,
         temp_image_asset_ids: vec!["temp-1".to_string()],
         temp_image_paths: vec!["/tmp/shot.png".to_string()],
-            prompt_doc: None,
+        prompt_doc: None,
     };
     let assets = vec![
         image_asset("temp-1", "粘贴图片", "/tmp/shot.png"),
@@ -446,7 +509,9 @@ fn command_uses_only_prompt_mentioned_assets_and_rewrites_mentions_inline() {
         name: "女主".to_string(),
         aliases: vec![],
         tags: vec![],
+        series: String::new(),
         description: String::new(),
+        disabled: false,
         asset_ids: vec![
             "img-chef".to_string(),
             "img-unused".to_string(),
@@ -577,7 +642,7 @@ fn multimodal_command_uses_only_images_and_audio_for_mvp() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
-            prompt_doc: None,
+        prompt_doc: None,
     };
     let assets = vec![
         image_asset("img-1", "警车威威", "/tmp/role.png"),
@@ -609,7 +674,7 @@ fn multimodal_prompt_rewrites_image_mentions_inline() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
-            prompt_doc: None,
+        prompt_doc: None,
     };
     let assets = vec![
         image_asset("img-1", "女主小雅", "/tmp/xiaoya.png"),
@@ -643,7 +708,7 @@ fn multimodal_prompt_rewrites_ordered_image_and_audio_mentions_inline() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
-            prompt_doc: None,
+        prompt_doc: None,
     };
     let assets = vec![
         image_asset("img-1", "素材名A", "/tmp/a.png"),
@@ -681,7 +746,7 @@ fn storyboard_mentions_use_temp_images_not_role_image_order() {
         scheduled_at: None,
         temp_image_asset_ids: vec!["storyboard-temp".to_string()],
         temp_image_paths: vec!["/tmp/storyboard.png".to_string()],
-            prompt_doc: None,
+        prompt_doc: None,
     };
     let assets = vec![
         image_asset("storyboard-temp", "粘贴图片", "/tmp/storyboard.png"),
@@ -694,7 +759,9 @@ fn storyboard_mentions_use_temp_images_not_role_image_order() {
             name: "女主".to_string(),
             aliases: vec![],
             tags: vec![],
+            series: String::new(),
             description: String::new(),
+            disabled: false,
             asset_ids: vec!["hero-home".to_string()],
             created_at: String::new(),
             updated_at: String::new(),
@@ -704,7 +771,9 @@ fn storyboard_mentions_use_temp_images_not_role_image_order() {
             name: "黑白猫和灰猫".to_string(),
             aliases: vec![],
             tags: vec![],
+            series: String::new(),
             description: String::new(),
+            disabled: false,
             asset_ids: vec!["cat-ref".to_string()],
             created_at: String::new(),
             updated_at: String::new(),
@@ -739,7 +808,7 @@ fn picture_number_mentions_use_temp_images_as_command_inputs() {
         scheduled_at: None,
         temp_image_asset_ids: vec!["temp-digger".to_string()],
         temp_image_paths: vec!["/tmp/digger.png".to_string()],
-            prompt_doc: None,
+        prompt_doc: None,
     };
     let assets = vec![image_asset(
         "temp-digger",
@@ -778,7 +847,7 @@ fn rejects_unsupported_ratio_before_command_build() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
-            prompt_doc: None,
+        prompt_doc: None,
     };
     let assets = vec![image_asset("img-1", "角色图", "/tmp/role.png")];
     let resolved = resolve_task_inputs(&task, &assets, &[]).expect("inputs resolve");
@@ -801,7 +870,7 @@ fn auto_match_does_not_add_unmentioned_role_media_to_command_inputs() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
-            prompt_doc: None,
+        prompt_doc: None,
     };
     let assets = vec![image_asset("img-wewei", "威威正面", "/tmp/wewei.png")];
     let roles = vec![Role {
@@ -809,7 +878,9 @@ fn auto_match_does_not_add_unmentioned_role_media_to_command_inputs() {
         name: "警车威威".to_string(),
         aliases: vec!["威威".to_string()],
         tags: vec!["警车".to_string()],
+        series: String::new(),
         description: "蓝白警车".to_string(),
+        disabled: false,
         asset_ids: vec!["img-wewei".to_string()],
         created_at: String::new(),
         updated_at: String::new(),
@@ -838,7 +909,7 @@ fn manual_role_mentions_do_not_bind_assets_without_asset_reference() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
-            prompt_doc: None,
+        prompt_doc: None,
     };
     let assets = vec![image_asset("img-wewei", "威威正面", "/tmp/wewei.png")];
     let roles = vec![Role {
@@ -846,7 +917,48 @@ fn manual_role_mentions_do_not_bind_assets_without_asset_reference() {
         name: "警车威威".to_string(),
         aliases: vec![],
         tags: vec![],
+        series: String::new(),
         description: "".to_string(),
+        disabled: false,
+        asset_ids: vec!["img-wewei".to_string()],
+        created_at: String::new(),
+        updated_at: String::new(),
+    }];
+
+    let result = resolve_task_inputs(&task, &assets, &roles);
+
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("至少需要 1 个图片"));
+}
+
+#[test]
+fn disabled_role_mentions_do_not_bind_role_assets() {
+    let task = TaskDraft {
+        title: "disabled mentions".to_string(),
+        prompt: "@警车威威 正面巡逻".to_string(),
+        image_asset_ids: vec![],
+        audio_asset_ids: vec![],
+        role_ids: vec![],
+        manual_mention_ids: vec![],
+        auto_match_roles: false,
+        params: VideoParams::default(),
+        scheduled_at: None,
+        temp_image_asset_ids: vec![],
+        temp_image_paths: vec![],
+        prompt_doc: None,
+    };
+    let assets = vec![image_asset("img-wewei", "威威正面", "/tmp/wewei.png")];
+    let roles = vec![Role {
+        id: "role-wewei".to_string(),
+        name: "警车威威".to_string(),
+        aliases: vec![],
+        tags: vec![],
+        series: "显眼包".to_string(),
+        description: String::new(),
+        disabled: true,
         asset_ids: vec!["img-wewei".to_string()],
         created_at: String::new(),
         updated_at: String::new(),
@@ -876,6 +988,8 @@ fn classifies_concurrency_limit_for_silent_retry_policy() {
         ai_model_configs: SchedulerSettings::default().ai_model_configs,
         active_ai_model_id: SchedulerSettings::default().active_ai_model_id,
         prevent_sleep: true,
+        standard_lane_enabled: true,
+        fast_lane_enabled: true,
         image_model_configs: SchedulerSettings::default().image_model_configs,
         active_image_model_id: SchedulerSettings::default().active_image_model_id,
         image_model_config: SchedulerSettings::default().image_model_config,
@@ -917,7 +1031,7 @@ fn rejects_video_asset_type() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
-            prompt_doc: None,
+        prompt_doc: None,
     };
     let video_asset = Asset {
         id: "vid-1".to_string(),
@@ -932,7 +1046,7 @@ fn rejects_video_asset_type() {
         duration_seconds: Some(5.0),
         created_at: String::new(),
         content_hash: None,
-    last_used_at: None,
+        last_used_at: None,
     };
     let assets = vec![image_asset("img-1", "角色图", "/tmp/role.png"), video_asset];
     let result = resolve_task_inputs(&task, &assets, &[]);
@@ -953,7 +1067,7 @@ fn missing_asset_id_returns_error() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
-            prompt_doc: None,
+        prompt_doc: None,
     };
     let result = resolve_task_inputs(&task, &[], &[]);
     assert!(result.is_err());
@@ -974,7 +1088,7 @@ fn role_ids_are_ignored_by_command_input_resolution() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
-            prompt_doc: None,
+        prompt_doc: None,
     };
     let assets = vec![image_asset("img-1", "角色图", "/tmp/role.png")];
     let result = resolve_task_inputs(&task, &assets, &[]);
@@ -996,7 +1110,7 @@ fn no_image_input_returns_error() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
-            prompt_doc: None,
+        prompt_doc: None,
     };
     let result = resolve_task_inputs(&task, &[], &[]);
     assert!(result.is_err());
@@ -1031,7 +1145,7 @@ fn too_many_images_returns_error() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
-            prompt_doc: None,
+        prompt_doc: None,
     };
     let result = resolve_task_inputs(&task, &assets, &[]);
     assert!(result.is_err());
@@ -1063,7 +1177,7 @@ fn too_many_audio_returns_error() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
-            prompt_doc: None,
+        prompt_doc: None,
     };
     let result = resolve_task_inputs(&task, &assets, &[]);
     assert!(result.is_err());
@@ -1089,7 +1203,7 @@ fn rejects_unsupported_model_version() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
-            prompt_doc: None,
+        prompt_doc: None,
     };
     let assets = vec![image_asset("img-1", "角色图", "/tmp/role.png")];
     let resolved = resolve_task_inputs(&task, &assets, &[]).expect("inputs resolve");
@@ -1116,7 +1230,7 @@ fn rejects_unsupported_duration() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
-            prompt_doc: None,
+        prompt_doc: None,
     };
     let assets = vec![image_asset("img-1", "角色图", "/tmp/role.png")];
     let resolved = resolve_task_inputs(&task, &assets, &[]).expect("inputs resolve");
@@ -1143,7 +1257,7 @@ fn rejects_unsupported_resolution() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
-            prompt_doc: None,
+        prompt_doc: None,
     };
     let assets = vec![image_asset("img-1", "角色图", "/tmp/role.png")];
     let resolved = resolve_task_inputs(&task, &assets, &[]).expect("inputs resolve");
@@ -1165,7 +1279,7 @@ fn duplicate_at_mentions_do_not_produce_duplicate_asset_ids() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
-            prompt_doc: None,
+        prompt_doc: None,
     };
     let assets = vec![image_asset("img-wewei", "威威正面", "/tmp/wewei.png")];
     let roles = vec![Role {
@@ -1173,7 +1287,9 @@ fn duplicate_at_mentions_do_not_produce_duplicate_asset_ids() {
         name: "警车威威".to_string(),
         aliases: vec![],
         tags: vec![],
+        series: String::new(),
         description: String::new(),
+        disabled: false,
         asset_ids: vec!["img-wewei".to_string()],
         created_at: String::new(),
         updated_at: String::new(),
@@ -1198,7 +1314,7 @@ fn auto_match_off_does_not_bind_role_media() {
         scheduled_at: None,
         temp_image_asset_ids: vec![],
         temp_image_paths: vec![],
-            prompt_doc: None,
+        prompt_doc: None,
     };
     let assets = vec![
         image_asset("img-1", "角色图", "/tmp/role.png"),
@@ -1209,7 +1325,9 @@ fn auto_match_off_does_not_bind_role_media() {
         name: "警车威威".to_string(),
         aliases: vec![],
         tags: vec![],
+        series: String::new(),
         description: String::new(),
+        disabled: false,
         asset_ids: vec!["img-wewei".to_string()],
         created_at: String::new(),
         updated_at: String::new(),
@@ -1283,6 +1401,18 @@ fn timeout_error_classified_as_transient() {
     let classified = classify_dreamina_error("context deadline exceeded", &settings);
     assert_eq!(classified.kind, DreaminaErrorKind::Transient);
     assert_eq!(classified.next_status, "retry_wait");
+}
+
+#[test]
+fn authsdk_transport_error_classified_as_network_unavailable() {
+    let settings = SchedulerSettings::default();
+    let classified = classify_dreamina_error(
+        "authsdk: refresh failed: protocol transport: do request",
+        &settings,
+    );
+    assert_eq!(classified.kind, DreaminaErrorKind::NetworkUnavailable);
+    assert_eq!(classified.next_status, "retry_wait");
+    assert!(classified.retry_after_seconds.is_some());
 }
 
 #[test]

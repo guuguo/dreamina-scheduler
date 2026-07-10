@@ -7,7 +7,7 @@ const WAITING_STATUSES = ['draft', 'queued', 'scheduled'];
 const RUNNING_STATUSES = ['submitting', 'submitted', 'querying'];
 const RETRY_STATUSES = ['retry_wait'];
 const DONE_STATUSES = ['succeeded'];
-const FAILED_STATUSES = ['failed'];
+const FAILED_STATUSES = ['failed', 'schema_error'];
 const PAUSED_STATUSES = ['paused'];
 
 /** Returns the tab group key for a given task status. */
@@ -120,7 +120,7 @@ export function deriveTaskFlowSteps(task) {
 }
 
 export function canDeleteTask(task) {
-  return ['draft', 'succeeded', 'failed', 'paused'].includes(task?.status);
+  return !['submitting', 'submitted', 'querying'].includes(task?.status);
 }
 
 export function getTaskResultItems(task) {
@@ -216,7 +216,12 @@ export function deriveTaskDispatchInfo(task, {
   const isDueNextRun = Number.isFinite(nextTime) && nextTime <= nowMs;
   const cooldownTime = concurrencyCooldownUntil ? new Date(concurrencyCooldownUntil).getTime() : NaN;
   const hasFutureConcurrencyCooldown = Number.isFinite(cooldownTime) && cooldownTime > nowMs;
-  const fallbackCheckText = `${schedulerTickSeconds} 秒内检查`;
+  const safeSchedulerTickSeconds = Math.max(1, Number(schedulerTickSeconds || 30));
+  const fallbackCheckAtMs = nowMs + safeSchedulerTickSeconds * 1000;
+  const fallbackCheckAt = new Date(fallbackCheckAtMs).toISOString();
+  const fallbackWithinText = formatDispatchWithin(safeSchedulerTickSeconds);
+  const fallbackCheckText = `约 ${fallbackWithinText}检查`;
+  const fallbackCheckSummary = `${formatDispatchClock(fallbackCheckAtMs)} 前后`;
 
   if (status === 'scheduled') {
     return {
@@ -278,6 +283,10 @@ export function deriveTaskDispatchInfo(task, {
   }
 
   if (status === 'queued') {
+    const routeLabel = task?.params?.model_version === 'seedance2.0fast' ? 'Fast' : '标准';
+    const nextSummary = nextRunAt && isFutureNextRun
+      ? `${formatDispatchClock(nextTime)} 前后`
+      : fallbackCheckSummary;
     return {
       status,
       attemptCount,
@@ -285,10 +294,11 @@ export function deriveTaskDispatchInfo(task, {
       concurrencyRetryCount,
       concurrencyRetryText,
       nextLabel: nextRunAt ? '下次尝试' : '下次检查',
-      nextAt: nextRunAt || '',
+      nextAt: nextRunAt || fallbackCheckAt,
       nextText: isDueNextRun ? '即将尝试' : fallbackCheckText,
-      reason: nextRunAt && isFutureNextRun ? '等待调度窗口' : '等待调度器空闲',
-      compactText: `尝试 ${attemptCount} 次 · ${nextRunAt && isFutureNextRun ? '等待窗口' : fallbackCheckText}`,
+      nextSummary,
+      reason: nextRunAt && isFutureNextRun ? `等待调度窗口，预计 ${nextSummary}走${routeLabel}` : `预计 ${nextSummary}调度，走${routeLabel}车道`,
+      compactText: `尝试 ${attemptCount} 次 · ${nextRunAt && isFutureNextRun ? nextSummary : fallbackCheckText}`,
     };
   }
 
@@ -304,6 +314,23 @@ export function deriveTaskDispatchInfo(task, {
     reason: '',
     compactText: attemptCount ? `尝试 ${attemptCount} 次` : '',
   };
+}
+
+function formatDispatchWithin(seconds) {
+  const safeSeconds = Math.max(1, Math.ceil(Number(seconds || 0)));
+  if (safeSeconds < 60) return `${safeSeconds} 秒内`;
+  const minutes = Math.ceil(safeSeconds / 60);
+  if (minutes < 60) return `${minutes} 分钟内`;
+  const hours = Math.floor(minutes / 60);
+  const remainMinutes = minutes % 60;
+  if (remainMinutes === 0) return `${hours} 小时内`;
+  return `${hours} 小时 ${remainMinutes} 分钟内`;
+}
+
+function formatDispatchClock(ms) {
+  const date = new Date(ms);
+  if (Number.isNaN(date.getTime())) return '';
+  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
 }
 
 function basename(value) {

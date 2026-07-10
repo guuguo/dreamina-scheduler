@@ -13,6 +13,7 @@ function isRecentlyUsed(asset) {
 export function buildMentionItems({ roles = [], assetById = new Map(), tempImagePaths = [], tempImageAssetIds = [] }) {
   const items = [];
   for (const role of roles) {
+    if (role?.disabled) continue;
     items.push({
       key: `role:${role.id}`,
       label: role.name,

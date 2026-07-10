@@ -196,12 +196,14 @@ test('createRoleEditor(create) returns null roleId and empty form', () => {
   const editor = createRoleEditor('create');
   assert.equal(editor.roleId, null);
   assert.equal(editor.form.name, '');
+  assert.equal(editor.form.series, '');
+  assert.equal(editor.form.disabled, false);
   assert.equal(editor.form.imagePath, '');
   assert.equal(editor.form.audioPath, '');
 })
 
 test('createRoleEditor(edit, role) returns role id and filled form', () => {
-  const role = { id: 'role-1', name: '威威', aliases: ['警车'], tags: ['车'], description: '酷' };
+  const role = { id: 'role-1', name: '威威', aliases: ['警车'], tags: ['车'], description: '酷', series: '显眼包', disabled: true };
   const editor = createRoleEditor('edit', role);
   assert.equal(editor.roleId, 'role-1');
   assert.equal(editor.form.id, 'role-1');
@@ -209,6 +211,8 @@ test('createRoleEditor(edit, role) returns role id and filled form', () => {
   assert.equal(editor.form.aliases, '警车');
   assert.equal(editor.form.tags, '车');
   assert.equal(editor.form.description, '酷');
+  assert.equal(editor.form.series, '显眼包');
+  assert.equal(editor.form.disabled, true);
 });
 
 test('create mode does not read previous selectedRoleMedia', () => {
