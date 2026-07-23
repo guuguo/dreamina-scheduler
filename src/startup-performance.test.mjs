@@ -5,6 +5,7 @@ import { test } from 'node:test';
 const mainSource = readFileSync(new URL('./main.jsx', import.meta.url), 'utf8');
 const indexSource = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
 const tauriConfig = JSON.parse(readFileSync(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
+const tauriSource = readFileSync(new URL('../src-tauri/src/lib.rs', import.meta.url), 'utf8');
 
 test('webview is throttled without full suspension and uses the app shell color', () => {
   const mainWindow = tauriConfig.app.windows[0];
@@ -28,6 +29,27 @@ test('foreground recovery coalesces focus events and refreshes only changed stat
   assert.match(mainSource, /if \(document\.hidden\) return/);
   assert.match(mainSource, /window\.requestAnimationFrame/);
   assert.doesNotMatch(mainSource, /const handleFocus = \(\) => \{[\s\S]*?refreshStateRef\.current\?\.\(\)/);
+});
+
+test('large state reads and task mutations use Tauri async command dispatch', () => {
+  for (const command of [
+    'get_app_state',
+    'pause_task_command',
+    'pause_tasks_command',
+    'resume_task_command',
+    'reschedule_task_command',
+    'delete_task_command',
+    'delete_tasks_command',
+    'record_lifecycle_event_command',
+    'save_task_draft_command',
+    'create_task_command',
+    'update_task_command',
+    'create_role_command',
+    'update_settings_command',
+    'process_queue_command',
+  ]) {
+    assert.match(tauriSource, new RegExp(`#\\[tauri::command\\(async\\)\\]\\n    pub fn ${command}`));
+  }
 });
 
 test('task prompt editor is loaded only when the create view needs it', () => {

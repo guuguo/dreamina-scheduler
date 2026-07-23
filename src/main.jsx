@@ -1707,7 +1707,7 @@ function RolesView({
 
 // ── QueueView helper components ─────────────────────────────────────────────
 
-const TaskCard = React.memo(function TaskCard({ task, index, selected, selectedForBatch, queuePriority = 0, assetById, roles, onSelect, onToggleSelection }) {
+const TaskCard = React.memo(function TaskCard({ task, index, selected, selectedForBatch, batchSelectable, queuePriority = 0, assetById, roles, onSelect, onToggleSelection }) {
   const thumbPath = useMemo(() => {
     for (const id of (task.image_asset_ids || [])) {
       const a = assetById.get(id);
@@ -1736,7 +1736,7 @@ const TaskCard = React.memo(function TaskCard({ task, index, selected, selectedF
         type="button"
         className={`qc-task-check${selectedForBatch ? ' checked' : ''}`}
         title={selectedForBatch ? '取消选择' : '选择任务'}
-        disabled={!canScheduleTask(task)}
+        disabled={!batchSelectable}
         onClick={(event) => {
           event.stopPropagation();
           onToggleSelection?.(task);
@@ -1835,6 +1835,7 @@ function QueueView({
   const [pendingProbeLaneKind, setPendingProbeLaneKind] = useState('');
   const [pendingPriority, setPendingPriority] = useState(false);
   const [pendingBatchPause, setPendingBatchPause] = useState(false);
+  const [pendingBatchDelete, setPendingBatchDelete] = useState(false);
 
   // ── derived data ─────────────────────────────────────────────────────────
   const filteredSorted = useMemo(
@@ -1954,12 +1955,20 @@ function QueueView({
     () => selectedBatchIds.map((id) => tasks.find((task) => task.id === id)).filter(Boolean),
     [selectedBatchIds, tasks]
   );
+  const schedulableSelectedTasks = useMemo(
+    () => selectedBatchTasks.filter(canScheduleTask),
+    [selectedBatchTasks]
+  );
   const pausableSelectedTasks = useMemo(
     () => selectedBatchTasks.filter((task) => ['scheduled', 'queued', 'retry_wait'].includes(task.status)),
     [selectedBatchTasks]
   );
-  const schedulablePagedIds = useMemo(
-    () => paged.items.filter(canScheduleTask).map((task) => task.id),
+  const deletableSelectedTasks = useMemo(
+    () => selectedBatchTasks.filter(canDeleteTask),
+    [selectedBatchTasks]
+  );
+  const selectablePagedIds = useMemo(
+    () => paged.items.filter((task) => canScheduleTask(task) || canDeleteTask(task)).map((task) => task.id),
     [paged.items]
   );
 
@@ -1972,7 +1981,9 @@ function QueueView({
   }, [selectedTaskId]);
 
   useEffect(() => {
-    setSelectedBatchIds((ids) => ids.filter((id) => tasks.some((task) => task.id === id && canScheduleTask(task))));
+    setSelectedBatchIds((ids) => ids.filter((id) => tasks.some(
+      (task) => task.id === id && (canScheduleTask(task) || canDeleteTask(task))
+    )));
   }, [tasks]);
 
   // ── handlers ─────────────────────────────────────────────────────────────
@@ -2056,14 +2067,14 @@ function QueueView({
     });
   };
   const toggleTaskSelection = useCallback((task) => {
-    if (!canScheduleTask(task)) return;
+    if (!canScheduleTask(task) && !canDeleteTask(task)) return;
     setSelectedBatchIds((ids) => ids.includes(task.id) ? ids.filter((id) => id !== task.id) : [...ids, task.id]);
   }, []);
   const toggleSelectPage = () => {
     setSelectedBatchIds((ids) => {
-      const pageAllSelected = schedulablePagedIds.length && schedulablePagedIds.every((id) => ids.includes(id));
-      if (pageAllSelected) return ids.filter((id) => !schedulablePagedIds.includes(id));
-      return uniqueValues([...ids, ...schedulablePagedIds]);
+      const pageAllSelected = selectablePagedIds.length && selectablePagedIds.every((id) => ids.includes(id));
+      if (pageAllSelected) return ids.filter((id) => !selectablePagedIds.includes(id));
+      return uniqueValues([...ids, ...selectablePagedIds]);
     });
   };
   const openPrepareGenerate = (task) => {
@@ -2074,8 +2085,7 @@ function QueueView({
     setScheduleModal({ mode: 'prepare', taskIds: [task.id], title: `排队「${task.title || '未命名任务'}」` });
   };
   const openBatchSchedule = () => {
-    const batchTasks = selectedBatchTasks.filter(canScheduleTask);
-    const taskIds = batchTasks.map((task) => task.id);
+    const taskIds = schedulableSelectedTasks.map((task) => task.id);
     if (!taskIds.length) {
       setFeedback('请先选择可批量排队的任务');
       return;
@@ -2100,6 +2110,27 @@ function QueueView({
     } finally {
       setPendingBatchPause(false);
     }
+  };
+  const deleteSelectedTasks = () => {
+    const taskIds = deletableSelectedTasks.map((task) => task.id);
+    if (!taskIds.length || pendingBatchDelete) return;
+    askConfirm({
+      title: '批量删除任务',
+      body: `确认删除已选的 ${taskIds.length} 个任务？本地视频文件和角色素材不会被删除。`,
+      confirmText: `删除 ${taskIds.length} 个任务`,
+      onConfirm: async () => {
+        setPendingBatchDelete(true);
+        try {
+          await invoke('delete_tasks_command', { taskIds });
+          setFeedback(`已删除 ${taskIds.length} 个任务`);
+          setSelectedBatchIds([]);
+          setSelectedTaskId('');
+          await refreshState();
+        } finally {
+          setPendingBatchDelete(false);
+        }
+      },
+    });
   };
   const applySchedulePlan = async ({ scheduledAt, intervalMinutes, plannedSubmitCount }) => {
     if (!scheduleModal?.taskIds?.length) return;
@@ -2239,6 +2270,7 @@ function QueueView({
               <TaskCard key={task.id} task={task} index={paged.startIndex + idx + 1}
                 selected={task.id === selectedTaskId}
                 selectedForBatch={selectedBatchIds.includes(task.id)}
+                batchSelectable={canScheduleTask(task) || canDeleteTask(task)}
                 queuePriority={Number(state.taskPriorities?.[task.id] || 0)}
                 assetById={assetById} roles={state.roles}
                 onSelect={setSelectedTaskId}
@@ -2276,16 +2308,21 @@ function QueueView({
         {/* ── RIGHT: actions + selected task panel ── */}
         <div className="qc-detail-column">
           <div className="qc-toolbar">
-            <button type="button" className="qc-btn" onClick={toggleSelectPage} disabled={!schedulablePagedIds.length}>
-              <CheckCircle2 size={13} /> {schedulablePagedIds.length && schedulablePagedIds.every((id) => selectedBatchIds.includes(id)) ? '取消本页' : '选择本页'}
+            <button type="button" className="qc-btn" onClick={toggleSelectPage} disabled={!selectablePagedIds.length}>
+              <CheckCircle2 size={13} /> {selectablePagedIds.length && selectablePagedIds.every((id) => selectedBatchIds.includes(id)) ? '取消本页' : '选择本页'}
             </button>
-            <button type="button" className="qc-btn" onClick={openBatchSchedule} disabled={!selectedBatchTasks.length}>
-              <CalendarClock size={13} /> 批量排队{selectedBatchTasks.length ? `（${selectedBatchTasks.length}）` : ''}
+            <button type="button" className="qc-btn" onClick={openBatchSchedule} disabled={!schedulableSelectedTasks.length}>
+              <CalendarClock size={13} /> 批量排队{schedulableSelectedTasks.length ? `（${schedulableSelectedTasks.length}）` : ''}
             </button>
             <button type="button" className="qc-btn qc-btn-pause" onClick={pauseSelectedTasks}
               disabled={!pausableSelectedTasks.length || pendingBatchPause}>
               {pendingBatchPause ? <Loader2 size={13} className="spin" /> : <Pause size={13} />}
               {pendingBatchPause ? '暂停中' : `批量暂停${pausableSelectedTasks.length ? `（${pausableSelectedTasks.length}）` : ''}`}
+            </button>
+            <button type="button" className="qc-btn qc-btn-danger" onClick={deleteSelectedTasks}
+              disabled={!deletableSelectedTasks.length || pendingBatchDelete}>
+              {pendingBatchDelete ? <Loader2 size={13} className="spin" /> : <Trash2 size={13} />}
+              {pendingBatchDelete ? '删除中' : `批量删除${deletableSelectedTasks.length ? `（${deletableSelectedTasks.length}）` : ''}`}
             </button>
           </div>
           <div className="qc-selected">

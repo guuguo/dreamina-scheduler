@@ -79,6 +79,14 @@ test('queue center exposes atomic batch pause for selected waiting tasks', () =>
   assert.match(tauriSource, /commands::pause_tasks_command/);
 });
 
+test('queue center exposes atomic batch delete for selected deletable tasks', () => {
+  assert.match(source, /const deletableSelectedTasks = useMemo/);
+  assert.match(source, /invoke\('delete_tasks_command', \{ taskIds \}\)/);
+  assert.match(source, /批量删除/);
+  assert.match(tauriSource, /pub fn delete_tasks_command/);
+  assert.match(tauriSource, /commands::delete_tasks_command/);
+});
+
 test('queue center exposes two-level queue priority controls', () => {
   assert.match(source, /invoke\('set_task_queue_priority_command'/);
   assert.match(source, /className="qc-console-priority"/);

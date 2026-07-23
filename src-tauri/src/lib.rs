@@ -5943,6 +5943,40 @@ pub fn delete_task_from_data(data: &mut AppData, task_id: &str) -> Result<(), Sc
     Ok(())
 }
 
+pub fn delete_tasks_from_data(
+    data: &mut AppData,
+    task_ids: &[String],
+) -> Result<Vec<String>, SchedulerError> {
+    let mut unique_ids = Vec::with_capacity(task_ids.len());
+    for task_id in task_ids {
+        if !unique_ids.contains(task_id) {
+            unique_ids.push(task_id.clone());
+        }
+    }
+
+    for task_id in &unique_ids {
+        let task = data
+            .tasks
+            .iter()
+            .find(|task| task.id == *task_id)
+            .ok_or_else(|| SchedulerError::Io(format!("找不到任务：{task_id}")))?;
+        if matches!(
+            task.status.as_str(),
+            "submitting" | "submitted" | "querying"
+        ) {
+            return Err(SchedulerError::Io(format!(
+                "任务「{}」已开始提交、远端排队或生成，当前不可删除",
+                task.title
+            )));
+        }
+    }
+
+    for task_id in &unique_ids {
+        delete_task_from_data(data, task_id)?;
+    }
+    Ok(unique_ids)
+}
+
 /// 更新任务的可编辑字段，保留执行历史（attempts、execution_records、结果、错误记录不变）。
 /// save_mode: "task"（重新排队）或 "draft"（保存草稿）
 pub fn update_task_from_data(
@@ -8204,6 +8238,7 @@ pub fn run() {
             commands::install_dreamina_cli_command,
             commands::login_dreamina_cli_command,
             commands::delete_task_command,
+            commands::delete_tasks_command,
             commands::delete_execution_record_command,
             commands::update_task_command,
             commands::update_task_draft_command,
@@ -8233,7 +8268,7 @@ pub mod commands {
     use base64::Engine as _;
     use tauri::State;
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn get_app_state(store: State<'_, AppStore>) -> AppData {
         frontend_app_state(store.snapshot())
     }
@@ -8307,7 +8342,7 @@ pub mod commands {
             .map_err(|error| error.to_string())
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn import_temp_image_command(
         store: State<'_, AppStore>,
         input: ImportAssetInput,
@@ -8383,7 +8418,7 @@ pub mod commands {
             .map_err(|error| error.to_string())
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn save_clipboard_image_command(
         store: State<'_, AppStore>,
         input: ClipboardImageInput,
@@ -8417,7 +8452,7 @@ pub mod commands {
             .map_err(|error| error.to_string())
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn paste_clipboard_image_command(store: State<'_, AppStore>) -> Result<Asset, String> {
         let assets_dir = store.assets_dir().join("clipboard");
         store
@@ -8448,7 +8483,7 @@ pub mod commands {
             .map_err(|error| error.to_string())
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn import_role_media_command(
         store: State<'_, AppStore>,
         input: ImportRoleMediaInput,
@@ -8482,7 +8517,7 @@ pub mod commands {
             .map_err(|error| error.to_string())
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn remove_role_media_command(
         store: State<'_, AppStore>,
         input: RemoveRoleMediaInput,
@@ -8515,7 +8550,7 @@ pub mod commands {
             .map_err(|error| error.to_string())
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn create_role_command(
         store: State<'_, AppStore>,
         input: CreateRoleInput,
@@ -8548,7 +8583,7 @@ pub mod commands {
             .map_err(|error| error.to_string())
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn update_role_command(
         store: State<'_, AppStore>,
         input: CreateRoleInput,
@@ -8581,7 +8616,7 @@ pub mod commands {
             .map_err(|error| error.to_string())
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn delete_role_command(store: State<'_, AppStore>, role_id: String) -> Result<(), String> {
         store
             .mutate(|data| {
@@ -8611,7 +8646,7 @@ pub mod commands {
             .map_err(|error| error.to_string())
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn preview_task_command(
         store: State<'_, AppStore>,
         draft: TaskDraft,
@@ -8624,7 +8659,7 @@ pub mod commands {
             .map_err(|error| error.to_string())
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn save_task_draft_command(
         store: State<'_, AppStore>,
         draft: TaskDraft,
@@ -8659,7 +8694,7 @@ pub mod commands {
             .map_err(|error| error.to_string())
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn create_task_command(
         store: State<'_, AppStore>,
         waker: State<'_, SchedulerWaker>,
@@ -8883,14 +8918,14 @@ pub mod commands {
         Ok(task)
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn process_queue_command(
         store: State<'_, AppStore>,
     ) -> Result<Option<ScheduledTask>, String> {
         process_queue_for_store_blocking(&store, "manual")
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn record_lifecycle_event_command(
         store: State<'_, AppStore>,
         event_type: String,
@@ -9525,7 +9560,7 @@ pub mod commands {
         generate_image_command(store, item.prompt, item.size, reference_asset_ids).await
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn download_imagegen_image_command(
         store: State<'_, AppStore>,
         history_id: String,
@@ -9555,7 +9590,7 @@ pub mod commands {
         Ok(target.to_string_lossy().to_string())
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn copy_imagegen_image_command(
         store: State<'_, AppStore>,
         history_id: String,
@@ -9589,7 +9624,7 @@ pub mod commands {
         Ok(())
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn delete_imagegen_history_item_command(
         store: State<'_, AppStore>,
         id: String,
@@ -9607,7 +9642,7 @@ pub mod commands {
             .map_err(|e| format!("删除历史失败：{e}"))
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn clear_imagegen_history_command(store: State<'_, AppStore>) -> Result<(), String> {
         store
             .mutate(|data| {
@@ -9639,7 +9674,7 @@ pub mod commands {
         }
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn update_settings_command(
         store: State<'_, AppStore>,
         input: UpdateSettingsInput,
@@ -9692,7 +9727,7 @@ pub mod commands {
             .map_err(|error| error.to_string())
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn set_lane_enabled_command(
         store: State<'_, AppStore>,
         waker: State<'_, SchedulerWaker>,
@@ -9710,7 +9745,7 @@ pub mod commands {
         Ok(settings)
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn set_task_queue_priority_command(
         store: State<'_, AppStore>,
         waker: State<'_, SchedulerWaker>,
@@ -9724,7 +9759,7 @@ pub mod commands {
         Ok(priority)
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn pause_task_command(
         store: State<'_, AppStore>,
         task_id: String,
@@ -9758,7 +9793,7 @@ pub mod commands {
             .map_err(|error| error.to_string())
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn pause_tasks_command(
         store: State<'_, AppStore>,
         task_ids: Vec<String>,
@@ -9794,7 +9829,7 @@ pub mod commands {
             .map_err(|error| error.to_string())
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn resume_task_command(
         store: State<'_, AppStore>,
         task_id: String,
@@ -9829,7 +9864,7 @@ pub mod commands {
             .map_err(|error| error.to_string())
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn reschedule_task_command(
         store: State<'_, AppStore>,
         waker: State<'_, SchedulerWaker>,
@@ -9867,7 +9902,7 @@ pub mod commands {
         Ok(task)
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn set_task_planned_submit_count_command(
         store: State<'_, AppStore>,
         task_id: String,
@@ -9905,7 +9940,7 @@ pub mod commands {
             .map_err(|error| error.to_string())
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn queue_tasks_with_model_strategy_command(
         store: State<'_, AppStore>,
         task_ids: Vec<String>,
@@ -9967,7 +10002,7 @@ pub mod commands {
             .map_err(|error| error.to_string())
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn queue_tasks_with_batch_schedule_command(
         store: State<'_, AppStore>,
         waker: State<'_, SchedulerWaker>,
@@ -10192,7 +10227,7 @@ pub mod commands {
         Ok(msg)
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn delete_task_command(store: State<'_, AppStore>, task_id: String) -> Result<(), String> {
         store
             .mutate(|data| {
@@ -10222,7 +10257,42 @@ pub mod commands {
             .map_err(|e| e.to_string())
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
+    pub fn delete_tasks_command(
+        store: State<'_, AppStore>,
+        task_ids: Vec<String>,
+    ) -> Result<Vec<String>, String> {
+        store
+            .mutate(|data| {
+                let deleted_ids = delete_tasks_from_data(data, &task_ids)?;
+                for task_id in &deleted_ids {
+                    append_log(
+                        data,
+                        LogEntryDraft {
+                            level: LogLevel::Info,
+                            source: LogSource::Scheduler,
+                            category: "task".to_string(),
+                            event_type: "delete".to_string(),
+                            message: format!("批量删除任务：{task_id}"),
+                            detail: String::new(),
+                            task_id: Some(task_id.clone()),
+                            task_title: None,
+                            submit_id: None,
+                            execution_record_id: None,
+                            error_detail: None,
+                            raw_output: None,
+                            stdout: None,
+                            stderr: None,
+                            module: None,
+                        },
+                    );
+                }
+                Ok(deleted_ids)
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    #[tauri::command(async)]
     pub fn delete_execution_record_command(
         store: State<'_, AppStore>,
         task_id: String,
@@ -10233,7 +10303,7 @@ pub mod commands {
             .map_err(|e| e.to_string())
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn update_task_command(
         store: State<'_, AppStore>,
         waker: State<'_, SchedulerWaker>,
@@ -10274,7 +10344,7 @@ pub mod commands {
         Ok(task)
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn update_task_draft_command(
         store: State<'_, AppStore>,
         task_id: String,
@@ -10310,7 +10380,7 @@ pub mod commands {
             .map_err(|error| error.to_string())
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn sync_keep_awake_command(
         store: State<'_, AppStore>,
         guard: State<'_, keep_awake::KeepAwakeGuard>,
@@ -10324,7 +10394,7 @@ pub mod commands {
         guard.is_active()
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn clear_logs_command(store: State<'_, AppStore>) -> Result<(), String> {
         store
             .mutate(|data| {

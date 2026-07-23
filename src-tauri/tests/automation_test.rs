@@ -3,12 +3,13 @@ use dreamina_scheduler_lib::{
     backfill_draft_command_previews, backfill_execution_records_from_attempts, build_install_plan,
     build_login_plan, classify_dreamina_error, compact_retry_execution_records_for_display,
     create_draft_task, create_task_with_preview, delete_execution_record_from_data, delete_role,
-    delete_task_from_data, import_media_to_role, needs_keep_awake, pause_task, pause_tasks,
-    peek_due_task_cli, process_next_due_task_with_runner, query_task_submit_id_once_with_runner,
-    queue_tasks_with_batch_schedule, queue_tasks_with_model_strategy, record_lifecycle_event,
-    record_scheduler_tick, recover_tasks_on_load, remove_media_from_role, reschedule_task,
-    resume_task, save_clipboard_image_asset, update_task_from_data, upsert_role, AppData, Asset,
-    AssetKind, BatchQueuePlanItem, ClipboardImageInput, ConcurrencyLimitPolicy, CreateRoleInput,
+    delete_task_from_data, delete_tasks_from_data, import_media_to_role, needs_keep_awake,
+    pause_task, pause_tasks, peek_due_task_cli, process_next_due_task_with_runner,
+    query_task_submit_id_once_with_runner, queue_tasks_with_batch_schedule,
+    queue_tasks_with_model_strategy, record_lifecycle_event, record_scheduler_tick,
+    recover_tasks_on_load, remove_media_from_role, reschedule_task, resume_task,
+    save_clipboard_image_asset, update_task_from_data, upsert_role, AppData, Asset, AssetKind,
+    BatchQueuePlanItem, ClipboardImageInput, ConcurrencyLimitPolicy, CreateRoleInput,
     DreaminaErrorKind, DueTaskCliAction, ImportRoleMediaInput, LogEntry, LogLevel, LogSource,
     RemoveRoleMediaInput, Role, ScheduledTask, SchedulerSettings, TaskAttempt, TaskDraft,
     TaskExecutionInputSnapshot, TaskExecutionRecord, VideoParams,
@@ -2724,6 +2725,38 @@ fn delete_task_removes_from_list() {
     delete_task_from_data(&mut data, "task-1").expect("delete");
     assert_eq!(data.tasks.len(), 1);
     assert_eq!(data.tasks[0].id, "task-2");
+}
+
+#[test]
+fn delete_tasks_removes_all_selected_tasks_atomically() {
+    let mut data = default_data();
+    data.tasks.push(queued_task("task-1"));
+    data.tasks.push(queued_task("task-2"));
+    let mut active = queued_task("task-active");
+    active.status = "querying".to_string();
+    data.tasks.push(active);
+
+    let deleted = delete_tasks_from_data(&mut data, &["task-1".to_string(), "task-2".to_string()])
+        .expect("batch delete");
+    assert_eq!(deleted, vec!["task-1", "task-2"]);
+    assert_eq!(data.tasks.len(), 1);
+    assert_eq!(data.tasks[0].id, "task-active");
+}
+
+#[test]
+fn delete_tasks_rejects_mixed_invalid_batch_without_partial_changes() {
+    let mut data = default_data();
+    data.tasks.push(queued_task("task-1"));
+    let mut active = queued_task("task-active");
+    active.status = "querying".to_string();
+    data.tasks.push(active);
+
+    let result = delete_tasks_from_data(
+        &mut data,
+        &["task-1".to_string(), "task-active".to_string()],
+    );
+    assert!(result.is_err());
+    assert_eq!(data.tasks.len(), 2);
 }
 
 #[test]
