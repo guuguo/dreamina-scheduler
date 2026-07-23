@@ -7,9 +7,9 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     fs,
-    io::{Cursor, Write},
+    io::{Cursor, Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Mutex,
@@ -24,7 +24,7 @@ const SUPPORTED_RATIOS: &[&str] = &["1:1", "3:4", "16:9", "4:3", "9:16", "21:9"]
 const SUPPORTED_MODELS: &[&str] = &["seedance2.0", "seedance2.0fast"];
 const MAX_IMAGES: usize = 9;
 const MAX_AUDIO: usize = 3;
-/// 自动查询最长等待时间（4小时），超过后停止自动查询，改为手动
+/// 自动查询最长等待时间，超过后停止自动查询，改为手动。
 const MAX_WAIT_HOURS: i64 = 6;
 const MAX_NO_REMOTE_QUEUE_INFO_MINUTES: i64 = 10;
 /// 5xx 服务器错误自动重试上限次数
@@ -41,11 +41,13 @@ const MAX_GENERATION_PRECHECK_RETRIES: u32 = 2;
 const MAX_CONCURRENCY_FAILURE_RECOVERY_HOURS: i64 = 24;
 const IMAGE_SUBMIT_TIMEOUT_SECS: u64 = 300;
 const IMAGE_SUBMIT_CONNECT_TIMEOUT_SECS: u64 = 300;
+const DREAMINA_CLI_TIMEOUT_SECS: u64 = 360;
 const SCHEDULER_TICK_INTERVAL_SECS: u64 = 30;
 const DEFAULT_CONCURRENCY_RETRY_DELAY_SECONDS: u64 = 300;
 const LEGACY_CONCURRENCY_RETRY_DELAY_SECONDS: u64 = 30;
 const FAST_FALLBACK_MODEL_VERSION: &str = "seedance2.0fast";
-const FAST_FALLBACK_QUEUE_WAIT_HOURS: i64 = 2;
+const STATE_WRITE_LOCK_WAIT_SECS: u64 = 30;
+const STATE_WRITE_LOCK_STALE_SECS: i64 = 120;
 static PROCESS_QUEUE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -989,6 +991,15 @@ pub struct McpVideoTaskInput {
     pub planned_submit_count: Option<u32>,
 }
 
+/// MCP 原位更新请求。仅允许替换尚未执行任务的生成输入，避免用“重新入队”制造重复任务。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct McpQueuedTaskUpdateInput {
+    #[serde(alias = "taskId")]
+    pub task_id: String,
+    #[serde(flatten)]
+    pub task: McpVideoTaskInput,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct McpQueueVideosInput {
     #[serde(
@@ -1200,6 +1211,24 @@ fn normalize_mcp_video_task_value(value: JsonValue) -> JsonValue {
 pub fn parse_mcp_video_task_input(value: JsonValue) -> Result<McpVideoTaskInput, SchedulerError> {
     serde_json::from_value(normalize_mcp_video_task_value(value))
         .map_err(|error| SchedulerError::Io(format!("MCP 参数解析失败：{error}")))
+}
+
+pub fn parse_mcp_queued_task_update_input(
+    value: JsonValue,
+) -> Result<McpQueuedTaskUpdateInput, SchedulerError> {
+    let JsonValue::Object(mut map) = value else {
+        return Err(SchedulerError::Io("MCP 原位更新参数必须是对象".to_string()));
+    };
+    let task_id = ["task_id", "taskId"]
+        .iter()
+        .find_map(|key| map.remove(*key))
+        .and_then(|value| value.as_str().map(str::to_string))
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| SchedulerError::Io("task_id 不可为空".to_string()))?;
+    Ok(McpQueuedTaskUpdateInput {
+        task_id,
+        task: parse_mcp_video_task_input(JsonValue::Object(map))?,
+    })
 }
 
 pub fn parse_mcp_queue_videos_input(
@@ -1452,6 +1481,108 @@ pub struct AppStore {
     data: Mutex<AppData>,
 }
 
+struct StateWriteLockGuard {
+    path: PathBuf,
+    token: String,
+}
+
+impl Drop for StateWriteLockGuard {
+    fn drop(&mut self) {
+        let expected_token = format!("token={}", self.token);
+        let owns_lock = fs::read_to_string(&self.path)
+            .map(|content| content.lines().any(|line| line == expected_token))
+            .unwrap_or(false);
+        if owns_lock {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn create_state_write_lock(
+    lock_path: &Path,
+) -> Result<Option<StateWriteLockGuard>, SchedulerError> {
+    let token = Uuid::new_v4().simple().to_string();
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(lock_path)
+    {
+        Ok(mut file) => {
+            if let Err(error) = writeln!(file, "token={token}")
+                .and_then(|_| writeln!(file, "pid={}", std::process::id()))
+                .and_then(|_| writeln!(file, "created_at={}", now_rfc3339()))
+            {
+                drop(file);
+                let _ = fs::remove_file(lock_path);
+                return Err(SchedulerError::Io(error.to_string()));
+            }
+            Ok(Some(StateWriteLockGuard {
+                path: lock_path.to_path_buf(),
+                token,
+            }))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        Err(error) => Err(SchedulerError::Io(error.to_string())),
+    }
+}
+
+#[cfg(unix)]
+fn state_write_lock_owner_is_dead(content: &str) -> bool {
+    let Some(pid) = content.lines().find_map(|line| {
+        line.strip_prefix("pid=")
+            .and_then(|value| value.trim().parse::<u32>().ok())
+    }) else {
+        return false;
+    };
+    if pid == 0 || pid == std::process::id() || pid > i32::MAX as u32 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return false;
+    }
+    !matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EPERM)
+    )
+}
+
+#[cfg(not(unix))]
+fn state_write_lock_owner_is_dead(_content: &str) -> bool {
+    false
+}
+
+fn acquire_state_write_lock(root_dir: &Path) -> Result<StateWriteLockGuard, SchedulerError> {
+    fs::create_dir_all(root_dir).map_err(|error| SchedulerError::Io(error.to_string()))?;
+    let lock_path = root_dir.join("state.write.lock");
+    let deadline = std::time::Instant::now() + StdDuration::from_secs(STATE_WRITE_LOCK_WAIT_SECS);
+
+    loop {
+        if let Some(guard) = create_state_write_lock(&lock_path)? {
+            return Ok(guard);
+        }
+        let owner_is_dead = fs::read_to_string(&lock_path)
+            .map(|content| state_write_lock_owner_is_dead(&content))
+            .unwrap_or(false);
+        let stale_by_age = fs::metadata(&lock_path)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .map(|age| age >= StdDuration::from_secs(STATE_WRITE_LOCK_STALE_SECS as u64))
+            .unwrap_or(false);
+        if owner_is_dead || stale_by_age {
+            let _ = fs::remove_file(&lock_path);
+            continue;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(SchedulerError::Io(
+                "等待 state.json 写锁超时，请稍后重试".to_string(),
+            ));
+        }
+        std::thread::sleep(StdDuration::from_millis(10));
+    }
+}
+
 impl AppStore {
     pub fn load(root_dir: PathBuf) -> Self {
         let (data, should_compact) = match load_app_data_from_disk(&root_dir) {
@@ -1471,18 +1602,27 @@ impl AppStore {
     /// 启动时一次性压实：当磁盘 `state.json` 明显大于规整（紧凑序列化 + 历史裁剪）后的数据时，
     /// 重写一次使旧的 pretty 格式 / 历史臃肿文件立即瘦身。压实后磁盘体积≈紧凑数据，不会重复触发。
     fn compact_on_disk_if_oversized(&self) {
+        let mut data = self.data.lock().expect("store lock");
         let path = self.root_dir.join("state.json");
+        let Ok(_write_lock) = acquire_state_write_lock(&self.root_dir) else {
+            return;
+        };
         let Ok(meta) = fs::metadata(&path) else {
             return;
         };
-        let data = self.data.lock().expect("store lock");
-        let Ok(serialized) = serde_json::to_string(&*data) else {
+        let Ok(latest) = load_app_data_from_disk(&self.root_dir) else {
+            return;
+        };
+        let Ok(serialized) = serde_json::to_string(&latest) else {
             return;
         };
         // 留 10% 余量，避免等大文件的无谓重写。
-        if meta.len() as usize > serialized.len() + serialized.len() / 10 {
-            let _ = self.persist(&data);
+        if meta.len() as usize > serialized.len() + serialized.len() / 10
+            && self.persist(&latest).is_err()
+        {
+            return;
         }
+        *data = latest;
     }
 
     pub fn snapshot(&self) -> AppData {
@@ -1507,11 +1647,11 @@ impl AppStore {
         F: FnOnce(&mut AppData) -> Result<T, SchedulerError>,
     {
         let mut data = self.data.lock().expect("store lock");
-        if let Ok(latest) = load_app_data_from_disk(&self.root_dir) {
-            *data = latest;
-        }
-        let result = mutate(&mut data)?;
-        self.persist(&data)?;
+        let _write_lock = acquire_state_write_lock(&self.root_dir)?;
+        let mut latest = load_app_data_from_disk(&self.root_dir)?;
+        let result = mutate(&mut latest)?;
+        self.persist(&latest)?;
+        *data = latest;
         Ok(result)
     }
 
@@ -1538,13 +1678,23 @@ impl AppStore {
         fs::create_dir_all(&self.root_dir)
             .map_err(|error| SchedulerError::Io(error.to_string()))?;
         let state_path = self.root_dir.join("state.json");
-        let temp_path = self.root_dir.join("state.json.tmp");
+        let temp_path = self.root_dir.join(format!(
+            "state.json.tmp.{}.{}",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
         // 紧凑序列化：state.json 为机器状态文件，pretty 缩进会让磁盘体积近乎翻倍，
         // 加重每次读/写/解析的 I/O 与 CPU。compact 不改变可读回的数据。
         let content =
             serde_json::to_string(data).map_err(|error| SchedulerError::Io(error.to_string()))?;
-        fs::write(&temp_path, content).map_err(|error| SchedulerError::Io(error.to_string()))?;
-        fs::rename(temp_path, state_path).map_err(|error| SchedulerError::Io(error.to_string()))?;
+        if let Err(error) = fs::write(&temp_path, content) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(SchedulerError::Io(error.to_string()));
+        }
+        if let Err(error) = fs::rename(&temp_path, state_path) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(SchedulerError::Io(error.to_string()));
+        }
         Ok(())
     }
 }
@@ -1553,11 +1703,12 @@ fn load_app_data_from_disk(root_dir: &Path) -> Result<AppData, SchedulerError> {
     let data_path = root_dir.join("state.json");
     let content = match fs::read_to_string(&data_path) {
         Ok(content) => content,
-        Err(_) => {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let mut data = AppData::default();
             normalize_loaded_app_data(&mut data);
             return Ok(data);
         }
+        Err(error) => return Err(SchedulerError::Io(error.to_string())),
     };
     let mut data: AppData = match serde_json::from_str(&content) {
         Ok(data) => data,
@@ -2361,7 +2512,13 @@ fn query_output_has_explicit_remote_progress(parsed: &QueryOutput) -> bool {
         .map(|status| {
             matches!(
                 status.to_ascii_lowercase().as_str(),
-                "processing" | "generating" | "success" | "succeeded" | "failed" | "cancelled"
+                "running"
+                    | "processing"
+                    | "generating"
+                    | "success"
+                    | "succeeded"
+                    | "failed"
+                    | "cancelled"
             )
         })
         .unwrap_or(false)
@@ -2383,6 +2540,16 @@ fn latest_record_query_has_explicit_remote_progress(record: &TaskExecutionRecord
     })
 }
 
+fn latest_record_query_was_waitable_error(record: &TaskExecutionRecord) -> bool {
+    record.query_records.last().is_some_and(|attempt| {
+        attempt.status == "retry_wait"
+            && matches!(
+                attempt.error_kind.as_str(),
+                "NetworkUnavailable" | "Transient" | "ConcurrencyLimit"
+            )
+    })
+}
+
 fn expire_stale_historical_execution_records(
     task: &mut ScheduledTask,
     now: DateTime<Utc>,
@@ -2393,8 +2560,10 @@ fn expire_stale_historical_execution_records(
     for record in &mut task.execution_records {
         if record.submit_id == current_submit_id
             || !is_active_execution_record(record)
+            || record.query_records.is_empty()
             || !execution_tracking_window_expired(record, now)
             || latest_record_query_has_explicit_remote_progress(record)
+            || latest_record_query_was_waitable_error(record)
         {
             continue;
         }
@@ -2427,7 +2596,10 @@ fn normalize_active_execution_records(task: &mut ScheduledTask) {
 }
 
 fn reconcile_task_with_active_execution(task: &mut ScheduledTask) {
-    if task.status == "succeeded" {
+    if task.status == "succeeded"
+        || (matches!(task.status.as_str(), "querying" | "submitted")
+            && !task.submit_id.trim().is_empty())
+    {
         return;
     }
     let Some(record) = task
@@ -2456,31 +2628,6 @@ fn reconcile_task_with_active_execution(task: &mut ScheduledTask) {
     task.auto_query_stopped = false;
 }
 
-fn queue_info_is_queueing(queue_info: Option<&QueueInfo>) -> bool {
-    queue_info
-        .and_then(|info| info.queue_status.as_deref())
-        .map(|status| status.eq_ignore_ascii_case("queueing"))
-        .unwrap_or(false)
-}
-
-fn current_submit_has_waited_for_fast_fallback(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
-    if !matches!(task.status.as_str(), "querying" | "submitted")
-        || task.submit_id.trim().is_empty()
-        || !queue_info_is_queueing(task.queue_info.as_ref())
-    {
-        return false;
-    }
-    let Some(submitted_at) = task.submitted_at.as_ref() else {
-        return false;
-    };
-    DateTime::parse_from_rfc3339(submitted_at.trim())
-        .map(|time| {
-            now.signed_duration_since(time.with_timezone(&Utc))
-                >= Duration::hours(FAST_FALLBACK_QUEUE_WAIT_HOURS)
-        })
-        .unwrap_or(false)
-}
-
 fn is_fast_execution_record(record: &TaskExecutionRecord) -> bool {
     record.input_snapshot.params.model_version == FAST_FALLBACK_MODEL_VERSION
         || record
@@ -2495,36 +2642,6 @@ fn record_sort_time(record: &TaskExecutionRecord) -> &str {
     } else {
         record.finished_at.as_str()
     }
-}
-
-fn latest_fast_execution_record(task: &ScheduledTask) -> Option<&TaskExecutionRecord> {
-    task.execution_records
-        .iter()
-        .filter(|record| is_fast_execution_record(record))
-        .max_by(|left, right| record_sort_time(left).cmp(record_sort_time(right)))
-}
-
-fn has_active_fast_execution_record(task: &ScheduledTask) -> bool {
-    task.execution_records
-        .iter()
-        .any(|record| is_fast_execution_record(record) && is_active_execution_record(record))
-}
-
-fn is_fast_fallback_due(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
-    if !current_submit_has_waited_for_fast_fallback(task, now)
-        || has_active_fast_execution_record(task)
-    {
-        return false;
-    }
-    let Some(latest_fast) = latest_fast_execution_record(task) else {
-        return true;
-    };
-    DateTime::parse_from_rfc3339(record_sort_time(latest_fast))
-        .map(|time| {
-            now.signed_duration_since(time.with_timezone(&Utc))
-                >= Duration::hours(FAST_FALLBACK_QUEUE_WAIT_HOURS)
-        })
-        .unwrap_or(true)
 }
 
 fn next_due_execution_query_target(data: &AppData, now: DateTime<Utc>) -> Option<(String, String)> {
@@ -2609,7 +2726,7 @@ fn next_due_initial_current_query_target(
     None
 }
 
-/// 判断任务是否超过最长等待时间（4小时），需要停止自动查询
+/// 判断任务是否超过最长等待时间，需要停止自动查询。
 pub fn is_past_max_wait(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
     let Some(ref submitted_at) = task.submitted_at else {
         return false;
@@ -2653,7 +2770,7 @@ fn query_output_has_remote_progress_info(parsed: &QueryOutput, raw: &str) -> boo
         .map(|status| {
             matches!(
                 status.to_ascii_lowercase().as_str(),
-                "queueing" | "processing" | "generating" | "success" | "succeeded"
+                "queueing" | "running" | "processing" | "generating" | "success" | "succeeded"
             )
         })
         .unwrap_or(false)
@@ -3008,6 +3125,7 @@ fn compact_query_retry_error_detail(kind: &str, message: &str) -> String {
             "网络暂不可用或登录刷新失败，已等待网络恢复后自动查询。".to_string()
         }
         "Transient" => "查询时遇到临时网络或平台错误，已等待下次自动查询。".to_string(),
+        "QueryUnavailable" => "本地查询暂时未取得结果，已保留远端任务，稍后自动查询。".to_string(),
         _ => message.trim().to_string(),
     }
 }
@@ -3131,6 +3249,8 @@ pub fn classify_dreamina_error(
 ) -> ClassifiedDreaminaError {
     let text = message.trim().to_string();
     let lower_text = text.to_ascii_lowercase();
+    let transient_upload_gateway_error = lower_text.contains("upload")
+        && (lower_text.contains("bad gateway") || lower_text.contains("backend service failed"));
     if is_concurrency_limit(&text) {
         return ClassifiedDreaminaError {
             kind: DreaminaErrorKind::ConcurrencyLimit,
@@ -3170,6 +3290,7 @@ pub fn classify_dreamina_error(
         || lower_text.contains("upload video/audio")
         || lower_text.contains("connection reset")
         || lower_text.contains("broken pipe")
+        || transient_upload_gateway_error
     {
         return ClassifiedDreaminaError {
             kind: DreaminaErrorKind::Transient,
@@ -3256,7 +3377,13 @@ pub fn parse_query_output(output: &str) -> QueryOutput {
         gen_status: parsed
             .as_ref()
             .and_then(|value| find_json_string_field(value, "gen_status"))
+            .or_else(|| {
+                parsed
+                    .as_ref()
+                    .and_then(|value| find_json_string_field(value, "task_status"))
+            })
             .or_else(|| first_field(&text, "gen_status"))
+            .or_else(|| first_field(&text, "task_status"))
             .or_else(|| first_field(&text, "status")),
         fail_reason: parsed
             .as_ref()
@@ -3818,6 +3945,347 @@ pub fn queue_mcp_video_task(
         task,
         imported_assets,
     })
+}
+
+/// 通过 MCP 原位替换尚未执行的队列任务。
+///
+/// 任务 ID 和执行历史保持不变；图片、音频会由调度器资产层重新导入，绝不由调用方直接改状态文件。
+pub fn update_queued_mcp_video_task(
+    data: &mut AppData,
+    assets_dir: &Path,
+    input: McpQueuedTaskUpdateInput,
+) -> Result<McpQueuedVideoTask, SchedulerError> {
+    let task_index = data
+        .tasks
+        .iter()
+        .position(|task| task.id == input.task_id)
+        .ok_or_else(|| SchedulerError::Io(format!("找不到任务：{}", input.task_id)))?;
+    let previous = data.tasks[task_index].clone();
+    if !is_never_executed_queued_task(&previous) {
+        return Err(SchedulerError::Io(format!(
+            "任务 {} 已执行或不在 queued 状态，禁止原位替换",
+            input.task_id
+        )));
+    }
+
+    preflight_mcp_asset_paths(&input.task.image_paths, AssetKind::Image)?;
+    preflight_mcp_asset_paths(&input.task.audio_paths, AssetKind::Audio)?;
+    let mcp_assets_dir = assets_dir.join("mcp");
+    let mut imported_assets = Vec::new();
+    let mut image_asset_ids = Vec::new();
+    let mut audio_asset_ids = Vec::new();
+    for path in &input.task.image_paths {
+        let asset = match import_mcp_asset_from_path(&mcp_assets_dir, path) {
+            Ok(asset) => asset,
+            Err(error) => {
+                cleanup_imported_assets(&imported_assets);
+                return Err(error);
+            }
+        };
+        if asset.kind != AssetKind::Image {
+            return Err(SchedulerError::UnsupportedAssetType(asset.mime));
+        }
+        image_asset_ids.push(asset.id.clone());
+        imported_assets.push(asset);
+    }
+    for path in &input.task.audio_paths {
+        let asset = match import_mcp_asset_from_path(&mcp_assets_dir, path) {
+            Ok(asset) => asset,
+            Err(error) => {
+                cleanup_imported_assets(&imported_assets);
+                return Err(error);
+            }
+        };
+        if asset.kind != AssetKind::Audio {
+            return Err(SchedulerError::UnsupportedAssetType(asset.mime));
+        }
+        audio_asset_ids.push(asset.id.clone());
+        imported_assets.push(asset);
+    }
+    if image_asset_ids.is_empty() {
+        return Err(SchedulerError::MissingImageInput);
+    }
+
+    let mut params = previous.params.clone();
+    if let Some(orientation) = input.task.orientation.as_deref() {
+        params.ratio = mcp_orientation_to_ratio(Some(orientation))?;
+    }
+    if let Some(model) = input.task.model.as_deref() {
+        params.model_version = mcp_model_to_version(Some(model))?;
+    }
+    if let Some(duration) = input.task.duration {
+        params.duration = duration;
+    }
+    if let Some(resolution) = input.task.video_resolution.as_deref() {
+        params.video_resolution = resolution.trim().to_string();
+    }
+    validate_video_params(&params)?;
+    let draft = TaskDraft {
+        title: if input.task.title.trim().is_empty() {
+            previous.title.clone()
+        } else {
+            input.task.title
+        },
+        prompt: input.task.prompt,
+        image_asset_ids,
+        audio_asset_ids,
+        role_ids: previous.role_ids.clone(),
+        manual_mention_ids: previous.manual_mention_ids.clone(),
+        auto_match_roles: previous.auto_match_roles,
+        params,
+        scheduled_at: previous.scheduled_at.clone(),
+        temp_image_asset_ids: vec![],
+        temp_image_paths: vec![],
+        prompt_doc: None,
+    };
+
+    let mut preview_data = data.clone();
+    preview_data.assets.extend(imported_assets.clone());
+    let update_result = (|| {
+        let (preview, _) = build_optional_draft_preview_from_parts(
+            &draft,
+            &preview_data.assets,
+            &preview_data.roles,
+        )?;
+        data.assets.extend(imported_assets.clone());
+        let updated = update_task_from_data(data, &input.task_id, draft, "task")?;
+        Ok::<_, SchedulerError>((updated, preview))
+    })();
+    let (updated, preview) = match update_result {
+        Ok(value) => value,
+        Err(error) => {
+            cleanup_imported_assets(&imported_assets);
+            return Err(error);
+        }
+    };
+    debug_assert_eq!(updated.command_preview, preview);
+    append_task_log(
+        data,
+        &updated,
+        LogEntryDraft {
+            level: LogLevel::Info,
+            source: LogSource::Scheduler,
+            category: "task".to_string(),
+            event_type: "mcp_update_queued".to_string(),
+            message: format!("MCP 原位更新未执行任务：{}", updated.title),
+            detail: String::new(),
+            task_id: None,
+            task_title: None,
+            submit_id: None,
+            execution_record_id: None,
+            error_detail: None,
+            raw_output: None,
+            stdout: None,
+            stderr: None,
+            module: Some("mcp".to_string()),
+        },
+    );
+    Ok(McpQueuedVideoTask {
+        task: updated,
+        imported_assets,
+    })
+}
+
+/// 通过 MCP 原位替换失败或等待重试任务的生成输入，并保持为失败草稿。
+///
+/// 该入口只保存下一次手动重试要使用的新版草稿，不会重新排队或唤醒调度器；
+/// 任务 ID、submit ID、尝试次数、执行记录、结果和错误记录全部保留。
+pub fn update_failed_mcp_video_task_draft(
+    data: &mut AppData,
+    assets_dir: &Path,
+    input: McpQueuedTaskUpdateInput,
+) -> Result<McpQueuedVideoTask, SchedulerError> {
+    let task_index = data
+        .tasks
+        .iter()
+        .position(|task| task.id == input.task_id)
+        .ok_or_else(|| SchedulerError::Io(format!("找不到任务：{}", input.task_id)))?;
+    let previous = data.tasks[task_index].clone();
+    if !matches!(previous.status.as_str(), "failed" | "retry_wait") {
+        return Err(SchedulerError::Io(format!(
+            "任务 {} 当前状态为 {}，只允许原位更新 failed 或 retry_wait 任务草稿",
+            input.task_id, previous.status
+        )));
+    }
+
+    preflight_mcp_asset_paths(&input.task.image_paths, AssetKind::Image)?;
+    preflight_mcp_asset_paths(&input.task.audio_paths, AssetKind::Audio)?;
+    let mcp_assets_dir = assets_dir.join("mcp");
+    let mut imported_assets = Vec::new();
+    let mut image_asset_ids = Vec::new();
+    let mut audio_asset_ids = Vec::new();
+    for path in &input.task.image_paths {
+        let asset = match import_mcp_asset_from_path(&mcp_assets_dir, path) {
+            Ok(asset) => asset,
+            Err(error) => {
+                cleanup_imported_assets(&imported_assets);
+                return Err(error);
+            }
+        };
+        if asset.kind != AssetKind::Image {
+            cleanup_imported_assets(&imported_assets);
+            return Err(SchedulerError::UnsupportedAssetType(asset.mime));
+        }
+        image_asset_ids.push(asset.id.clone());
+        imported_assets.push(asset);
+    }
+    for path in &input.task.audio_paths {
+        let asset = match import_mcp_asset_from_path(&mcp_assets_dir, path) {
+            Ok(asset) => asset,
+            Err(error) => {
+                cleanup_imported_assets(&imported_assets);
+                return Err(error);
+            }
+        };
+        if asset.kind != AssetKind::Audio {
+            cleanup_imported_assets(&imported_assets);
+            return Err(SchedulerError::UnsupportedAssetType(asset.mime));
+        }
+        audio_asset_ids.push(asset.id.clone());
+        imported_assets.push(asset);
+    }
+    if image_asset_ids.is_empty() {
+        return Err(SchedulerError::MissingImageInput);
+    }
+
+    let mut params = previous.params.clone();
+    if let Some(orientation) = input.task.orientation.as_deref() {
+        params.ratio = mcp_orientation_to_ratio(Some(orientation))?;
+    }
+    if let Some(model) = input.task.model.as_deref() {
+        params.model_version = mcp_model_to_version(Some(model))?;
+    }
+    if let Some(duration) = input.task.duration {
+        params.duration = duration;
+    }
+    if let Some(resolution) = input.task.video_resolution.as_deref() {
+        params.video_resolution = resolution.trim().to_string();
+    }
+    validate_video_params(&params)?;
+    let draft = TaskDraft {
+        title: if input.task.title.trim().is_empty() {
+            previous.title.clone()
+        } else {
+            input.task.title
+        },
+        prompt: input.task.prompt,
+        image_asset_ids,
+        audio_asset_ids,
+        role_ids: previous.role_ids.clone(),
+        manual_mention_ids: previous.manual_mention_ids.clone(),
+        auto_match_roles: previous.auto_match_roles,
+        params,
+        scheduled_at: previous.scheduled_at.clone(),
+        temp_image_asset_ids: vec![],
+        temp_image_paths: vec![],
+        prompt_doc: None,
+    };
+
+    let mut preview_data = data.clone();
+    preview_data.assets.extend(imported_assets.clone());
+    let update_result = (|| {
+        let (preview, _) = build_optional_draft_preview_from_parts(
+            &draft,
+            &preview_data.assets,
+            &preview_data.roles,
+        )?;
+        data.assets.extend(imported_assets.clone());
+        let mut updated = update_task_from_data(data, &input.task_id, draft, "draft")?;
+        if previous.status == "retry_wait" {
+            let task = data
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == input.task_id)
+                .expect("task exists after draft update");
+            task.status = "failed".to_string();
+            task.next_run_at = None;
+            updated = task.clone();
+        }
+        Ok::<_, SchedulerError>((updated, preview))
+    })();
+    let (updated, preview) = match update_result {
+        Ok(value) => value,
+        Err(error) => {
+            cleanup_imported_assets(&imported_assets);
+            return Err(error);
+        }
+    };
+    debug_assert_eq!(updated.command_preview, preview);
+    append_task_log(
+        data,
+        &updated,
+        LogEntryDraft {
+            level: LogLevel::Info,
+            source: LogSource::Scheduler,
+            category: "task".to_string(),
+            event_type: "mcp_update_failed_draft".to_string(),
+            message: format!("MCP 原位保存失败任务新版草稿：{}", updated.title),
+            detail: "未重新排队，等待手动重试".to_string(),
+            task_id: None,
+            task_title: None,
+            submit_id: None,
+            execution_record_id: None,
+            error_detail: None,
+            raw_output: None,
+            stdout: None,
+            stderr: None,
+            module: Some("mcp".to_string()),
+        },
+    );
+    Ok(McpQueuedVideoTask {
+        task: updated,
+        imported_assets,
+    })
+}
+
+fn is_never_executed_queued_task(task: &ScheduledTask) -> bool {
+    task.status == "queued"
+        && task.attempt_count == 0
+        && task.attempts.is_empty()
+        && task.submit_id.trim().is_empty()
+        && task.submitted_at.is_none()
+        && task.finished_at.trim().is_empty()
+        && task.result_paths.is_empty()
+        && task.result_urls.is_empty()
+        && task.execution_records.is_empty()
+}
+
+fn preflight_mcp_asset_paths(
+    paths: &[String],
+    expected_kind: AssetKind,
+) -> Result<(), SchedulerError> {
+    for path in paths {
+        let source = PathBuf::from(path);
+        let extension = source
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let actual_kind = match extension.as_str() {
+            "png" | "jpg" | "jpeg" | "webp" => AssetKind::Image,
+            "mp3" | "wav" | "m4a" | "aac" => AssetKind::Audio,
+            "mp4" | "mov" | "webm" | "mkv" => return Err(SchedulerError::UnsupportedVideoAsset),
+            _ => return Err(SchedulerError::UnsupportedAssetType(extension)),
+        };
+        if actual_kind != expected_kind {
+            return Err(SchedulerError::UnsupportedAssetType(path.clone()));
+        }
+        let metadata =
+            fs::metadata(&source).map_err(|error| SchedulerError::Io(error.to_string()))?;
+        if !metadata.is_file() {
+            return Err(SchedulerError::Io(format!(
+                "素材不是文件：{}",
+                source.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_imported_assets(assets: &[Asset]) {
+    for asset in assets {
+        let _ = fs::remove_file(&asset.stored_path);
+    }
 }
 
 fn merge_mcp_video_defaults(
@@ -5179,8 +5647,7 @@ pub fn queue_tasks_with_batch_schedule(
     planned_submit_count: u32,
     alternate_fast_model: bool,
 ) -> Result<Vec<ScheduledTask>, SchedulerError> {
-    let task_ids: Vec<String> = plan.iter().map(|item| item.task_id.clone()).collect();
-    if task_ids.is_empty() {
+    if plan.is_empty() {
         return Ok(vec![]);
     }
     for item in plan {
@@ -5207,8 +5674,9 @@ pub fn queue_tasks_with_batch_schedule(
         "succeeded",
     ];
     let mut seen: HashSet<String> = HashSet::new();
-    let mut task_indices = Vec::with_capacity(task_ids.len());
-    for task_id in task_ids {
+    let mut selected_tasks = Vec::with_capacity(plan.len());
+    for item in plan {
+        let task_id = &item.task_id;
         if !seen.insert(task_id.clone()) {
             return Err(SchedulerError::Io(format!("任务重复：{task_id}")));
         }
@@ -5228,17 +5696,16 @@ pub fn queue_tasks_with_batch_schedule(
             // 已经是 Fast 模型的任务跳过，不参与交替排队
             continue;
         }
-        task_indices.push(index);
+        selected_tasks.push((index, item.scheduled_at.clone()));
     }
 
     let normalized_count = normalize_planned_submit_count(planned_submit_count);
     let now = now_rfc3339();
-    let mut updated = Vec::with_capacity(task_indices.len());
-    for (order, index) in task_indices.into_iter().enumerate() {
+    let mut updated = Vec::with_capacity(selected_tasks.len());
+    for (index, scheduled_at) in selected_tasks {
         let task = &mut data.tasks[index];
-        let scheduled_at = plan
-            .get(order)
-            .and_then(|item| item.scheduled_at.as_ref())
+        let scheduled_at = scheduled_at
+            .as_ref()
             .map(|value| value.trim())
             .filter(|value| !value.is_empty());
         task.planned_submit_count = normalized_count;
@@ -5301,19 +5768,21 @@ where
         .map(Some);
     }
 
-    if let Some((task_id, submit_id)) = next_due_initial_current_query_target(data, now) {
-        return query_task_submit_id_once_with_runner(data, &task_id, &submit_id, &mut runner)
-            .map(Some);
-    }
+    if data.settings.auto_query_enabled {
+        if let Some((task_id, submit_id)) = next_due_initial_current_query_target(data, now) {
+            return query_task_submit_id_once_with_runner(data, &task_id, &submit_id, &mut runner)
+                .map(Some);
+        }
 
-    if let Some((task_id, submit_id)) = next_due_execution_query_target(data, now) {
-        return query_task_submit_id_once_with_runner(data, &task_id, &submit_id, &mut runner)
-            .map(Some);
-    }
+        if let Some((task_id, submit_id)) = next_due_execution_query_target(data, now) {
+            return query_task_submit_id_once_with_runner(data, &task_id, &submit_id, &mut runner)
+                .map(Some);
+        }
 
-    if let Some((task_id, submit_id)) = next_due_current_query_target(data, now) {
-        return query_task_submit_id_once_with_runner(data, &task_id, &submit_id, &mut runner)
-            .map(Some);
+        if let Some((task_id, submit_id)) = next_due_current_query_target(data, now) {
+            return query_task_submit_id_once_with_runner(data, &task_id, &submit_id, &mut runner)
+                .map(Some);
+        }
     }
 
     Ok(None)
@@ -5335,6 +5804,37 @@ pub fn pause_task(data: &mut AppData, task_id: &str) -> Result<ScheduledTask, Sc
     data.tasks[task_index].status = "paused".to_string();
     data.tasks[task_index].updated_at = now_rfc3339();
     Ok(data.tasks[task_index].clone())
+}
+
+pub fn pause_tasks(
+    data: &mut AppData,
+    task_ids: &[String],
+) -> Result<Vec<ScheduledTask>, SchedulerError> {
+    let mut unique_ids = Vec::with_capacity(task_ids.len());
+    for task_id in task_ids {
+        if !unique_ids.contains(task_id) {
+            unique_ids.push(task_id.clone());
+        }
+    }
+
+    for task_id in &unique_ids {
+        let task = data
+            .tasks
+            .iter()
+            .find(|task| task.id == *task_id)
+            .ok_or_else(|| SchedulerError::Io(format!("找不到任务：{task_id}")))?;
+        if !matches!(task.status.as_str(), "scheduled" | "queued" | "retry_wait") {
+            return Err(SchedulerError::Io(format!(
+                "任务「{}」当前状态 {} 不可暂停",
+                task.title, task.status
+            )));
+        }
+    }
+
+    unique_ids
+        .iter()
+        .map(|task_id| pause_task(data, task_id))
+        .collect()
 }
 
 pub fn resume_task(
@@ -5425,11 +5925,20 @@ pub fn reschedule_task(
 }
 
 pub fn delete_task_from_data(data: &mut AppData, task_id: &str) -> Result<(), SchedulerError> {
-    let before = data.tasks.len();
-    data.tasks.retain(|task| task.id != task_id);
-    if data.tasks.len() == before {
-        return Err(SchedulerError::Io(format!("找不到任务：{task_id}")));
+    let index = data
+        .tasks
+        .iter()
+        .position(|task| task.id == task_id)
+        .ok_or_else(|| SchedulerError::Io(format!("找不到任务：{task_id}")))?;
+    if matches!(
+        data.tasks[index].status.as_str(),
+        "submitting" | "submitted" | "querying"
+    ) {
+        return Err(SchedulerError::Io(
+            "任务已开始提交、远端排队或生成，当前不可删除".to_string(),
+        ));
     }
+    data.tasks.remove(index);
     data.task_priorities.remove(task_id);
     Ok(())
 }
@@ -5513,7 +6022,7 @@ pub fn query_task_once(data: &mut AppData, task_id: &str) -> Result<ScheduledTas
     query_task_once_with_runner(data, task_id, |args| run_dreamina_command(args))
 }
 
-/// 同 `query_task_submit_id_once_with_runner`，但跳过 4 小时上限（用于手动查询）
+/// 同 `query_task_submit_id_once_with_runner`，但跳过最长等待上限（用于手动查询）。
 pub fn manual_query_task_submit_id_with_runner<F>(
     data: &mut AppData,
     task_id: &str,
@@ -5530,6 +6039,13 @@ where
 /// Skips already-downloaded files (same URL base name already exists).
 pub fn download_result_urls(urls: &[String], results_dir: &Path) -> Vec<String> {
     let _ = fs::create_dir_all(results_dir);
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .connect_timeout(StdDuration::from_secs(10))
+        .timeout(StdDuration::from_secs(120))
+        .build()
+    else {
+        return vec![];
+    };
     let mut saved = Vec::new();
     for url in urls {
         let ext = url
@@ -5538,27 +6054,89 @@ pub fn download_result_urls(urls: &[String], results_dir: &Path) -> Vec<String> 
             .unwrap_or("")
             .rsplit('.')
             .next()
-            .unwrap_or("mp4");
-        let safe_ext = if ["mp4", "mov", "webm", "mkv", "png", "jpg", "jpeg", "webp"].contains(&ext)
+            .unwrap_or("mp4")
+            .to_ascii_lowercase();
+        let safe_ext = if [
+            "mp4", "mov", "webm", "mkv", "png", "jpg", "jpeg", "webp", "gif",
+        ]
+        .contains(&ext.as_str())
         {
-            ext
+            ext.as_str()
         } else {
             "mp4"
         };
-        let id = format!("result_{}", Uuid::new_v4().simple());
+        let url_hash = format!("{:x}", Sha256::digest(url.as_bytes()));
+        let id = format!("result_{}", &url_hash[..16]);
         let local_path = results_dir.join(format!("{id}.{safe_ext}"));
-        match reqwest::blocking::get(url.as_str()) {
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(bytes) = resp.bytes() {
-                    if fs::write(&local_path, &bytes).is_ok() {
-                        saved.push(local_path.to_string_lossy().to_string());
-                    }
-                }
-            }
-            _ => {}
+        if fs::metadata(&local_path)
+            .map(|meta| meta.is_file() && meta.len() > 0)
+            .unwrap_or(false)
+        {
+            saved.push(local_path.to_string_lossy().to_string());
+            continue;
+        }
+        let Ok(mut response) = client.get(url).send() else {
+            continue;
+        };
+        if !response.status().is_success() {
+            continue;
+        }
+        let temp_path = results_dir.join(format!("{id}.{}.part", Uuid::new_v4().simple()));
+        let copied = fs::File::create(&temp_path)
+            .ok()
+            .and_then(|mut file| std::io::copy(&mut response, &mut file).ok())
+            .is_some();
+        if copied && fs::rename(&temp_path, &local_path).is_ok() {
+            saved.push(local_path.to_string_lossy().to_string());
+        } else {
+            let _ = fs::remove_file(&temp_path);
         }
     }
     saved
+}
+
+fn attach_downloaded_result_paths(
+    data: &mut AppData,
+    task_id: &str,
+    submit_id: &str,
+    downloaded: &[String],
+) {
+    let Some(task) = data.tasks.iter_mut().find(|task| task.id == task_id) else {
+        return;
+    };
+    if task.submit_id == submit_id {
+        for path in downloaded {
+            push_unique(&mut task.result_paths, path.clone());
+        }
+    }
+    if let Some(record) = task
+        .execution_records
+        .iter_mut()
+        .find(|record| record.submit_id == submit_id)
+    {
+        for path in downloaded {
+            push_unique(&mut record.result_paths, path.clone());
+        }
+    }
+    task.updated_at = now_rfc3339();
+}
+
+fn spawn_result_download(root_dir: PathBuf, task_id: String, submit_id: String, urls: Vec<String>) {
+    if urls.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let results_dir = root_dir.join("role-media").join("results");
+        let downloaded = download_result_urls(&urls, &results_dir);
+        if downloaded.is_empty() {
+            return;
+        }
+        let store = AppStore::load(root_dir);
+        let _ = store.mutate(|data| {
+            attach_downloaded_result_paths(data, &task_id, &submit_id, &downloaded);
+            Ok(())
+        });
+    });
 }
 
 #[derive(Debug, Clone)]
@@ -5576,7 +6154,6 @@ pub enum DueTaskCliAction {
     Submit {
         model_version_override: Option<String>,
     },
-    FastFallbackSubmit,
 }
 
 #[derive(Debug, Clone)]
@@ -5643,49 +6220,51 @@ pub fn peek_due_task_cli(data: &AppData) -> Result<Option<DueTaskCli>, DueTaskBu
         }));
     }
 
-    if let Some((task_id, submit_id)) = next_due_initial_current_query_target(data, now) {
-        let args = vec![
-            "query_result".to_string(),
-            format!("--submit_id={submit_id}"),
-        ];
-        return Ok(Some(DueTaskCli {
-            task_id,
-            args,
-            action: DueTaskCliAction::Query { submit_id },
-        }));
-    }
+    if data.settings.auto_query_enabled {
+        if let Some((task_id, submit_id)) = next_due_initial_current_query_target(data, now) {
+            let args = vec![
+                "query_result".to_string(),
+                format!("--submit_id={submit_id}"),
+            ];
+            return Ok(Some(DueTaskCli {
+                task_id,
+                args,
+                action: DueTaskCliAction::Query { submit_id },
+            }));
+        }
 
-    if let Some((task_id, submit_id)) = next_due_execution_query_target(data, now) {
-        let args = vec![
-            "query_result".to_string(),
-            format!("--submit_id={submit_id}"),
-        ];
-        return Ok(Some(DueTaskCli {
-            task_id,
-            args,
-            action: DueTaskCliAction::Query { submit_id },
-        }));
-    }
+        if let Some((task_id, submit_id)) = next_due_execution_query_target(data, now) {
+            let args = vec![
+                "query_result".to_string(),
+                format!("--submit_id={submit_id}"),
+            ];
+            return Ok(Some(DueTaskCli {
+                task_id,
+                args,
+                action: DueTaskCliAction::Query { submit_id },
+            }));
+        }
 
-    if let Some((task_id, submit_id)) = next_due_current_query_target(data, now) {
-        let args = vec![
-            "query_result".to_string(),
-            format!("--submit_id={submit_id}"),
-        ];
-        return Ok(Some(DueTaskCli {
-            task_id,
-            args,
-            action: DueTaskCliAction::Query { submit_id },
-        }));
+        if let Some((task_id, submit_id)) = next_due_current_query_target(data, now) {
+            let args = vec![
+                "query_result".to_string(),
+                format!("--submit_id={submit_id}"),
+            ];
+            return Ok(Some(DueTaskCli {
+                task_id,
+                args,
+                action: DueTaskCliAction::Query { submit_id },
+            }));
+        }
     }
 
     Ok(None)
 }
 
-/// 后台调度循环的空闲短路判定：仅当存在活跃任务、或有到期工作（含构建出错需处理）时才跑重函数。
-/// 完全空闲（无活跃任务且 `peek_due_task_cli` 返回 Ok(None)）时返回 false，跳过整份读写与噪音日志。
+/// 后台调度循环的空闲短路判定：只有到期动作（含构建出错需处理）才跑重函数。
+/// 远端任务仍活跃但尚未到自适应查询时间时返回 false，避免每 30 秒重写整份状态。
 pub fn should_process_now(data: &AppData) -> bool {
-    has_active_tasks(&data.tasks) || !matches!(peek_due_task_cli(data), Ok(None))
+    !matches!(peek_due_task_cli(data), Ok(None))
 }
 
 pub fn query_task_once_with_runner<F>(
@@ -5715,160 +6294,6 @@ where
     F: FnMut(&[String]) -> Result<(String, String), String>,
 {
     query_task_submit_id_once_with_runner_inner(data, task_id, submit_id, &mut runner, false)
-}
-
-fn fast_fallback_draft(task: &ScheduledTask) -> TaskDraft {
-    let mut params = task.params.clone();
-    params.model_version = FAST_FALLBACK_MODEL_VERSION.to_string();
-    TaskDraft {
-        title: task.title.clone(),
-        prompt: task.prompt.clone(),
-        image_asset_ids: task.image_asset_ids.clone(),
-        audio_asset_ids: task.audio_asset_ids.clone(),
-        role_ids: task.role_ids.clone(),
-        manual_mention_ids: task.manual_mention_ids.clone(),
-        auto_match_roles: task.auto_match_roles,
-        params,
-        scheduled_at: task.scheduled_at.clone(),
-        temp_image_asset_ids: task.temp_image_asset_ids.clone(),
-        temp_image_paths: task.temp_image_paths.clone(),
-        prompt_doc: task.prompt_doc.clone(),
-    }
-}
-
-fn input_snapshot_from_task_with_params(
-    task: &ScheduledTask,
-    params: VideoParams,
-) -> TaskExecutionInputSnapshot {
-    TaskExecutionInputSnapshot {
-        prompt: task.prompt.clone(),
-        image_asset_ids: task.image_asset_ids.clone(),
-        audio_asset_ids: task.audio_asset_ids.clone(),
-        role_ids: task.role_ids.clone(),
-        manual_mention_ids: task.manual_mention_ids.clone(),
-        auto_match_roles: task.auto_match_roles,
-        params,
-        temp_image_asset_ids: task.temp_image_asset_ids.clone(),
-    }
-}
-
-pub fn submit_fast_fallback_once_with_runner<F>(
-    data: &mut AppData,
-    task_id: &str,
-    mut runner: F,
-) -> Result<ScheduledTask, SchedulerError>
-where
-    F: FnMut(&[String]) -> Result<(String, String), String>,
-{
-    let task_index = data
-        .tasks
-        .iter()
-        .position(|task| task.id == task_id)
-        .ok_or_else(|| SchedulerError::Io(format!("找不到任务：{task_id}")))?;
-    let task = data.tasks[task_index].clone();
-    let draft = fast_fallback_draft(&task);
-    let resolved = resolve_task_inputs(&draft, &data.assets, &data.roles)?;
-    let args = build_multimodal2video_args(&draft, &resolved)?;
-    let started_at = now_rfc3339();
-    let (stdout, stderr) = match runner(&args) {
-        Ok(output) => output,
-        Err(message) => {
-            let finished = now_rfc3339();
-            let duration_secs = calc_duration_seconds(&started_at, &finished);
-            data.tasks[task_index].attempts.push(TaskAttempt {
-                id: format!("attempt_{}", Uuid::new_v4().simple()),
-                started_at: started_at.clone(),
-                finished_at: finished.clone(),
-                status: "failed".to_string(),
-                command_preview: args.clone(),
-                stdout: String::new(),
-                stderr: truncate_log(&message),
-                error_kind: "FastFallback".to_string(),
-                duration_seconds: duration_secs,
-                error_detail: message.clone(),
-            });
-            data.tasks[task_index]
-                .execution_records
-                .push(TaskExecutionRecord {
-                    id: format!("exec_{}", Uuid::new_v4().simple()),
-                    submit_id: String::new(),
-                    status: "failed".to_string(),
-                    started_at,
-                    finished_at: finished,
-                    input_snapshot: input_snapshot_from_task_with_params(&task, draft.params),
-                    command_preview: args,
-                    query_records: vec![],
-                    result_paths: vec![],
-                    result_urls: vec![],
-                    error_kind: "FastFallback".to_string(),
-                    error_detail: message,
-                });
-            data.tasks[task_index].updated_at = now_rfc3339();
-            return Ok(data.tasks[task_index].clone());
-        }
-    };
-
-    let raw = format!("{stdout}\n{stderr}");
-    let parsed = parse_submit_output(&raw);
-    let submit_failed = parsed
-        .gen_status
-        .as_deref()
-        .map(|status| {
-            let normalized = status.trim().to_ascii_lowercase();
-            normalized.contains("fail") || normalized.contains("cancel")
-        })
-        .unwrap_or(false);
-    let finished = now_rfc3339();
-    let duration_secs = calc_duration_seconds(&started_at, &finished);
-    let submit_id = parsed.submit_id.unwrap_or_default();
-    let status = if submit_failed {
-        "failed".to_string()
-    } else if parsed.gen_status.as_deref() == Some("success") {
-        "succeeded".to_string()
-    } else if data.settings.auto_query_enabled {
-        "querying".to_string()
-    } else {
-        "submitted".to_string()
-    };
-    let error_detail = if submit_failed {
-        parsed.fail_reason.unwrap_or_else(|| raw.trim().to_string())
-    } else {
-        String::new()
-    };
-    data.tasks[task_index].attempts.push(TaskAttempt {
-        id: format!("attempt_{}", Uuid::new_v4().simple()),
-        started_at: started_at.clone(),
-        finished_at: finished.clone(),
-        status: status.clone(),
-        command_preview: args.clone(),
-        stdout: truncate_log(&stdout),
-        stderr: truncate_log(&stderr),
-        error_kind: "FastFallback".to_string(),
-        duration_seconds: duration_secs,
-        error_detail: error_detail.clone(),
-    });
-    data.tasks[task_index]
-        .execution_records
-        .push(TaskExecutionRecord {
-            id: format!("exec_{}", Uuid::new_v4().simple()),
-            submit_id: submit_id.clone(),
-            status: status.clone(),
-            started_at,
-            finished_at: if status == "succeeded" || status == "failed" {
-                finished.clone()
-            } else {
-                String::new()
-            },
-            input_snapshot: input_snapshot_from_task_with_params(&task, draft.params),
-            command_preview: args,
-            query_records: vec![],
-            result_paths: vec![],
-            result_urls: vec![],
-            error_kind: "FastFallback".to_string(),
-            error_detail,
-        });
-    data.tasks[task_index].updated_at = finished;
-    Ok(data.tasks[task_index].clone())
 }
 
 fn query_task_submit_id_once_with_runner_inner<F>(
@@ -5918,8 +6343,17 @@ where
             let finished = now_rfc3339();
             let duration_secs = calc_duration_seconds(&started_at, &finished);
             let classified = classify_dreamina_error(&message, &data.settings);
-            let waitable = is_waitable_query_error(&classified.kind, &classified.next_status);
-            let error_kind = format!("{:?}", classified.kind);
+            // 已拿到 submit_id 的任务已经被远端受理。本地查询进程异常时没有
+            // 远端失败证据，必须继续追踪，不能把远端任务误标为失败。
+            let local_query_unavailable = is_current_submit
+                && !is_waitable_query_error(&classified.kind, &classified.next_status);
+            let waitable = local_query_unavailable
+                || is_waitable_query_error(&classified.kind, &classified.next_status);
+            let error_kind = if local_query_unavailable {
+                "QueryUnavailable".to_string()
+            } else {
+                format!("{:?}", classified.kind)
+            };
             let error_detail = if waitable {
                 compact_query_retry_error_detail(&error_kind, &message)
             } else {
@@ -6063,7 +6497,7 @@ where
             reset_query_backoff(&mut data.tasks[task_index]);
         } else if !is_manual && is_current_submit && is_past_max_wait(&data.tasks[task_index], now)
         {
-            // 检查是否超过 4 小时等待上限（手动查询不触发该限制）
+            // 检查是否超过最长等待上限（手动查询不触发该限制）
             final_status = "submitted".to_string();
             final_error_detail = format!(
                 "自动查询已停止（已等待超过 {} 小时），请手动查询",
@@ -6958,19 +7392,115 @@ fn dreamina_candidates() -> Vec<String> {
     candidates
 }
 
+fn command_output_to_result(output: std::process::Output) -> Result<(String, String), String> {
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if !output.status.success() {
+        let code = output
+            .status
+            .code()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "未知".to_string());
+        let detail = [stderr.trim(), stdout.trim()]
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(if detail.is_empty() {
+            format!("dreamina CLI 退出码 {code}")
+        } else {
+            format!("dreamina CLI 退出码 {code}: {detail}")
+        });
+    }
+    if stdout.trim().is_empty() && !stderr.trim().is_empty() {
+        let classified = classify_dreamina_error(&stderr, &SchedulerSettings::default());
+        if classified.kind != DreaminaErrorKind::Generic {
+            return Err(stderr.trim().to_string());
+        }
+    }
+    Ok((stdout, stderr))
+}
+
+fn run_command_with_timeout(
+    program: &str,
+    args: &[String],
+    timeout: StdDuration,
+) -> Result<std::process::Output, String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "无法读取 dreamina CLI 标准输出".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "无法读取 dreamina CLI 错误输出".to_string())?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut reader = stdout;
+        let mut bytes = Vec::new();
+        let _ = reader.read_to_end(&mut bytes);
+        bytes
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut reader = stderr;
+        let mut bytes = Vec::new();
+        let _ = reader.read_to_end(&mut bytes);
+        bytes
+    });
+    let deadline = std::time::Instant::now() + timeout;
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!(
+                    "dreamina CLI timeout：执行超时（{} 秒），已终止本次操作",
+                    timeout.as_secs_f64()
+                ));
+            }
+            Ok(None) => std::thread::sleep(StdDuration::from_millis(25)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(error.to_string());
+            }
+        }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "读取 dreamina CLI 标准输出失败".to_string())?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "读取 dreamina CLI 错误输出失败".to_string())?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 fn run_dreamina_command(args: &[String]) -> Result<(String, String), String> {
     let cli = check_dreamina_cli_status();
     if !cli.available {
         return Err(cli.message);
     }
-    let output = Command::new(&cli.path)
-        .args(args)
-        .output()
-        .map_err(|error| error.to_string())?;
-    Ok((
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
-    ))
+    let output = run_command_with_timeout(
+        &cli.path,
+        args,
+        StdDuration::from_secs(DREAMINA_CLI_TIMEOUT_SECS),
+    )?;
+    command_output_to_result(output)
 }
 
 fn now_rfc3339() -> String {
@@ -7110,11 +7640,18 @@ fn try_begin_process_queue() -> Option<ProcessQueueGuard> {
 
 struct StoreQueueLockGuard {
     path: PathBuf,
+    token: String,
 }
 
 impl Drop for StoreQueueLockGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let expected_token = format!("token={}", self.token);
+        let owns_lock = fs::read_to_string(&self.path)
+            .map(|content| content.lines().any(|line| line == expected_token))
+            .unwrap_or(false);
+        if owns_lock {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -7139,17 +7676,26 @@ fn lock_is_stale(content: &str, now: DateTime<Utc>, stale_secs: i64) -> bool {
 }
 
 fn create_store_queue_lock(lock_path: &Path, origin: &str) -> Option<StoreQueueLockGuard> {
+    let token = Uuid::new_v4().simple().to_string();
     match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(lock_path)
     {
         Ok(mut file) => {
-            let _ = writeln!(file, "origin={origin}");
-            let _ = writeln!(file, "pid={}", std::process::id());
-            let _ = writeln!(file, "created_at={}", now_rfc3339());
+            let written = writeln!(file, "token={token}")
+                .and_then(|_| writeln!(file, "origin={origin}"))
+                .and_then(|_| writeln!(file, "pid={}", std::process::id()))
+                .and_then(|_| writeln!(file, "created_at={}", now_rfc3339()))
+                .is_ok();
+            if !written {
+                drop(file);
+                let _ = fs::remove_file(lock_path);
+                return None;
+            }
             Some(StoreQueueLockGuard {
                 path: lock_path.to_path_buf(),
+                token,
             })
         }
         Err(_) => None,
@@ -7167,7 +7713,22 @@ fn try_acquire_store_queue_lock(store: &AppStore, origin: &str) -> Option<StoreQ
     }
     // 已存在：若是陈旧锁（持有者崩溃/强退/被 kill 遗留），回收后重试一次，避免永久卡死调度。
     if let Ok(content) = fs::read_to_string(&lock_path) {
-        if lock_is_stale(&content, Utc::now(), QUEUE_LOCK_STALE_SECS) {
+        let has_parseable_created_at = content.lines().any(|line| {
+            line.strip_prefix("created_at=")
+                .and_then(|value| DateTime::parse_from_rfc3339(value.trim()).ok())
+                .is_some()
+        });
+        let stale = if has_parseable_created_at {
+            lock_is_stale(&content, Utc::now(), QUEUE_LOCK_STALE_SECS)
+        } else {
+            fs::metadata(&lock_path)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .map(|age| age >= StdDuration::from_secs(QUEUE_LOCK_STALE_SECS as u64))
+                .unwrap_or(false)
+        };
+        if stale {
             let _ = fs::remove_file(&lock_path);
             return create_store_queue_lock(&lock_path, origin);
         }
@@ -7254,6 +7815,43 @@ pub fn cap_execution_history(data: &mut AppData) -> usize {
     removed
 }
 
+const MAX_FRONTEND_LOG_ENTRIES: usize = 200;
+
+fn compact_attempt_for_frontend(attempt: &mut TaskAttempt) {
+    let queue_info = parse_query_output(&attempt.stdout).queue_info;
+    attempt.stdout = queue_info
+        .and_then(|queue| serde_json::to_string(&serde_json::json!({ "queue_info": queue })).ok())
+        .unwrap_or_default();
+    attempt.stderr.clear();
+    attempt.command_preview.clear();
+}
+
+/// IPC 只传 UI 实际使用的数据。磁盘中的完整历史保持不变。
+fn frontend_app_state(mut data: AppData) -> AppData {
+    if data.logs.len() > MAX_FRONTEND_LOG_ENTRIES {
+        let remove = data.logs.len() - MAX_FRONTEND_LOG_ENTRIES;
+        data.logs.drain(0..remove);
+    }
+    for log in &mut data.logs {
+        log.detail.clear();
+        log.error_detail = None;
+        log.raw_output = None;
+        log.stdout = None;
+        log.stderr = None;
+    }
+    for task in &mut data.tasks {
+        for attempt in &mut task.attempts {
+            compact_attempt_for_frontend(attempt);
+        }
+        for record in &mut task.execution_records {
+            for attempt in &mut record.query_records {
+                compact_attempt_for_frontend(attempt);
+            }
+        }
+    }
+    data
+}
+
 /// Trim log entries older than `log_retention_days` (default 3 days).
 /// Logs are chronologically ordered (always appended), so binary search is used.
 fn apply_log_retention(data: &mut AppData) {
@@ -7282,7 +7880,7 @@ pub fn process_queue_for_store_blocking(
         Ok(())
     });
 
-    let Some(_guard) = try_begin_process_queue() else {
+    let Some(process_guard) = try_begin_process_queue() else {
         let _ = store.mutate(|data| {
             record_scheduler_tick(data, origin, "skipped_busy");
             Ok(())
@@ -7290,7 +7888,7 @@ pub fn process_queue_for_store_blocking(
         return Ok(None);
     };
 
-    let Some(_store_lock) = try_acquire_store_queue_lock(store, origin) else {
+    let Some(store_lock) = try_acquire_store_queue_lock(store, origin) else {
         let _ = store.mutate(|data| {
             record_scheduler_tick(data, origin, "skipped_busy");
             Ok(())
@@ -7431,9 +8029,6 @@ pub fn process_queue_for_store_blocking(
                     model_version_override.as_deref(),
                     |_| cli_result.clone(),
                 )?,
-                DueTaskCliAction::FastFallbackSubmit => {
-                    submit_fast_fallback_once_with_runner(data, &task_id, |_| cli_result.clone())?
-                }
             };
             append_task_log(
                 data,
@@ -7463,31 +8058,17 @@ pub fn process_queue_for_store_blocking(
             Ok(task)
         })
         .map_err(|error| error.to_string())?;
+    drop(store_lock);
+    drop(process_guard);
     if task.status == "succeeded" && !task.result_urls.is_empty() {
-        let results_dir = store.assets_dir().join("results");
-        let urls = task.result_urls.clone();
-        let tid = task.id.clone();
-        let downloaded = download_result_urls(&urls, &results_dir);
-        if !downloaded.is_empty() {
-            let _ = store.mutate(|data| {
-                if let Some(t) = data.tasks.iter_mut().find(|t| t.id == tid) {
-                    for p in &downloaded {
-                        if !t.result_paths.contains(p) {
-                            t.result_paths.push(p.clone());
-                        }
-                    }
-                }
-                Ok(())
-            });
-        }
+        spawn_result_download(
+            store.root_dir.clone(),
+            task.id.clone(),
+            task.submit_id.clone(),
+            task.result_urls.clone(),
+        );
     }
-    store
-        .snapshot()
-        .tasks
-        .into_iter()
-        .find(|t| t.id == task.id)
-        .map(Some)
-        .ok_or_else(|| "任务不存在".to_string())
+    Ok(Some(task))
 }
 
 fn start_background_scheduler(app_handle: tauri::AppHandle) {
@@ -7615,6 +8196,7 @@ pub fn run() {
             commands::set_lane_enabled_command,
             commands::set_task_queue_priority_command,
             commands::pause_task_command,
+            commands::pause_tasks_command,
             commands::resume_task_command,
             commands::reschedule_task_command,
             commands::open_result_dir_command,
@@ -7653,7 +8235,7 @@ pub mod commands {
 
     #[tauri::command]
     pub fn get_app_state(store: State<'_, AppStore>) -> AppData {
-        store.snapshot()
+        frontend_app_state(store.snapshot())
     }
 
     /// 廉价变更签名（仅 stat，不读取整份状态）。前端轮询比对，未变则跳过 `get_app_state`。
@@ -8123,6 +8705,8 @@ pub mod commands {
         store: State<'_, AppStore>,
         task_id: String,
     ) -> Result<ScheduledTask, String> {
+        let store_lock = try_acquire_store_queue_lock(&store, "manual_submit")
+            .ok_or_else(|| "调度器正在执行提交或查询，请稍后再试".to_string())?;
         // 锁外：从快照构建 CLI 参数
         let args = {
             let data = store.snapshot();
@@ -8190,34 +8774,15 @@ pub mod commands {
                 Ok(task)
             })
             .map_err(|e| e.to_string())?;
+        drop(store_lock);
         // 锁外：下载结果（如有）
         if task.status == "succeeded" && !task.result_urls.is_empty() {
-            let results_dir = store.assets_dir().join("results");
-            let urls = task.result_urls.clone();
-            let tid = task.id.clone();
-            let downloaded = tauri::async_runtime::spawn_blocking(move || {
-                download_result_urls(&urls, &results_dir)
-            })
-            .await
-            .unwrap_or_default();
-            if !downloaded.is_empty() {
-                let _ = store.mutate(|data| {
-                    if let Some(t) = data.tasks.iter_mut().find(|t| t.id == tid) {
-                        for p in &downloaded {
-                            if !t.result_paths.contains(p) {
-                                t.result_paths.push(p.clone());
-                            }
-                        }
-                    }
-                    Ok(())
-                });
-                return store
-                    .snapshot()
-                    .tasks
-                    .into_iter()
-                    .find(|t| t.id == task.id)
-                    .ok_or_else(|| "任务不存在".to_string());
-            }
+            spawn_result_download(
+                store.root_dir.clone(),
+                task.id.clone(),
+                task.submit_id.clone(),
+                task.result_urls.clone(),
+            );
         }
         Ok(task)
     }
@@ -8244,6 +8809,8 @@ pub mod commands {
         if submit_id.trim().is_empty() {
             return Err("任务没有 submit_id，无法查询".to_string());
         }
+        let store_lock = try_acquire_store_queue_lock(&store, "manual_query")
+            .ok_or_else(|| "调度器正在执行提交或查询，请稍后再刷新".to_string())?;
         // 锁外：运行 CLI
         let args = vec![
             "query_result".to_string(),
@@ -8297,6 +8864,7 @@ pub mod commands {
                 Ok(task)
             })
             .map_err(|e| e.to_string())?;
+        drop(store_lock);
         // 锁外：下载结果
         let result_urls = task
             .execution_records
@@ -8305,46 +8873,12 @@ pub mod commands {
             .map(|record| record.result_urls.clone())
             .unwrap_or_else(|| task.result_urls.clone());
         if !result_urls.is_empty() {
-            let results_dir = store.assets_dir().join("results");
-            let urls = result_urls.clone();
-            let tid = task.id.clone();
-            let queried_submit_id = submit_id.clone();
-            let downloaded = tauri::async_runtime::spawn_blocking(move || {
-                download_result_urls(&urls, &results_dir)
-            })
-            .await
-            .unwrap_or_default();
-            if !downloaded.is_empty() {
-                let _ = store.mutate(|data| {
-                    if let Some(t) = data.tasks.iter_mut().find(|t| t.id == tid) {
-                        if t.submit_id == queried_submit_id {
-                            for p in &downloaded {
-                                if !t.result_paths.contains(p) {
-                                    t.result_paths.push(p.clone());
-                                }
-                            }
-                        }
-                        if let Some(record) = t
-                            .execution_records
-                            .iter_mut()
-                            .find(|record| record.submit_id == queried_submit_id)
-                        {
-                            for p in &downloaded {
-                                if !record.result_paths.contains(p) {
-                                    record.result_paths.push(p.clone());
-                                }
-                            }
-                        }
-                    }
-                    Ok(())
-                });
-                return store
-                    .snapshot()
-                    .tasks
-                    .into_iter()
-                    .find(|t| t.id == task.id)
-                    .ok_or_else(|| "任务不存在".to_string());
-            }
+            spawn_result_download(
+                store.root_dir.clone(),
+                task.id.clone(),
+                submit_id.clone(),
+                result_urls,
+            );
         }
         Ok(task)
     }
@@ -9225,6 +9759,42 @@ pub mod commands {
     }
 
     #[tauri::command]
+    pub fn pause_tasks_command(
+        store: State<'_, AppStore>,
+        task_ids: Vec<String>,
+    ) -> Result<Vec<ScheduledTask>, String> {
+        store
+            .mutate(|data| {
+                let tasks = pause_tasks(data, &task_ids)?;
+                for task in &tasks {
+                    append_task_log(
+                        data,
+                        task,
+                        LogEntryDraft {
+                            level: LogLevel::Info,
+                            source: LogSource::Scheduler,
+                            category: "task".to_string(),
+                            event_type: "pause".to_string(),
+                            message: format!("批量暂停任务：{}", task.title),
+                            detail: String::new(),
+                            task_id: None,
+                            task_title: None,
+                            submit_id: None,
+                            execution_record_id: None,
+                            error_detail: None,
+                            raw_output: None,
+                            stdout: None,
+                            stderr: None,
+                            module: None,
+                        },
+                    );
+                }
+                Ok(tasks)
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    #[tauri::command]
     pub fn resume_task_command(
         store: State<'_, AppStore>,
         task_id: String,
@@ -9502,32 +10072,10 @@ pub mod commands {
     ) -> Result<String, String> {
         let results_dir = store.assets_dir().join("results");
         tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
-            fs::create_dir_all(&results_dir).map_err(|e| e.to_string())?;
-            let ext = url
-                .split('?')
+            download_result_urls(&[url], &results_dir)
+                .into_iter()
                 .next()
-                .unwrap_or("")
-                .rsplit('.')
-                .next()
-                .unwrap_or("mp4");
-            let safe_ext = if [
-                "mp4", "mov", "webm", "mkv", "png", "jpg", "jpeg", "webp", "gif",
-            ]
-            .contains(&ext)
-            {
-                ext
-            } else {
-                "mp4"
-            };
-            let id = format!("result_{}", Uuid::new_v4().simple());
-            let local_path = results_dir.join(format!("{id}.{safe_ext}"));
-            let response = reqwest::blocking::get(&url).map_err(|e| format!("下载失败：{e}"))?;
-            if !response.status().is_success() {
-                return Err(format!("下载失败：HTTP {}", response.status()));
-            }
-            let bytes = response.bytes().map_err(|e| format!("读取响应失败：{e}"))?;
-            fs::write(&local_path, &bytes).map_err(|e| format!("写入文件失败：{e}"))?;
-            Ok(local_path.to_string_lossy().to_string())
+                .ok_or_else(|| "下载失败或远端未返回有效文件".to_string())
         })
         .await
         .map_err(|e| format!("任务错误：{e}"))?
@@ -9648,11 +10196,7 @@ pub mod commands {
     pub fn delete_task_command(store: State<'_, AppStore>, task_id: String) -> Result<(), String> {
         store
             .mutate(|data| {
-                let before = data.tasks.len();
-                data.tasks.retain(|task| task.id != task_id);
-                if data.tasks.len() == before {
-                    return Err(SchedulerError::Io(format!("找不到任务：{task_id}")));
-                }
+                delete_task_from_data(data, &task_id)?;
                 append_log(
                     data,
                     LogEntryDraft {
@@ -9869,6 +10413,51 @@ fn find_json_string_field(value: &serde_json::Value, field: &str) -> Option<Stri
 mod tests {
     use super::*;
 
+    #[test]
+    fn mcp_queued_task_update_parses_compatible_task_id_and_image_aliases() {
+        let parsed = parse_mcp_queued_task_update_input(serde_json::json!({
+            "taskId": "task-1",
+            "prompt": "替换后的提示词",
+            "images": { "path": "file:///tmp/scene%2001.png" },
+        }))
+        .expect("兼容参数应被解析");
+        assert_eq!(parsed.task_id, "task-1");
+        assert_eq!(parsed.task.image_paths, vec!["/tmp/scene 01.png"]);
+    }
+
+    #[test]
+    fn only_pristine_queued_task_can_be_updated_in_place() {
+        let draft = TaskDraft {
+            title: "未执行任务".to_string(),
+            prompt: "提示词".to_string(),
+            image_asset_ids: vec![],
+            audio_asset_ids: vec![],
+            role_ids: vec![],
+            manual_mention_ids: vec![],
+            auto_match_roles: false,
+            params: VideoParams::default(),
+            scheduled_at: None,
+            temp_image_asset_ids: vec![],
+            temp_image_paths: vec![],
+            prompt_doc: None,
+        };
+        let mut task = ScheduledTask::from(draft);
+        assert!(is_never_executed_queued_task(&task));
+        task.attempts.push(TaskAttempt {
+            id: "attempt-1".to_string(),
+            started_at: String::new(),
+            finished_at: String::new(),
+            status: "failed".to_string(),
+            command_preview: vec![],
+            stdout: String::new(),
+            stderr: String::new(),
+            error_kind: String::new(),
+            duration_seconds: 0.0,
+            error_detail: String::new(),
+        });
+        assert!(!is_never_executed_queued_task(&task));
+    }
+
     fn make_task_with_execution_records() -> ScheduledTask {
         ScheduledTask {
             id: "task-1".to_string(),
@@ -9980,6 +10569,38 @@ mod tests {
             .expect("应找到第二次执行记录");
         assert_eq!(current_record.status, "querying");
         assert!(current_record.query_records.is_empty());
+    }
+
+    #[test]
+    fn downloaded_result_paths_are_attached_to_the_matching_submit_only() {
+        let mut data = AppData {
+            tasks: vec![make_task_with_execution_records()],
+            ..AppData::default()
+        };
+
+        attach_downloaded_result_paths(
+            &mut data,
+            "task-1",
+            "sub-1",
+            &["/downloaded/old.mp4".to_string()],
+        );
+        assert!(data.tasks[0].result_paths.is_empty());
+        assert_eq!(
+            data.tasks[0].execution_records[0].result_paths,
+            vec!["/old.mp4", "/downloaded/old.mp4"]
+        );
+
+        attach_downloaded_result_paths(
+            &mut data,
+            "task-1",
+            "sub-2",
+            &["/downloaded/current.mp4".to_string()],
+        );
+        assert_eq!(data.tasks[0].result_paths, vec!["/downloaded/current.mp4"]);
+        assert_eq!(
+            data.tasks[0].execution_records[1].result_paths,
+            vec!["/downloaded/current.mp4"]
+        );
     }
 
     fn make_pre_tns_querying_task(submit_id: &str) -> ScheduledTask {
@@ -10364,6 +10985,23 @@ mod tests {
         assert_eq!(store.state_signature(), s2, "空闲时签名应稳定不变");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn state_write_lock_from_dead_process_is_reclaimable_immediately() {
+        let dead_pid = i32::MAX as u32;
+        let content = format!("token=old\npid={dead_pid}\ncreated_at={}\n", now_rfc3339());
+        assert!(state_write_lock_owner_is_dead(&content));
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        std::fs::write(temp.path().join("state.write.lock"), content)
+            .expect("write dead owner lock");
+        let started = std::time::Instant::now();
+        let guard =
+            acquire_state_write_lock(temp.path()).expect("dead owner lock should be reclaimed");
+        assert!(started.elapsed() < StdDuration::from_secs(1));
+        drop(guard);
+    }
+
     // ── lock_is_stale（陈旧锁回收）─────────────────────────────────────────
 
     #[test]
@@ -10420,6 +11058,19 @@ mod tests {
         assert!(g1.is_some(), "首次应获取成功");
         let g2 = try_acquire_store_queue_lock(&store, "b");
         assert!(g2.is_none(), "新鲜锁应阻塞第二次获取");
+    }
+
+    #[test]
+    fn try_acquire_does_not_steal_a_newly_created_empty_lock() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = AppStore::load(temp.path().to_path_buf());
+        let lock_path = temp.path().join("queue.lock");
+        std::fs::File::create(&lock_path).expect("create fresh partial lock");
+
+        let guard = try_acquire_store_queue_lock(&store, "contender");
+
+        assert!(guard.is_none(), "刚创建的半写锁不能被当成陈旧锁抢走");
+        assert!(lock_path.exists());
     }
 
     // process_queue_for_store_blocking 用进程级全局原子 PROCESS_QUEUE_RUNNING，
@@ -10481,6 +11132,87 @@ mod tests {
             duration_seconds: 0.0,
             error_detail: String::new(),
         }
+    }
+
+    #[test]
+    fn frontend_state_projection_keeps_history_but_drops_heavy_transport_fields() {
+        let large_prompt = "长提示词".repeat(2_000);
+        let stdout = serde_json::json!({
+            "submit_id": "submit-1",
+            "gen_status": "querying",
+            "prompt": large_prompt,
+            "queue_info": {
+                "queue_idx": 23,
+                "queue_length": 456,
+                "queue_status": "Queueing"
+            }
+        })
+        .to_string();
+        let mut attempt = cap_attempt(1);
+        attempt.status = "querying".to_string();
+        attempt.stdout = stdout;
+        attempt.stderr = "重复的命令输出".repeat(1_000);
+
+        let mut task = make_queued_task_for_submit("frontend-projection");
+        task.attempts = vec![attempt.clone()];
+        task.execution_records = vec![TaskExecutionRecord {
+            id: "record-1".to_string(),
+            submit_id: "submit-1".to_string(),
+            status: "querying".to_string(),
+            started_at: "2026-07-11T00:00:00Z".to_string(),
+            finished_at: String::new(),
+            input_snapshot: TaskExecutionInputSnapshot::default(),
+            command_preview: vec![],
+            query_records: vec![attempt],
+            result_paths: vec![],
+            result_urls: vec![],
+            error_kind: String::new(),
+            error_detail: String::new(),
+        }];
+        let mut data = AppData {
+            tasks: vec![task],
+            ..AppData::default()
+        };
+        for index in 0..250 {
+            append_log(
+                &mut data,
+                LogEntryDraft {
+                    level: LogLevel::Debug,
+                    source: LogSource::System,
+                    category: "test".to_string(),
+                    event_type: "projection".to_string(),
+                    message: format!("log-{index}"),
+                    detail: "大段日志".repeat(500),
+                    task_id: None,
+                    task_title: None,
+                    submit_id: None,
+                    execution_record_id: None,
+                    error_detail: None,
+                    raw_output: None,
+                    stdout: None,
+                    stderr: None,
+                    module: None,
+                },
+            );
+        }
+
+        let projected = frontend_app_state(data.clone());
+
+        assert_eq!(data.logs.len(), 250, "磁盘态副本不能被裁剪");
+        assert_eq!(projected.logs.len(), 200, "前端只需要最近日志");
+        assert_eq!(projected.tasks[0].attempts.len(), 1);
+        assert_eq!(
+            projected.tasks[0].execution_records[0].query_records.len(),
+            1
+        );
+        let projected_attempt = &projected.tasks[0].execution_records[0].query_records[0];
+        assert!(projected_attempt.stdout.len() < 512);
+        assert!(projected_attempt.stderr.is_empty());
+        let queue = parse_query_output(&projected_attempt.stdout)
+            .queue_info
+            .expect("queue info should remain available to the UI");
+        assert_eq!(queue.queue_idx, Some(23));
+        assert_eq!(queue.queue_length, Some(456));
     }
 
     #[test]
@@ -10669,6 +11401,47 @@ mod tests {
         assert!(should_process_now(&data));
     }
 
+    #[test]
+    fn should_process_now_false_when_remote_query_is_not_due() {
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let mut task = make_backoff_task(1, Some(&now_text), false);
+        task.queue_info = Some(QueueInfo {
+            queue_idx: Some(5_000),
+            priority: Some(1),
+            queue_status: Some("Queueing".to_string()),
+            queue_length: Some(300_000),
+        });
+        let data = AppData {
+            tasks: vec![task],
+            ..AppData::default()
+        };
+
+        assert!(
+            !should_process_now(&data),
+            "查询未到期时不应执行重函数并重写整份状态"
+        );
+    }
+
+    #[test]
+    fn auto_query_disabled_does_not_plan_remote_query() {
+        let settings = SchedulerSettings {
+            auto_query_enabled: false,
+            ..SchedulerSettings::default()
+        };
+        let task = make_backoff_task(0, None, false);
+        let data = AppData {
+            settings,
+            tasks: vec![task],
+            ..AppData::default()
+        };
+
+        assert!(
+            peek_due_task_cli(&data).expect("plan query").is_none(),
+            "关闭自动查询后只能由手动刷新触发远端查询"
+        );
+    }
+
     // ── query_interval_secs（按队列状态/位置自适应，无退避增长）─────────────
     fn make_queue_task(queue_status: &str, queue_idx: Option<u64>) -> ScheduledTask {
         let mut task = make_backoff_task(0, None, false);
@@ -10787,7 +11560,7 @@ mod tests {
     }
 
     #[test]
-    fn is_past_max_wait_under_4_hours_returns_false() {
+    fn is_past_max_wait_under_limit_returns_false() {
         let recent = (Utc::now() - Duration::hours(2)).to_rfc3339();
         assert!(!is_past_max_wait(
             &make_past_max_task(Some(&recent)),
@@ -10821,7 +11594,7 @@ mod tests {
         ));
     }
 
-    // ── manual query bypasses 4-hour cap ───────────────────────────────────
+    // ── manual query bypasses max-wait cap ─────────────────────────────────
 
     fn make_long_pending_task() -> ScheduledTask {
         let submitted = (Utc::now() - Duration::hours(6)).to_rfc3339();
@@ -10836,12 +11609,12 @@ mod tests {
     }
 
     #[test]
-    fn auto_query_past_4_hours_keeps_task_stopped() {
+    fn auto_query_past_max_wait_keeps_task_stopped() {
         let mut data = AppData {
             tasks: vec![make_long_pending_task()],
             ..AppData::default()
         };
-        // 有远端任务状态但已超过 4 小时：停止自动查询，改为手动查询
+        // 有远端任务状态但已达到最长等待时间：停止自动查询，改为手动查询
         let task =
             query_task_submit_id_once_with_runner(&mut data, "task-stale", "sub-stale", |_args| {
                 Ok((
@@ -10856,7 +11629,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_query_past_4_hours_bypasses_cap() {
+    fn manual_query_past_max_wait_bypasses_cap() {
         let mut data = AppData {
             tasks: vec![make_long_pending_task()],
             ..AppData::default()
@@ -10865,7 +11638,7 @@ mod tests {
         if let Some(t) = data.tasks.iter_mut().find(|t| t.id == "task-stale") {
             reset_query_backoff(t);
         }
-        // No-result CLI output: should NOT re-trigger 4 小时上限
+        // No-result CLI output: should NOT re-trigger max-wait cap
         let task = manual_query_task_submit_id_with_runner(
             &mut data,
             "task-stale",
@@ -10877,7 +11650,7 @@ mod tests {
         assert!(!task.auto_query_stopped);
         assert!(
             !task.last_error.contains("已等待超过"),
-            "manual query should not surface the 4-hour stop message: {}",
+            "manual query should not surface the max-wait stop message: {}",
             task.last_error
         );
     }
@@ -11321,6 +12094,60 @@ mod tests {
     }
 
     #[test]
+    fn recover_tasks_on_load_preserves_historical_record_after_network_query_error() {
+        let mut completed = make_queued_task_for_submit("completed-with-offline-fast");
+        completed.status = "succeeded".to_string();
+        completed.submit_id = "completed-submit".to_string();
+        completed.result_urls = vec!["https://example.com/completed.mp4".to_string()];
+        completed.finished_at = "2026-07-01T01:00:00Z".to_string();
+        completed.execution_records.push(TaskExecutionRecord {
+            id: "offline-fast-querying".to_string(),
+            submit_id: "offline-fast-submit".to_string(),
+            status: "querying".to_string(),
+            started_at: "2026-07-01T00:00:00Z".to_string(),
+            finished_at: String::new(),
+            input_snapshot: TaskExecutionInputSnapshot {
+                params: VideoParams {
+                    model_version: FAST_FALLBACK_MODEL_VERSION.to_string(),
+                    ..VideoParams::default()
+                },
+                ..TaskExecutionInputSnapshot::default()
+            },
+            command_preview: vec![],
+            query_records: vec![TaskAttempt {
+                id: "offline-fast-query".to_string(),
+                started_at: "2026-07-01T07:00:00Z".to_string(),
+                finished_at: "2026-07-01T07:00:01Z".to_string(),
+                status: "retry_wait".to_string(),
+                command_preview: vec![
+                    "query_result".to_string(),
+                    "--submit_id=offline-fast-submit".to_string(),
+                ],
+                stdout: String::new(),
+                stderr: "dial tcp: lookup jimeng.jianying.com: no such host".to_string(),
+                error_kind: "NetworkUnavailable".to_string(),
+                duration_seconds: 1.0,
+                error_detail: "网络暂不可用".to_string(),
+            }],
+            result_paths: vec![],
+            result_urls: vec![],
+            error_kind: "NetworkUnavailable".to_string(),
+            error_detail: "网络暂不可用".to_string(),
+        });
+        let mut data = AppData {
+            tasks: vec![completed],
+            ..AppData::default()
+        };
+
+        recover_tasks_on_load(&mut data);
+
+        let record = &data.tasks[0].execution_records[0];
+        assert_eq!(record.status, "querying");
+        assert!(record.finished_at.is_empty());
+        assert!(active_remote_queue_kinds(&data).contains(&ModelQueueKind::Fast));
+    }
+
+    #[test]
     fn submit_5xx_first_time_goes_to_retry_wait() {
         let mut data = AppData {
             tasks: vec![make_queued_task_for_submit("t5xx")],
@@ -11471,6 +12298,67 @@ mod tests {
         assert_eq!(out.error_code, None);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn command_output_nonzero_exit_is_an_error() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"authsdk: refresh failed: protocol transport: do request".to_vec(),
+        };
+        let error = command_output_to_result(output).expect_err("non-zero exit must fail");
+
+        assert!(error.contains("退出码 1"));
+        assert!(error.contains("authsdk: refresh failed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_output_zero_exit_with_empty_stdout_and_network_stderr_is_an_error() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: Vec::new(),
+            stderr: b"dial tcp: lookup jimeng.jianying.com: no such host".to_vec(),
+        };
+        let error = command_output_to_result(output)
+            .expect_err("empty stdout plus a network failure must remain retryable");
+
+        assert!(error.contains("no such host"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_output_keeps_valid_stdout_even_when_stderr_has_a_warning() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: br#"{"submit_id":"sub-ok","gen_status":"querying"}"#.to_vec(),
+            stderr: b"temporary warning: context deadline exceeded".to_vec(),
+        };
+        let (stdout, _) = command_output_to_result(output)
+            .expect("valid stdout must win over a non-fatal stderr warning");
+
+        assert!(stdout.contains("sub-ok"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_execution_timeout_terminates_a_hung_process() {
+        let args = vec!["-c".to_string(), "while :; do :; done".to_string()];
+        let started = std::time::Instant::now();
+
+        let error = run_command_with_timeout("sh", &args, StdDuration::from_millis(50))
+            .expect_err("hung process must be terminated");
+
+        assert!(error.contains("超时"));
+        assert!(started.elapsed() < StdDuration::from_secs(1));
+    }
+
     #[test]
     fn asset_from_path_normalizes_spaces_in_name_for_mentions() {
         let unique = format!("dreamina-space-name-{}", Uuid::new_v4().simple());
@@ -11551,6 +12439,54 @@ mod tests {
             "error message should be stored in last_error: {}",
             result.last_error
         );
+    }
+
+    #[test]
+    fn query_cli_exit_with_known_submit_keeps_remote_task_querying() {
+        let mut task = make_task_with_execution_records();
+        task.execution_records.clear();
+        task.id = "task-query-cli-exit".to_string();
+        task.submit_id = "sub-query-cli-exit".to_string();
+        task.status = "querying".to_string();
+        task.submitted_at = Some((Utc::now() - Duration::minutes(5)).to_rfc3339());
+        task.execution_records.push(TaskExecutionRecord {
+            id: "rec-query-cli-exit".to_string(),
+            submit_id: task.submit_id.clone(),
+            status: "querying".to_string(),
+            started_at: now_rfc3339(),
+            finished_at: String::new(),
+            input_snapshot: TaskExecutionInputSnapshot::default(),
+            command_preview: vec![],
+            query_records: vec![],
+            result_paths: vec![],
+            result_urls: vec![],
+            error_kind: String::new(),
+            error_detail: String::new(),
+        });
+        let mut data = AppData {
+            tasks: vec![task],
+            ..AppData::default()
+        };
+
+        let result = query_task_submit_id_once_with_runner(
+            &mut data,
+            "task-query-cli-exit",
+            "sub-query-cli-exit",
+            |_args| Err("dreamina CLI 退出码 1".to_string()),
+        )
+        .expect("local query error should be recorded without failing remote task");
+
+        assert_eq!(result.status, "querying");
+        assert_eq!(result.submit_id, "sub-query-cli-exit");
+        assert!(!result.auto_query_stopped);
+        assert_eq!(
+            result.last_error,
+            "本地查询暂时未取得结果，已保留远端任务，稍后自动查询。"
+        );
+        let record = result.execution_records.last().expect("execution record");
+        assert_eq!(record.status, "querying");
+        assert_eq!(record.error_kind, "QueryUnavailable");
+        assert_eq!(record.query_records.last().unwrap().status, "retry_wait");
     }
 
     #[test]

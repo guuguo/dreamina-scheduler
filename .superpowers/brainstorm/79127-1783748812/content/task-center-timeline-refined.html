@@ -1,0 +1,516 @@
+<style>
+  :root {
+    --ink: #18223a;
+    --muted: #758198;
+    --line: #dfe4ed;
+    --soft: #f5f7fb;
+    --primary: #5b61f3;
+    --primary-soft: #eff0ff;
+    --fast: #0c9d65;
+    --fast-soft: #eaf8f2;
+    --warn: #c77700;
+    --warn-soft: #fff5df;
+    --danger: #dc3434;
+  }
+  .review-head {
+    display: flex;
+    align-items: end;
+    justify-content: space-between;
+    gap: 20px;
+    margin-bottom: 16px;
+  }
+  .review-head h2 { margin: 0 0 5px; }
+  .review-head p { margin: 0; color: var(--muted); line-height: 1.5; }
+  .review-tag {
+    padding: 5px 8px;
+    border: 1px solid #bfe5d4;
+    border-radius: 5px;
+    background: var(--fast-soft);
+    color: #08784d;
+    font-size: 11px;
+    font-weight: 800;
+    white-space: nowrap;
+  }
+  .wireframe {
+    overflow: hidden;
+    border: 1px solid #cfd6e2;
+    border-radius: 8px;
+    background: #f3f6fb;
+    box-shadow: 0 14px 35px rgba(31, 42, 72, .10);
+    color: var(--ink);
+  }
+  .app-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 18px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--line);
+    background: #fff;
+  }
+  .app-title { display: flex; align-items: baseline; gap: 12px; min-width: 0; }
+  .app-title b { font-size: 18px; }
+  .app-title span {
+    overflow: hidden;
+    color: var(--muted);
+    font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .new-task {
+    padding: 8px 13px;
+    border-radius: 6px;
+    background: var(--primary);
+    color: #fff;
+    font-size: 11px;
+    font-weight: 800;
+    white-space: nowrap;
+  }
+  .lanes { padding: 12px 14px 0; }
+  .lane-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .lane {
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    background: #fff;
+    overflow: hidden;
+  }
+  .lane-head {
+    display: grid;
+    grid-template-columns: 34px minmax(0, 1fr) 140px;
+    align-items: center;
+    gap: 9px;
+    padding: 9px 10px;
+    border-bottom: 1px solid #e9edf3;
+  }
+  .lane-letter {
+    display: grid;
+    place-items: center;
+    width: 32px;
+    height: 32px;
+    border-radius: 6px;
+    background: var(--primary-soft);
+    color: var(--primary);
+    font-weight: 850;
+  }
+  .lane.fast .lane-letter { background: var(--fast-soft); color: var(--fast); }
+  .lane-name b { display: block; font-size: 12px; }
+  .lane-name span { color: var(--muted); font-size: 9px; }
+  .pressure { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 6px; }
+  .pressure span, .pressure b { font-size: 9px; }
+  .bar { height: 5px; border-radius: 3px; background: #e9edf4; overflow: hidden; }
+  .bar i { display: block; width: 80%; height: 100%; background: var(--primary); }
+  .lane.fast .bar i { width: 38%; background: var(--fast); }
+  .lane-body {
+    display: grid;
+    grid-template-columns: minmax(0, 1.25fr) .8fr .9fr;
+  }
+  .lane-cell { min-width: 0; padding: 9px 10px; border-right: 1px solid #e9edf3; }
+  .lane-cell:last-child { border-right: 0; }
+  .lane-cell label { display: block; margin-bottom: 4px; color: var(--muted); font-size: 9px; font-weight: 700; }
+  .lane-cell b { display: block; overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+  .lane-cell b.warn { color: var(--warn); }
+  .lane-cell b.fast-tone { color: var(--fast); }
+  .lane-cell span { display: block; overflow: hidden; margin-top: 3px; color: #68758d; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+  .lane-note {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    border-top: 1px solid #edf0f4;
+    background: #fbfcfe;
+    color: var(--muted);
+    font-size: 9px;
+  }
+  .lane-note strong { color: #3f4a62; }
+  .shared-pool {
+    display: grid;
+    grid-template-columns: auto minmax(180px, 1fr) repeat(4, auto);
+    align-items: center;
+    gap: 14px;
+    margin-top: 10px;
+    padding: 9px 11px;
+    border: 1px solid #d5d9ff;
+    border-left: 4px solid var(--primary);
+    border-radius: 7px;
+    background: #fff;
+  }
+  .pool-icon {
+    display: grid;
+    place-items: center;
+    width: 30px;
+    height: 30px;
+    border-radius: 6px;
+    background: var(--primary-soft);
+    color: var(--primary);
+    font-weight: 850;
+  }
+  .pool-title b { display: block; font-size: 12px; }
+  .pool-title span { display: block; margin-top: 2px; color: var(--muted); font-size: 9px; }
+  .pool-metric { padding-left: 13px; border-left: 1px solid #e6e9f0; }
+  .pool-metric span { display: block; color: var(--muted); font-size: 8px; }
+  .pool-metric b { display: block; margin-top: 2px; font-size: 10px; }
+  .pool-open { color: var(--primary); font-size: 10px; font-weight: 800; white-space: nowrap; }
+  .body {
+    display: grid;
+    grid-template-columns: 340px minmax(0, 1fr);
+    gap: 10px;
+    height: 525px;
+    min-height: 0;
+    padding: 10px 14px 14px;
+  }
+  .task-list, .detail {
+    min-height: 0;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    background: #fff;
+  }
+  .list-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 10px;
+    border-bottom: 1px solid #e9edf3;
+  }
+  .list-head b { font-size: 11px; }
+  .list-head span { color: var(--muted); font-size: 9px; }
+  .task-row {
+    display: grid;
+    grid-template-columns: 22px 42px minmax(0, 1fr) auto;
+    gap: 8px;
+    align-items: center;
+    padding: 8px 9px;
+    border-bottom: 1px solid #edf0f4;
+  }
+  .task-row.active { background: #f1f2ff; box-shadow: inset 3px 0 0 var(--primary); }
+  .check { width: 13px; height: 13px; border: 1px solid #d4dae5; border-radius: 3px; }
+  .thumb { width: 42px; height: 42px; border-radius: 6px; background: #34445a; }
+  .task-copy { min-width: 0; }
+  .task-copy b { display: block; overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+  .task-copy span { display: block; margin-top: 3px; color: var(--muted); font-size: 9px; }
+  .task-state { text-align: right; }
+  .task-state b { display: block; color: var(--warn); font-size: 9px; }
+  .task-state span { display: block; margin-top: 3px; color: #8a94a7; font-size: 8px; }
+  .star { color: #bd7300; }
+  .detail { overflow-y: auto; }
+  .detail-head {
+    display: grid;
+    grid-template-columns: 52px minmax(0, 1fr) auto;
+    gap: 11px;
+    align-items: center;
+    padding: 11px 12px;
+    border-bottom: 1px solid #e9edf3;
+  }
+  .detail-head .thumb { width: 52px; height: 52px; }
+  .detail-title { min-width: 0; }
+  .detail-title b { display: block; overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+  .detail-title span { display: block; margin-top: 4px; color: var(--muted); font-size: 9px; }
+  .status {
+    padding: 4px 7px;
+    border-radius: 5px;
+    background: var(--warn-soft);
+    color: var(--warn);
+    font-size: 9px;
+    font-weight: 800;
+  }
+  .detail-controls {
+    display: grid;
+    grid-template-columns: minmax(300px, 1.15fr) minmax(300px, 1fr);
+    gap: 9px;
+    padding: 9px 11px 0;
+  }
+  .next-state {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+    align-items: center;
+    padding: 9px 10px;
+    border: 1px solid #d6daff;
+    border-left: 3px solid var(--primary);
+    border-radius: 6px;
+    background: var(--primary-soft);
+  }
+  .next-state b { display: block; font-size: 11px; }
+  .next-state span { display: block; margin-top: 2px; color: #64708a; font-size: 9px; }
+  .health { color: #0b8b59; font-size: 9px; font-weight: 800; white-space: nowrap; }
+  .priority {
+    display: grid;
+    grid-template-columns: auto repeat(3, 1fr);
+    align-items: center;
+    gap: 5px;
+    padding: 7px 8px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+  }
+  .priority > b { font-size: 9px; white-space: nowrap; }
+  .priority button {
+    min-width: 0;
+    height: 29px;
+    padding: 0 5px;
+    border: 1px solid #dde2eb;
+    border-radius: 5px;
+    background: #fff;
+    color: #5d6980;
+    font-size: 9px;
+    white-space: nowrap;
+  }
+  .priority button.on { border-color: #efc56c; background: #fff5dc; color: #945700; font-weight: 800; }
+  .actions {
+    display: flex;
+    gap: 6px;
+    padding: 8px 11px;
+    border-bottom: 1px solid #edf0f4;
+  }
+  .action {
+    display: grid;
+    place-items: center;
+    min-width: 64px;
+    height: 29px;
+    padding: 0 8px;
+    border: 1px solid #dce1e9;
+    border-radius: 5px;
+    background: #fff;
+    color: #39455d;
+    font-size: 9px;
+    font-weight: 750;
+  }
+  .action.primary { min-width: 110px; border-color: var(--primary); background: var(--primary); color: #fff; }
+  .action.danger { margin-left: auto; border-color: #efaaaa; color: var(--danger); }
+  .timeline-wrap { padding: 10px 12px 0; }
+  .section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+  .section-head b { font-size: 11px; }
+  .section-head span { color: var(--primary); font-size: 9px; font-weight: 800; }
+  .timeline-step { position: relative; padding: 0 0 10px 22px; }
+  .timeline-step::before { content: ''; position: absolute; left: 6px; top: 8px; bottom: -2px; width: 1px; background: #dce1e9; }
+  .timeline-step:last-child::before { display: none; }
+  .timeline-step::after {
+    content: '';
+    position: absolute;
+    left: 2px;
+    top: 4px;
+    width: 7px;
+    height: 7px;
+    border: 2px solid #fff;
+    border-radius: 50%;
+    background: #a9b1c1;
+    box-shadow: 0 0 0 1px #a9b1c1;
+  }
+  .timeline-step.next::after { background: var(--primary); box-shadow: 0 0 0 1px var(--primary); }
+  .timeline-step .line-head { display: flex; align-items: baseline; gap: 7px; }
+  .timeline-step time { width: 34px; color: #8792a6; font-family: ui-monospace, monospace; font-size: 8px; }
+  .timeline-step b { font-size: 10px; }
+  .timeline-step p { margin: 2px 0 0 41px; color: #768197; font-size: 9px; line-height: 1.35; }
+  .folds { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; padding: 3px 12px 12px; }
+  .fold {
+    display: flex;
+    justify-content: space-between;
+    padding: 8px;
+    border: 1px solid #e1e5ed;
+    border-radius: 5px;
+    color: #5f6b81;
+    font-size: 9px;
+  }
+  .fold b { color: #354158; }
+  .annotations {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+    margin-top: 14px;
+  }
+  .annotation {
+    display: grid;
+    grid-template-columns: 24px minmax(0, 1fr);
+    gap: 8px;
+    padding: 10px;
+    border: 1px solid #e0e4ec;
+    border-radius: 7px;
+    background: #fff;
+  }
+  .annotation i {
+    display: grid;
+    place-items: center;
+    width: 22px;
+    height: 22px;
+    border-radius: 5px;
+    background: #eff0ff;
+    color: var(--primary);
+    font-size: 10px;
+    font-style: normal;
+    font-weight: 850;
+  }
+  .annotation b { display: block; margin-bottom: 3px; font-size: 10px; }
+  .annotation span { color: var(--muted); font-size: 9px; line-height: 1.45; }
+  .approve {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin-top: 12px;
+    padding: 12px 14px;
+    border: 2px solid #d6daff;
+    border-radius: 7px;
+    background: #f8f8ff;
+    cursor: pointer;
+  }
+  .approve.selected { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(91, 97, 243, .12); }
+  .approve b { display: block; font-size: 12px; }
+  .approve span { color: var(--muted); font-size: 10px; }
+  .approve strong { padding: 7px 10px; border-radius: 5px; background: var(--primary); color: #fff; font-size: 10px; white-space: nowrap; }
+  @media (max-width: 1050px) {
+    .body { grid-template-columns: 280px minmax(0, 1fr); }
+    .detail-controls { grid-template-columns: 1fr; }
+    .shared-pool { grid-template-columns: auto 1fr repeat(2, auto); }
+    .shared-pool .pool-metric:nth-of-type(3), .shared-pool .pool-metric:nth-of-type(4) { display: none; }
+    .annotations { grid-template-columns: 1fr 1fr; }
+  }
+</style>
+
+<div class="review-head">
+  <div>
+    <h2>收敛版：共享待调度池 + 状态自适应时间线</h2>
+    <p>待调度任务不预分车道；车道只展示已发生的真实执行。详情页让优先级与常用动作保持在首屏。</p>
+  </div>
+  <span class="review-tag">内部自用高密度版</span>
+</div>
+
+<div class="wireframe">
+  <header class="app-head">
+    <div class="app-title"><b>任务中心</b><span>有任务时每 30 秒自动检查 · 上次检查 12:41:37</span></div>
+    <div class="new-task">+ 新建任务</div>
+  </header>
+
+  <section class="lanes">
+    <div class="lane-grid">
+      <article class="lane">
+        <div class="lane-head">
+          <div class="lane-letter">S</div>
+          <div class="lane-name"><b>标准车道 · 优先</b><span>seedance2.0</span></div>
+          <div class="pressure"><span>压力</span><div class="bar"><i></i></div><b>80%</b></div>
+        </div>
+        <div class="lane-body">
+          <div class="lane-cell"><label>实际远端任务</label><b class="warn">#2824 / 295514</b><span>总裁飞书19集 S02 酒廊试探</span></div>
+          <div class="lane-cell"><label>冷却探测</label><b>53 秒</b><span>下次 12:42:43</span></div>
+          <div class="lane-cell"><label>下一步</label><b class="warn">查询远端</b><span>保留当前 submit</span></div>
+        </div>
+        <div class="lane-note"><strong>仅显示真实占用</strong><span>未提交任务不计入本车道</span></div>
+      </article>
+
+      <article class="lane fast">
+        <div class="lane-head">
+          <div class="lane-letter">F</div>
+          <div class="lane-name"><b>Fast车道 · 并行</b><span>seedance2.0fast</span></div>
+          <div class="pressure"><span>压力</span><div class="bar"><i></i></div><b>38%</b></div>
+        </div>
+        <div class="lane-body">
+          <div class="lane-cell"><label>实际远端任务</label><b class="fast-tone">#205 / 559117</b><span>总裁飞书19集 S01 临时约见</span></div>
+          <div class="lane-cell"><label>冷却探测</label><b>5 分钟</b><span>下次 12:45:52</span></div>
+          <div class="lane-cell"><label>下一步</label><b class="warn">查询远端</b><span>保留当前 submit</span></div>
+        </div>
+        <div class="lane-note"><strong>执行记录确认 Fast</strong><span>任务保存模型不参与展示归类</span></div>
+      </article>
+    </div>
+
+    <div class="shared-pool">
+      <div class="pool-icon">Q</div>
+      <div class="pool-title"><b>共享待调度池 10 个</b><span>任一启用车道空闲后动态分配，标准优先</span></div>
+      <div class="pool-metric"><span>待排</span><b>9</b></div>
+      <div class="pool-metric"><span>重试</span><b>1</b></div>
+      <div class="pool-metric"><span>最老等待</span><b>3小时49分</b></div>
+      <div class="pool-metric"><span>下一候选</span><b>★★ S03</b></div>
+      <div class="pool-open">查看 10 个 ›</div>
+    </div>
+  </section>
+
+  <main class="body">
+    <section class="task-list">
+      <div class="list-head"><b>全部任务</b><span>198 个 · 共享池优先展示</span></div>
+      <div class="task-row active">
+        <span class="check"></span><span class="thumb"></span>
+        <span class="task-copy"><b><span class="star">★</span> 总裁飞书19集 S03 换酒与北城</b><span>9:16 · 入队 3小时49分</span></span>
+        <span class="task-state"><b>待调度</b><span>共享池</span></span>
+      </div>
+      <div class="task-row">
+        <span class="check"></span><span class="thumb" style="background:#6d5c4e"></span>
+        <span class="task-copy"><b>总裁飞书19集 S04 饭局试探</b><span>9:16 · 入队 2小时8分</span></span>
+        <span class="task-state"><b>待调度</b><span>共享池</span></span>
+      </div>
+      <div class="task-row">
+        <span class="check"></span><span class="thumb" style="background:#485d52"></span>
+        <span class="task-copy"><b>总裁飞书19集 S05 走廊相遇</b><span>9:16 · 重试 1 次</span></span>
+        <span class="task-state"><b>等待重试</b><span>共享池</span></span>
+      </div>
+      <div class="task-row">
+        <span class="check"></span><span class="thumb" style="background:#574756"></span>
+        <span class="task-copy"><b>总裁飞书19集 S01 临时约见</b><span>9:16 · Fast 实际执行</span></span>
+        <span class="task-state"><b style="color:#0c9d65">远端排队</b><span>Fast #205</span></span>
+      </div>
+    </section>
+
+    <section class="detail">
+      <div class="detail-head">
+        <span class="thumb"></span>
+        <div class="detail-title"><b>总裁飞书19集 今晚还有一场 S03 换酒与北城</b><span>9:16 · 15 秒 · 720p · 共享待调度池</span></div>
+        <span class="status">排队中</span>
+      </div>
+
+      <div class="detail-controls">
+        <div class="next-state">
+          <div><b>等待任一车道空闲</b><span>调度器运行正常，约 30 秒后再次检查</span></div>
+          <span class="health">无需干预</span>
+        </div>
+        <div class="priority">
+          <b>排队优先</b>
+          <button>随机</button>
+          <button class="on">★ 第二优先</button>
+          <button>★★ 下一位</button>
+        </div>
+      </div>
+
+      <div class="actions">
+        <span class="action primary">立即排队</span>
+        <span class="action">编辑</span>
+        <span class="action">复制</span>
+        <span class="action">暂停</span>
+        <span class="action danger">删除任务</span>
+      </div>
+
+      <div class="timeline-wrap">
+        <div class="section-head"><b>过程时间线</b><span>查看全部记录（8）</span></div>
+        <div class="timeline-step next">
+          <div class="line-head"><time>下一步</time><b>自动选择标准或 Fast 车道</b></div>
+          <p>任一启用车道空闲后提交；车道只在提交发生后确定。</p>
+        </div>
+        <div class="timeline-step">
+          <div class="line-head"><time>11:10</time><b>进入共享待调度池</b></div>
+          <p>第二优先；当前共享池共 10 个任务，前方有 1 个更高优先任务。</p>
+        </div>
+        <div class="timeline-step">
+          <div class="line-head"><time>11:09</time><b>MCP 创建并校验任务</b></div>
+          <p>2 张图片、1 条音频，命令与素材引用完整。</p>
+        </div>
+        <div class="timeline-step">
+          <div class="line-head"><time>11:09</time><b>保存任务</b></div>
+          <p>9:16 · 15 秒 · 720p · 计划生成 1 次。</p>
+        </div>
+      </div>
+
+      <div class="folds">
+        <div class="fold"><span>命中资源</span><b>3 个 ›</b></div>
+        <div class="fold"><span>执行历史</span><b>0 次 ›</b></div>
+        <div class="fold"><span>命令与参数</span><b>完整 ›</b></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div class="annotations">
+  <div class="annotation"><i>1</i><div><b>车道只讲事实</b><span>显示当前真实 submit、远端排位和下一次探测，不再显示预估本地任务。</span></div></div>
+  <div class="annotation"><i>2</i><div><b>共享池统一入口</b><span>queued 与 retry_wait 全部归入共享池，点击查看待调度任务。</span></div></div>
+  <div class="annotation"><i>3</i><div><b>优先级始终外露</b><span>随机、第二优先、下一位均可一键切换，不需要进入编辑页。</span></div></div>
+  <div class="annotation"><i>4</i><div><b>状态自适应时间线</b><span>排队和异常看过程；成功后结果自动升到首屏，时间线收缩。</span></div></div>
+</div>
+
+<div class="approve" data-choice="approve-shared-pool-timeline" onclick="toggleSelect(this)">
+  <div><b>确认采用这版信息架构</b><span>共享待调度池 + 真实车道占用 + 快捷优先级 + 状态自适应时间线</span></div>
+  <strong>点击确认</strong>
+</div>

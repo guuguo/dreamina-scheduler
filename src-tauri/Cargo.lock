@@ -727,6 +727,7 @@ dependencies = [
  "arboard",
  "base64 0.22.1",
  "chrono",
+ "libc",
  "png 0.17.16",
  "reqwest 0.12.28",
  "serde",

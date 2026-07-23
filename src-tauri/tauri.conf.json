@@ -39,6 +39,8 @@
           "x": 18,
           "y": 20
         },
+        "backgroundColor": "#F4F7FC",
+        "backgroundThrottling": "throttle",
         "acceptFirstMouse": true
       }
     ]

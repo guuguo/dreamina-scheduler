@@ -1,7 +1,7 @@
 import React from 'react';
 import { ChevronRight, Image, Power, RefreshCw, X } from 'lucide-react';
 import {
-  getLaneLocalTasks,
+  getSharedWaitingTasks,
   laneLabel,
   laneModelVersion,
   formatNextCheckAt,
@@ -10,68 +10,76 @@ import {
 } from '../lane-utils.js';
 import { resolveMediaSrc } from '../media-src.js';
 
-const WAITING_STATUSES = ['queued'];
 const ACTIVE_STATUSES = ['submitting', 'submitted', 'querying'];
-const RETRY_STATUSES = ['retry_wait'];
 
 /**
  * LaneStrip — 双车道状态条（原型 lane-strip 区域）
  *
  * Props:
  *   laneStatuses  — Array<LaneStatus> (至少 [standard, fast])
- *   tasks         — 全量任务，用于推导本地任务、车道年龄、占用时间线
+ *   tasks         — 全量任务，用于推导共享待调度池与车道占用时间线
  *   nowMs         — 当前时间戳，用于倒计时格式化
  */
 export default function LaneStrip({
   laneStatuses = [],
   tasks = [],
   nowMs = Date.now(),
-  queryIntervalSeconds = 30,
   onToggleLane,
   onProbeLane,
   onSelectTask,
   assetById,
   roles = [],
+  taskPriorities = {},
   pendingLaneKind = '',
   pendingProbeLaneKind = '',
 }) {
-  const [openLaneKind, setOpenLaneKind] = React.useState('');
+  const [sharedPoolOpen, setSharedPoolOpen] = React.useState(false);
   const standard = laneStatuses.find(s => s.queueKind === 'standard') || null;
   const fast = laneStatuses.find(s => s.queueKind === 'fast') || null;
   const enabledCount = laneStatuses.filter((lane) => lane.enabled !== false).length;
-  const openLaneTasks = React.useMemo(
-    () => openLaneKind ? getLaneLocalTasks(tasks, openLaneKind) : [],
-    [openLaneKind, tasks]
-  );
+  const sharedTasks = React.useMemo(() => getSharedWaitingTasks(tasks), [tasks]);
+  const sharedStats = React.useMemo(() => getSharedPoolStats(sharedTasks, nowMs), [sharedTasks, nowMs]);
 
   const selectTask = (taskId) => {
-    setOpenLaneKind('');
+    setSharedPoolOpen(false);
     onSelectTask?.(taskId);
   };
 
   return (
     <section className="lane-strip" aria-label="模型车道状态">
-      <LaneCard lane={standard} kind="standard" tasks={tasks} nowMs={nowMs} queryIntervalSeconds={queryIntervalSeconds}
-        onToggleLane={onToggleLane} onProbeLane={onProbeLane} onOpenTasks={() => setOpenLaneKind('standard')}
+      <LaneCard lane={standard} kind="standard" tasks={tasks} nowMs={nowMs} sharedTaskCount={sharedStats.total}
+        onToggleLane={onToggleLane} onProbeLane={onProbeLane}
         pending={pendingLaneKind === 'standard'} probePending={pendingProbeLaneKind === 'standard'} canDisable={enabledCount > 1} />
-      <LaneCard lane={fast} kind="fast" tasks={tasks} nowMs={nowMs} queryIntervalSeconds={queryIntervalSeconds}
-        onToggleLane={onToggleLane} onProbeLane={onProbeLane} onOpenTasks={() => setOpenLaneKind('fast')}
+      <LaneCard lane={fast} kind="fast" tasks={tasks} nowMs={nowMs} sharedTaskCount={sharedStats.total}
+        onToggleLane={onToggleLane} onProbeLane={onProbeLane}
         pending={pendingLaneKind === 'fast'} probePending={pendingProbeLaneKind === 'fast'} canDisable={enabledCount > 1} />
-      {openLaneKind ? (
-        <LaneTasksModal
-          kind={openLaneKind}
-          tasks={openLaneTasks}
+      <button type="button" className="shared-dispatch-pool" onClick={() => setSharedPoolOpen(true)}
+        disabled={sharedStats.total === 0} title={sharedStats.total ? '查看共享待调度池' : '共享待调度池为空'}>
+        <span className="shared-pool-icon">Q</span>
+        <span className="shared-pool-title">
+          <b>共享待调度池 {sharedStats.total} 个</b>
+          <em>任一启用车道空闲后动态分配，标准优先</em>
+        </span>
+        <span className="shared-pool-metric"><em>待排</em><b>{sharedStats.waiting}</b></span>
+        <span className="shared-pool-metric"><em>重试</em><b>{sharedStats.retry}</b></span>
+        <span className="shared-pool-metric"><em>最老等待</em><b>{sharedStats.queueAge}</b></span>
+        <ChevronRight size={16} />
+      </button>
+      {sharedPoolOpen ? (
+        <SharedTasksModal
+          tasks={sharedTasks}
           assetById={assetById}
           roles={roles}
+          taskPriorities={taskPriorities}
           onSelectTask={selectTask}
-          onClose={() => setOpenLaneKind('')}
+          onClose={() => setSharedPoolOpen(false)}
         />
       ) : null}
     </section>
   );
 }
 
-function LaneCard({ lane, kind, tasks, nowMs, queryIntervalSeconds, onToggleLane, onProbeLane, onOpenTasks, pending, probePending, canDisable }) {
+function LaneCard({ lane, kind, tasks, nowMs, sharedTaskCount, onToggleLane, onProbeLane, pending, probePending, canDisable }) {
   if (!lane) {
     return (
       <article className={`lane-card ${kind === 'fast' ? 'fast' : ''}`}>
@@ -85,14 +93,13 @@ function LaneCard({ lane, kind, tasks, nowMs, queryIntervalSeconds, onToggleLane
   const iconLetter = isFast ? 'F' : 'S';
   const title = `${laneLabel(kind)}车道`;
   const modelVer = laneModelVersion(kind);
-  const stats = getLaneTaskStats(tasks, kind, nowMs);
-  const pressure = getLanePressure(lane, stats);
+  const pressure = getLanePressure(lane);
   const timeValue = enabled
-    ? formatLaneTime(lane.nextCheckAt, nowMs, lane.isActive ? '应立即查询' : lane.waitingTaskCount > 0 ? '应立即提交' : '应立即探测')
+    ? formatLaneTime(lane.nextCheckAt, nowMs, lane.isActive ? '应立即查询' : sharedTaskCount > 0 ? '应立即提交' : '应立即探测')
     : '—';
-  const nextAt = formatLaneNextClock(lane.nextCheckAt, nowMs, queryIntervalSeconds);
+  const nextAt = formatLaneNextClock(lane.nextCheckAt, nowMs);
   const remote = getLaneRemoteOccupancyDisplay(lane);
-  const nextStep = getLaneNextStep(lane);
+  const nextStep = getLaneNextStep(lane, sharedTaskCount);
   const ticks = getLaneTicks(tasks, kind, nowMs);
 
   return (
@@ -118,19 +125,12 @@ function LaneCard({ lane, kind, tasks, nowMs, queryIntervalSeconds, onToggleLane
       </div>
 
       <div className="lane-bento">
-        <button type="button" className="lane-tile lane-task-trigger span-3" onClick={onOpenTasks}
-          disabled={stats.localTotal === 0} title={stats.localTotal ? `查看${title}的本地队列` : `${title}暂无待排任务`}>
-          <span className="lane-tile-label">本地队列</span>
-          <b>{stats.localTotal} 个 <ChevronRight size={14} /></b>
-          <em>排队 {stats.waiting} · 重试 {stats.retry}</em>
-          <small>队列年龄 {stats.queueAge}</small>
-        </button>
-        <div className="lane-tile span-4">
-          <span className="lane-tile-label">远端/冷却状态</span>
+        <div className="lane-tile span-5">
+          <span className="lane-tile-label">实际远端/冷却</span>
           <b className={remote.tone}>{remote.value}</b>
           <em>{remote.copy}</em>
         </div>
-        <div className="lane-tile lane-probe-tile span-2">
+        <div className="lane-tile lane-probe-tile span-3">
           <span className="lane-tile-label">冷却探测</span>
           <button type="button" className={`lane-probe-button${probePending ? ' spinning' : ''}`}
             onClick={() => onProbeLane?.(lane)} disabled={!enabled || probePending}
@@ -138,9 +138,9 @@ function LaneCard({ lane, kind, tasks, nowMs, queryIntervalSeconds, onToggleLane
             <RefreshCw size={13} />
           </button>
           <b>{timeValue}</b>
-          <em>下次 {nextAt}<br />间隔 {queryIntervalSeconds} 秒</em>
+          <em>下次 {nextAt}<br />自适应轮询</em>
         </div>
-        <div className="lane-tile span-3">
+        <div className="lane-tile span-4">
           <span className="lane-tile-label">下一步</span>
           <b className={nextStep.tone}>{nextStep.title}</b>
           <em>{nextStep.copy}</em>
@@ -157,24 +157,23 @@ function LaneCard({ lane, kind, tasks, nowMs, queryIntervalSeconds, onToggleLane
   );
 }
 
-function getLaneTaskStats(tasks, kind, nowMs) {
-  const laneTasks = getLaneLocalTasks(tasks, kind);
-  const waitingTasks = laneTasks.filter(task => WAITING_STATUSES.includes(task.status));
-  const retryTasks = laneTasks.filter(task => RETRY_STATUSES.includes(task.status));
-  const ageCandidates = [...waitingTasks, ...retryTasks]
-    .map(task => task.queued_at || task.scheduled_at || task.next_run_at || task.created_at || task.updated_at)
+function getSharedPoolStats(tasks, nowMs) {
+  const waiting = tasks.filter((task) => task.status === 'queued').length;
+  const retry = tasks.filter((task) => task.status === 'retry_wait').length;
+  const ageCandidates = tasks
+    .map(task => task.queued_at || task.created_at || task.updated_at)
     .map(value => value ? new Date(value).getTime() : NaN)
     .filter(Number.isFinite);
   const oldest = ageCandidates.length ? Math.min(...ageCandidates) : NaN;
   return {
-    waiting: waitingTasks.length,
-    retry: retryTasks.length,
-    localTotal: laneTasks.length,
+    waiting,
+    retry,
+    total: tasks.length,
     queueAge: Number.isFinite(oldest) ? formatDuration(nowMs - oldest) : '—',
   };
 }
 
-function LaneTasksModal({ kind, tasks, assetById, roles, onSelectTask, onClose }) {
+function SharedTasksModal({ tasks, assetById, roles, taskPriorities, onSelectTask, onClose }) {
   React.useEffect(() => {
     const closeOnEscape = (event) => {
       if (event.key === 'Escape') onClose();
@@ -183,15 +182,14 @@ function LaneTasksModal({ kind, tasks, assetById, roles, onSelectTask, onClose }
     return () => window.removeEventListener('keydown', closeOnEscape);
   }, [onClose]);
 
-  const title = `${laneLabel(kind)}车道待排任务`;
   return (
     <div className="modal-backdrop lane-tasks-modal-backdrop" role="presentation" onMouseDown={onClose}>
-      <section className={`lane-tasks-dialog${kind === 'fast' ? ' fast' : ''}`} role="dialog" aria-modal="true"
+      <section className="lane-tasks-dialog" role="dialog" aria-modal="true"
         aria-labelledby="lane-tasks-dialog-title" onMouseDown={(event) => event.stopPropagation()}>
         <header className="lane-tasks-dialog-head">
           <div>
-            <span>{laneModelVersion(kind)}</span>
-            <h2 id="lane-tasks-dialog-title">{title}</h2>
+            <span>动态双车道</span>
+            <h2 id="lane-tasks-dialog-title">共享待调度池</h2>
           </div>
           <strong>{tasks.length} 个</strong>
           <button type="button" className="icon-ghost" onClick={onClose} title="关闭"><X size={17} /></button>
@@ -199,7 +197,7 @@ function LaneTasksModal({ kind, tasks, assetById, roles, onSelectTask, onClose }
         <div className="lane-tasks-list">
           {tasks.map((task) => {
             const thumbPath = findTaskThumbPath(task, assetById, roles);
-            const queueInfo = task.queue_info;
+            const priority = Math.max(0, Math.min(2, Number(taskPriorities?.[task.id] || 0)));
             return (
               <button type="button" className="lane-task-row" key={task.id} onClick={() => onSelectTask(task.id)}>
                 <span className="lane-task-thumb">
@@ -207,13 +205,11 @@ function LaneTasksModal({ kind, tasks, assetById, roles, onSelectTask, onClose }
                 </span>
                 <span className="lane-task-copy">
                   <b>{task.title || '未命名任务'}</b>
-                  <em>{task.params?.model_version || laneModelVersion(kind)} · {task.params?.ratio || '比例未设置'}</em>
+                  <em>{priority ? `${'★'.repeat(priority)} 优先` : '随机顺序'} · {task.params?.ratio || '比例未设置'}</em>
                 </span>
                 <span className={`lane-task-state status-${task.status || 'draft'}`}>
                   <b>{laneTaskStatusLabel(task.status)}</b>
-                  <em>{queueInfo?.queue_idx != null
-                    ? `#${queueInfo.queue_idx}${queueInfo.queue_length != null ? ` / ${queueInfo.queue_length}` : ''}`
-                    : laneTaskTimeLabel(task)}</em>
+                  <em>{laneTaskTimeLabel(task)}</em>
                 </span>
                 <ChevronRight className="lane-task-open-icon" size={16} />
               </button>
@@ -263,15 +259,14 @@ function laneTaskTimeLabel(task) {
   return `${String(time.getMonth() + 1).padStart(2, '0')}-${String(time.getDate()).padStart(2, '0')} ${String(time.getHours()).padStart(2, '0')}:${String(time.getMinutes()).padStart(2, '0')}`;
 }
 
-function getLanePressure(lane, stats) {
+function getLanePressure(lane) {
   if (lane.enabled === false) return 0;
-  const remote = lane.isActive ? 38 : 0;
-  const cooling = lane.isCoolingDown ? 18 : 0;
-  const backlog = Math.min(42, (stats.waiting + stats.retry) * 7);
-  return Math.max(0, Math.min(96, remote + cooling + backlog));
+  const remote = lane.isActive ? 58 : 0;
+  const cooling = lane.isCoolingDown ? 24 : 0;
+  return Math.max(0, Math.min(96, remote + cooling));
 }
 
-function getLaneNextStep(lane) {
+function getLaneNextStep(lane, sharedTaskCount) {
   if (lane.enabled === false) {
     return { tone: 'idle', title: '已关闭', copy: '不会接收新的排队和重试任务。' };
   }
@@ -281,8 +276,8 @@ function getLaneNextStep(lane) {
   if (lane.isCoolingDown) {
     return { tone: 'warn', title: '等待冷却', copy: lane.cooldownReason || '并发限制未解除，冷却结束后继续探测。' };
   }
-  if (lane.waitingTaskCount > 0) {
-    return { tone: 'ok', title: '可提交', copy: '将尝试提交队首任务，先进入队列的优先。' };
+  if (sharedTaskCount > 0) {
+    return { tone: 'ok', title: '可接收', copy: '将从共享池按优先级取下一个任务。' };
   }
   return { tone: 'idle', title: '空闲', copy: '暂无本地待提交任务，继续按间隔探测。' };
 }
@@ -334,11 +329,10 @@ function formatClock(isoTime) {
   return `${String(time.getHours()).padStart(2, '0')}:${String(time.getMinutes()).padStart(2, '0')}:${String(time.getSeconds()).padStart(2, '0')}`;
 }
 
-function formatLaneNextClock(isoTime, nowMs, intervalSeconds) {
+function formatLaneNextClock(isoTime, nowMs) {
   const time = isoTime ? new Date(isoTime).getTime() : NaN;
-  if (!Number.isFinite(time) || time <= nowMs) {
-    return formatClock(new Date(nowMs + Math.max(1, Number(intervalSeconds || 30)) * 1000).toISOString());
-  }
+  if (!Number.isFinite(time)) return '—';
+  if (time <= nowMs) return '现在';
   return formatClock(isoTime);
 }
 

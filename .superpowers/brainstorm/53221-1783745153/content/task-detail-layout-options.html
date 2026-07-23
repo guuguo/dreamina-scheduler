@@ -1,0 +1,445 @@
+<style>
+  .concept-intro {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 20px;
+    align-items: end;
+    margin-bottom: 22px;
+  }
+  .concept-intro h2 { margin-bottom: 6px; }
+  .concept-intro .goal {
+    max-width: 760px;
+    margin: 0;
+    color: #637089;
+    line-height: 1.6;
+  }
+  .density-key {
+    display: flex;
+    gap: 12px;
+    color: #637089;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .density-key span::before {
+    content: '';
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    margin-right: 5px;
+    border-radius: 2px;
+    background: #5b61f3;
+  }
+  .density-key span:nth-child(2)::before { background: #12a36d; }
+  .density-key span:nth-child(3)::before { background: #e59b25; }
+  .layout-cards {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(300px, 1fr));
+    gap: 16px;
+  }
+  .layout-choice {
+    min-width: 0;
+    overflow: hidden;
+    border: 2px solid #e2e6ef;
+    border-radius: 10px;
+    background: #f7f8fb;
+    cursor: pointer;
+    transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease;
+  }
+  .layout-choice:hover {
+    transform: translateY(-2px);
+    border-color: #a9afff;
+    box-shadow: 0 10px 24px rgba(39, 49, 84, .10);
+  }
+  .layout-choice.selected {
+    border-color: #5b61f3;
+    box-shadow: 0 0 0 3px rgba(91, 97, 243, .13);
+  }
+  .choice-head {
+    display: grid;
+    grid-template-columns: 30px minmax(0, 1fr) auto;
+    gap: 10px;
+    align-items: center;
+    padding: 13px 14px;
+    border-bottom: 1px solid #e4e7ef;
+    background: #fff;
+  }
+  .choice-letter {
+    display: grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    background: #eef0ff;
+    color: #4d54e5;
+    font-weight: 850;
+  }
+  .choice-head h3 { margin: 0; font-size: 15px; }
+  .choice-head p { margin: 3px 0 0; color: #7c879d; font-size: 11px; }
+  .recommend {
+    padding: 4px 7px;
+    border-radius: 5px;
+    background: #e8f8f1;
+    color: #0a8557;
+    font-size: 10px;
+    font-weight: 800;
+  }
+  .screen {
+    min-height: 510px;
+    padding: 12px;
+    color: #172033;
+    font-size: 11px;
+  }
+  .task-shell {
+    overflow: hidden;
+    border: 1px solid #dfe3ec;
+    border-radius: 7px;
+    background: #fff;
+  }
+  .task-head {
+    display: grid;
+    grid-template-columns: 42px minmax(0, 1fr) auto;
+    gap: 9px;
+    align-items: center;
+    padding: 10px;
+    border-bottom: 1px solid #edf0f5;
+  }
+  .thumb {
+    width: 42px;
+    height: 42px;
+    border-radius: 6px;
+    background: linear-gradient(135deg, #243249, #a66855);
+  }
+  .task-title { min-width: 0; }
+  .task-title b {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 12px;
+  }
+  .task-title span { display: block; margin-top: 4px; color: #758198; font-size: 10px; }
+  .status {
+    padding: 4px 7px;
+    border-radius: 5px;
+    background: #fff2d9;
+    color: #bd6f00;
+    font-size: 10px;
+    font-weight: 800;
+  }
+  .next-strip {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+    align-items: center;
+    margin: 9px;
+    padding: 9px 10px;
+    border: 1px solid #d9ddff;
+    border-left: 3px solid #5b61f3;
+    border-radius: 6px;
+    background: #f3f4ff;
+  }
+  .next-strip strong { display: block; font-size: 12px; }
+  .next-strip span { display: block; margin-top: 3px; color: #687591; font-size: 10px; }
+  .eta { color: #4d54e5; font-weight: 800; white-space: nowrap; }
+  .compact-actions {
+    display: grid;
+    grid-template-columns: 1.4fr repeat(4, 32px);
+    gap: 6px;
+    padding: 0 9px 9px;
+  }
+  .btn {
+    display: grid;
+    place-items: center;
+    min-height: 30px;
+    border: 1px solid #dfe3ec;
+    border-radius: 6px;
+    background: #fff;
+    color: #38445d;
+    font-size: 10px;
+    font-weight: 750;
+  }
+  .btn.primary { border-color: #5b61f3; background: #5b61f3; color: #fff; }
+  .btn.danger { border-color: #f3b1b1; color: #d92f2f; }
+  .summary-line {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    border-top: 1px solid #edf0f5;
+    border-bottom: 1px solid #edf0f5;
+  }
+  .summary-line div { padding: 8px 9px; border-right: 1px solid #edf0f5; }
+  .summary-line div:last-child { border-right: 0; }
+  .summary-line span { display: block; color: #8490a5; font-size: 9px; }
+  .summary-line b { display: block; margin-top: 3px; font-size: 11px; }
+  .priority-row {
+    display: grid;
+    grid-template-columns: auto repeat(3, 1fr);
+    align-items: center;
+    gap: 5px;
+    padding: 8px 9px;
+  }
+  .priority-row > span { color: #7b879d; font-size: 9px; font-weight: 750; }
+  .seg {
+    padding: 5px 4px;
+    border: 1px solid #e2e6ee;
+    border-radius: 5px;
+    text-align: center;
+    color: #657087;
+    font-size: 9px;
+  }
+  .seg.on { border-color: #f0cc83; background: #fff7e6; color: #975800; font-weight: 800; }
+  .section-title {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 9px 10px 5px;
+    font-weight: 800;
+  }
+  .section-title a { color: #555de8; font-size: 9px; }
+  .events { padding: 0 10px 8px; }
+  .event {
+    display: grid;
+    grid-template-columns: 38px minmax(0, 1fr);
+    gap: 7px;
+    padding: 6px 0;
+    border-bottom: 1px solid #f0f2f6;
+  }
+  .event:last-child { border-bottom: 0; }
+  .event time { color: #8994a8; font-family: ui-monospace, monospace; font-size: 9px; }
+  .event b { display: block; font-size: 10px; }
+  .event span { display: block; margin-top: 2px; color: #7b879d; font-size: 9px; }
+  .disclosure {
+    display: flex;
+    justify-content: space-between;
+    padding: 8px 10px;
+    border-top: 1px solid #edf0f5;
+    color: #5f6b81;
+    font-size: 10px;
+  }
+  .two-pane {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 128px;
+  }
+  .main-pane { min-width: 0; border-right: 1px solid #edf0f5; }
+  .inspector { padding: 9px; background: #fafbfc; }
+  .inspector h4 { margin: 0 0 7px; font-size: 10px; }
+  .kv { display: flex; justify-content: space-between; gap: 6px; padding: 5px 0; border-bottom: 1px solid #eceff4; }
+  .kv span { color: #8792a5; font-size: 9px; }
+  .kv b { font-size: 9px; text-align: right; }
+  .inspector .seg { margin-top: 5px; }
+  .tabs { display: grid; grid-template-columns: repeat(3, 1fr); border-bottom: 1px solid #e7eaf0; }
+  .tabs span { padding: 8px 4px; text-align: center; color: #7b879d; font-size: 9px; }
+  .tabs .on { color: #4e55e7; border-bottom: 2px solid #5b61f3; font-weight: 800; }
+  .accordion { margin: 8px; border: 1px solid #e4e7ed; border-radius: 6px; overflow: hidden; }
+  .accordion div { display: flex; justify-content: space-between; padding: 8px; border-bottom: 1px solid #edf0f5; }
+  .accordion div:last-child { border-bottom: 0; }
+  .timeline-focus { padding: 9px; }
+  .timeline-step { position: relative; padding: 0 0 12px 20px; }
+  .timeline-step::before {
+    content: '';
+    position: absolute;
+    left: 5px;
+    top: 5px;
+    bottom: -3px;
+    width: 1px;
+    background: #dfe3eb;
+  }
+  .timeline-step:last-child::before { display: none; }
+  .timeline-step::after {
+    content: '';
+    position: absolute;
+    left: 2px;
+    top: 3px;
+    width: 7px;
+    height: 7px;
+    border: 2px solid #fff;
+    border-radius: 50%;
+    background: #5b61f3;
+    box-shadow: 0 0 0 1px #5b61f3;
+  }
+  .timeline-step b { display: block; font-size: 10px; }
+  .timeline-step span { display: block; margin-top: 2px; color: #7d889d; font-size: 9px; line-height: 1.35; }
+  .choice-foot {
+    min-height: 112px;
+    padding: 12px 14px 14px;
+    border-top: 1px solid #e4e7ef;
+    background: #fff;
+  }
+  .metric-row { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 8px; }
+  .metric {
+    padding: 4px 6px;
+    border-radius: 4px;
+    background: #f0f2f7;
+    color: #536077;
+    font-size: 9px;
+    font-weight: 750;
+  }
+  .choice-foot p { margin: 0; color: #68758c; font-size: 10px; line-height: 1.5; }
+  .decision-rule {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 8px;
+    margin-top: 18px;
+    padding: 12px;
+    border: 1px solid #e1e5ed;
+    border-radius: 8px;
+    background: #fff;
+  }
+  .decision-rule div { padding-right: 9px; border-right: 1px solid #e9ecf2; }
+  .decision-rule div:last-child { border-right: 0; }
+  .decision-rule b { display: block; margin-bottom: 4px; font-size: 10px; }
+  .decision-rule span { color: #748098; font-size: 9px; line-height: 1.45; }
+  @media (max-width: 1100px) {
+    .layout-cards { grid-template-columns: 1fr; }
+    .screen { min-height: 0; }
+    .concept-intro { grid-template-columns: 1fr; }
+  }
+</style>
+
+<div class="concept-intro">
+  <div>
+    <h2>任务详情页：哪种高密度结构更适合内部自用？</h2>
+    <p class="goal">目标不是展示信息完整，而是让你在 3 秒内判断：当前状态、下一步、是否需要干预。点击任意方案进行选择。</p>
+  </div>
+  <div class="density-key">
+    <span>当前动作</span><span>运行状态</span><span>仅异常出现</span>
+  </div>
+</div>
+
+<div class="layout-cards">
+  <div class="layout-choice" data-choice="a-command-center" onclick="toggleSelect(this)">
+    <div class="choice-head">
+      <div class="choice-letter">A</div>
+      <div><h3>紧凑指挥台</h3><p>状态、动作、记录一屏完成</p></div>
+      <span class="recommend">推荐</span>
+    </div>
+    <div class="screen">
+      <div class="task-shell">
+        <div class="task-head">
+          <div class="thumb"></div>
+          <div class="task-title"><b>总裁飞书19集 S03 换酒与北城</b><span>9:16 · 标准/自动车道 · 入队 3小时49分</span></div>
+          <span class="status">排队中</span>
+        </div>
+        <div class="next-strip">
+          <div><strong>等待空闲车道自动提交</strong><span>标准优先；Fast 空闲时自动并行</span></div>
+          <b class="eta">约 30 秒检查</b>
+        </div>
+        <div class="compact-actions">
+          <span class="btn primary">立即排队</span><span class="btn" title="编辑">编辑</span><span class="btn" title="复制">复制</span><span class="btn" title="暂停">暂停</span><span class="btn danger" title="删除并二次确认">删</span>
+        </div>
+        <div class="summary-line">
+          <div><span>本地入队</span><b>11:10</b></div>
+          <div><span>队列位置</span><b>待提交</b></div>
+          <div><span>重试</span><b>0 次</b></div>
+        </div>
+        <div class="priority-row">
+          <span>优先级</span><span class="seg">随机</span><span class="seg on">★ 第二</span><span class="seg">★★ 下一位</span>
+        </div>
+        <div class="section-title"><span>关键记录</span><a>全部 8 条</a></div>
+        <div class="events">
+          <div class="event"><time>11:10</time><div><b>进入共享待调度池</b><span>等待任一启用车道空闲</span></div></div>
+          <div class="event"><time>11:09</time><div><b>MCP 创建任务</b><span>素材与命令校验通过</span></div></div>
+          <div class="event"><time>11:09</time><div><b>任务保存</b><span>计划生成 1 次</span></div></div>
+        </div>
+        <div class="disclosure"><span>素材、命令与高级参数</span><b>展开 ›</b></div>
+      </div>
+    </div>
+    <div class="choice-foot">
+      <div class="metric-row"><span class="metric">首屏约 360px</span><span class="metric">0 个空值卡片</span><span class="metric">动态主按钮</span></div>
+      <p>最适合日常盯队列。默认参数、命令预览和完整历史全部收起；出现失败、停查、重试时才插入醒目的异常行。</p>
+    </div>
+  </div>
+
+  <div class="layout-choice" data-choice="b-inspector" onclick="toggleSelect(this)">
+    <div class="choice-head">
+      <div class="choice-letter">B</div>
+      <div><h3>主内容 + 检查器</h3><p>保留双栏，右侧极窄参数区</p></div>
+    </div>
+    <div class="screen">
+      <div class="task-shell">
+        <div class="task-head">
+          <div class="thumb"></div>
+          <div class="task-title"><b>总裁飞书19集 S03 换酒与北城</b><span>共享待调度池 · 11:10 入队</span></div>
+          <span class="status">排队中</span>
+        </div>
+        <div class="two-pane">
+          <div class="main-pane">
+            <div class="next-strip">
+              <div><strong>等待空闲车道</strong><span>约 30 秒后再次检查</span></div>
+            </div>
+            <div class="compact-actions" style="grid-template-columns:1.4fr repeat(3,32px)">
+              <span class="btn primary">立即排队</span><span class="btn">编</span><span class="btn">停</span><span class="btn danger">删</span>
+            </div>
+            <div class="tabs"><span class="on">记录</span><span>素材</span><span>结果</span></div>
+            <div class="events">
+              <div class="event"><time>11:10</time><div><b>进入共享待调度池</b><span>等待任一车道</span></div></div>
+              <div class="event"><time>11:09</time><div><b>MCP 创建任务</b><span>校验通过</span></div></div>
+              <div class="event"><time>11:09</time><div><b>命令已生成</b><span>2 图 · 1 音频</span></div></div>
+              <div class="event"><time>11:09</time><div><b>任务保存</b><span>生成 1 次</span></div></div>
+            </div>
+          </div>
+          <aside class="inspector">
+            <h4>运行检查器</h4>
+            <div class="kv"><span>状态</span><b>排队中</b></div>
+            <div class="kv"><span>车道</span><b>自动</b></div>
+            <div class="kv"><span>远端</span><b>未提交</b></div>
+            <div class="kv"><span>重试</span><b>0</b></div>
+            <div class="kv"><span>模型</span><b>2.0</b></div>
+            <div class="kv"><span>计划</span><b>1 次</b></div>
+            <h4 style="margin-top:12px">优先级</h4>
+            <div class="seg on">★ 第二优先</div>
+            <div class="disclosure" style="padding:8px 0 0;border-top:0"><span>高级</span><b>›</b></div>
+          </aside>
+        </div>
+      </div>
+    </div>
+    <div class="choice-foot">
+      <div class="metric-row"><span class="metric">首屏约 400px</span><span class="metric">信息最完整</span><span class="metric">改动较小</span></div>
+      <p>最接近现有结构，学习成本最低；缺点是窄窗口下检查器容易挤压主内容，仍会保留一些“只是看看”的字段。</p>
+    </div>
+  </div>
+
+  <div class="layout-choice" data-choice="c-timeline" onclick="toggleSelect(this)">
+    <div class="choice-head">
+      <div class="choice-letter">C</div>
+      <div><h3>过程时间线</h3><p>围绕异常排查组织详情</p></div>
+    </div>
+    <div class="screen">
+      <div class="task-shell">
+        <div class="task-head">
+          <div class="thumb"></div>
+          <div class="task-title"><b>总裁飞书19集 S03 换酒与北城</b><span>排队 3小时49分 · 第二优先</span></div>
+          <span class="status">排队中</span>
+        </div>
+        <div class="next-strip">
+          <div><strong>当前：等待空闲车道</strong><span>调度器运行正常，无需干预</span></div>
+          <b class="eta">健康</b>
+        </div>
+        <div class="compact-actions" style="grid-template-columns:1.4fr 1fr 32px">
+          <span class="btn primary">立即排队</span><span class="btn">调整优先级</span><span class="btn danger">删</span>
+        </div>
+        <div class="timeline-focus">
+          <div class="timeline-step"><b>下一步 · 自动选择标准或 Fast</b><span>任一车道空闲后提交，预计 30 秒内再次判断。</span></div>
+          <div class="timeline-step"><b>11:10 · 进入共享待调度池</b><span>优先级：第二优先；前方有 1 个高优先任务。</span></div>
+          <div class="timeline-step"><b>11:09 · MCP 创建并校验</b><span>2 张图片、1 条音频、命令参数完整。</span></div>
+          <div class="timeline-step"><b>11:09 · 保存任务</b><span>9:16 · 15 秒 · 720p · 计划 1 次。</span></div>
+        </div>
+        <div class="accordion">
+          <div><span>命中资源</span><b>3 个 ›</b></div>
+          <div><span>执行历史</span><b>0 次 ›</b></div>
+          <div><span>命令与参数</span><b>完整 ›</b></div>
+        </div>
+      </div>
+    </div>
+    <div class="choice-foot">
+      <div class="metric-row"><span class="metric">首屏约 390px</span><span class="metric">排障最快</span><span class="metric">过程语义清晰</span></div>
+      <p>适合经常追查“为什么还没跑”的场景；但普通成功任务会显得过程过重，编辑、复制等日常动作不如 A 直接。</p>
+    </div>
+  </div>
+</div>
+
+<div class="decision-rule">
+  <div><b>默认只显示</b><span>状态、下一步、动态主操作、优先级、3 条关键记录。</span></div>
+  <div><b>有值才显示</b><span>submit id、远端排位、查询时间、重试次数和错误。</span></div>
+  <div><b>默认收起</b><span>模型参数、完整命令、全部记录、素材明细和查询策略。</span></div>
+  <div><b>始终可达</b><span>编辑、复制、暂停、删除；删除仍需二次确认。</span></div>
+</div>

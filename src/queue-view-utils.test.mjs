@@ -15,6 +15,8 @@ import {
   getTaskResultItems,
   getTaskHitResources,
   getCommandPreviewPresentation,
+  deriveTaskDetailMetrics,
+  getTaskDetailSectionOrder,
 } from './queue-view-utils.js';
 
 function makeTask(overrides = {}) {
@@ -362,6 +364,42 @@ test('getCommandPreviewPresentation: command preview is shown as modal entry', (
   });
 });
 
+test('deriveTaskDetailMetrics adapts to queued state without empty placeholders', () => {
+  const metrics = deriveTaskDetailMetrics(makeTask({
+    status: 'queued',
+    queued_at: '2026-07-11T03:10:00Z',
+  }), {
+    nowMs: new Date('2026-07-11T07:00:00Z').getTime(),
+    sharedPoolCount: 10,
+    nextCheckSeconds: 30,
+  });
+
+  assert.deepEqual(metrics.map((item) => item.label), ['共享池', '已等待', '重试', '下次检查']);
+  assert.equal(metrics[0].value, '10 个');
+  assert.equal(metrics[1].value, '3小时50分');
+  assert.ok(metrics.every((item) => item.value && item.value !== '—'));
+});
+
+test('deriveTaskDetailMetrics shows actual remote facts for querying task', () => {
+  const metrics = deriveTaskDetailMetrics(makeTask({
+    status: 'querying',
+    submitted_at: '2026-07-11T06:30:00Z',
+    queue_info: { queue_idx: 205, queue_length: 559117 },
+  }), {
+    actualLaneLabel: 'Fast',
+  });
+
+  assert.deepEqual(metrics.map((item) => item.label), ['实际车道', '远端排位', '提交时间']);
+  assert.equal(metrics[0].value, 'Fast');
+  assert.equal(metrics[1].value, '#205 / 559117');
+});
+
+test('getTaskDetailSectionOrder puts results first only after success', () => {
+  assert.deepEqual(getTaskDetailSectionOrder('succeeded'), ['results', 'timeline', 'resources']);
+  assert.deepEqual(getTaskDetailSectionOrder('queued'), ['timeline', 'resources', 'results']);
+  assert.deepEqual(getTaskDetailSectionOrder('draft'), ['resources', 'timeline', 'results']);
+});
+
 test('getCommandPreviewPresentation: empty command hides section', () => {
   assert.equal(getCommandPreviewPresentation('', false).hasCommand, false);
 });
@@ -410,7 +448,7 @@ test('deriveTaskDispatchInfo: queued exposes attempts and next scheduler check',
   assert.equal(info.nextText, '约 30 秒内检查');
   assert.equal(info.nextAt, '2026-01-01T00:00:30.000Z');
   assert.ok(info.nextSummary.endsWith('前后'));
-  assert.equal(info.reason, `预计 ${checkClock} 前后调度，走标准车道`);
+  assert.equal(info.reason, `预计 ${checkClock} 前后从共享待调度池选择空闲车道`);
 });
 
 test('deriveTaskDispatchInfo: scheduled exposes start time', () => {

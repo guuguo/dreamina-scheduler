@@ -7,7 +7,9 @@ import {
   deriveTimelineEvents,
   selectKeyTimelineRecords,
   getLaneRemoteOccupancyDisplay,
-  getLaneLocalTasks,
+  getSharedWaitingTasks,
+  getActualTaskQueueKind,
+  getTaskRouteInfo,
   getLaneStatuses,
 } from './lane-utils.js';
 
@@ -45,7 +47,7 @@ test('getLaneStatuses uses backend laneStatus when present', () => {
   assert.equal(getLaneStatuses(backend, []), backend);
 });
 
-test('getLaneLocalTasks matches the lane card local task count', () => {
+test('queued and retry tasks stay in the shared dispatch pool', () => {
   const tasks = [
     task({ id: 'std-queued', status: 'queued' }),
     task({ id: 'std-active', status: 'querying' }),
@@ -55,8 +57,22 @@ test('getLaneLocalTasks matches the lane card local task count', () => {
     task({ id: 'fast-retry', status: 'retry_wait', params: { model_version: 'seedance2.0fast' } }),
   ];
 
-  assert.deepEqual(getLaneLocalTasks(tasks, 'standard').map((item) => item.id), ['std-queued']);
-  assert.deepEqual(getLaneLocalTasks(tasks, 'fast').map((item) => item.id), ['fast-retry']);
+  assert.deepEqual(getSharedWaitingTasks(tasks).map((item) => item.id), ['std-queued', 'fast-retry']);
+  assert.equal(getActualTaskQueueKind(tasks[0]), null);
+  assert.equal(getActualTaskQueueKind(tasks[5]), null);
+  assert.deepEqual(getTaskRouteInfo(tasks[0]), { kind: null, label: '共享池', assigned: false });
+});
+
+test('active task uses the current execution snapshot as its actual lane', () => {
+  const active = task({
+    status: 'querying',
+    submit_id: 'fast-submit',
+    params: { model_version: 'seedance2.0' },
+    execution_records: [record({ submit_id: 'fast-submit' })],
+  });
+
+  assert.equal(getActualTaskQueueKind(active), 'fast');
+  assert.deepEqual(getTaskRouteInfo(active), { kind: 'fast', label: 'Fast', assigned: true });
 });
 
 test('deriveFastLaneStatus detects active fast execution record fallback', () => {
@@ -138,7 +154,7 @@ test('deriveStandardLaneStatus cooldown ignores non-concurrency and due retries'
   assert.equal(lane.cooldownReason, '并发限制，1 个任务等待重试');
 });
 
-test('retry wait lane uses the newest execution record timestamp when records are out of order', () => {
+test('retry wait remains shared even when its latest execution used fast', () => {
   const nowMs = new Date('2026-07-04T00:02:00Z').getTime();
   const retryTask = task({
     status: 'retry_wait',
@@ -166,7 +182,10 @@ test('retry wait lane uses the newest execution record timestamp when records ar
   const fast = deriveFastLaneStatus([retryTask], nowMs);
 
   assert.equal(standard.waitingTaskCount, 0);
-  assert.equal(fast.waitingTaskCount, 1);
+  assert.equal(fast.waitingTaskCount, 0);
+  assert.equal(standard.sharedWaitingTaskCount, 1);
+  assert.equal(fast.sharedWaitingTaskCount, 1);
+  assert.equal(getActualTaskQueueKind(retryTask), null);
 });
 
 test('remote occupancy display treats concurrency cooldown as remote occupied', () => {
@@ -199,17 +218,25 @@ test('remote occupancy display shows idle only when there is no active or cooldo
   assert.equal(display.tone, 'idle');
 });
 
-test('deriveNextAction shows fast queued scheduler ETA', () => {
+test('deriveNextAction keeps queued task in the shared pool until submission', () => {
   const nowMs = new Date('2026-07-04T00:00:00Z').getTime();
   const next = deriveNextAction(task({
     status: 'queued',
     params: { model_version: 'seedance2.0fast' },
   }), nowMs, { schedulerTickSeconds: 30 });
-  const checkAt = new Date(nowMs + 30_000);
-  const checkClock = `${String(checkAt.getHours()).padStart(2, '0')}:${String(checkAt.getMinutes()).padStart(2, '0')}`;
+  assert.equal(next.action, '约 30 秒内 等待任一车道');
+  assert.equal(next.reason, '任务位于共享待调度池；任一启用车道空闲后提交，实际车道在提交发生后确定。');
+});
 
-  assert.equal(next.action, '约 30 秒内 走 Fast');
-  assert.equal(next.reason, `任务在队列中等待，预计 ${checkClock} 前后提交到Fast车道。`);
+test('deriveNextAction sends scheduled task to the shared pool before lane assignment', () => {
+  const nowMs = new Date('2026-07-04T00:00:00Z').getTime();
+  const next = deriveNextAction(task({
+    status: 'scheduled',
+    scheduled_at: '2026-07-04T01:00:00Z',
+  }), nowMs);
+
+  assert.match(next.action, /进入共享池/);
+  assert.equal(next.reason, '等待预定时间到达后自动进入共享待调度池。');
 });
 
 test('deriveNextAction distinguishes remote processing without queue position', () => {
@@ -237,7 +264,7 @@ test('deriveNextAction keeps explicit remote queue progress', () => {
   assert.equal(next.action, '远端排队 #6932 / 298595');
 });
 
-test('deriveNextAction switches a cooling fast retry to idle standard immediately', () => {
+test('deriveNextAction keeps a retry in the shared pool even when standard is idle', () => {
   const nowMs = new Date('2026-07-04T00:00:00Z').getTime();
   const next = deriveNextAction(task({
     status: 'retry_wait',
@@ -252,8 +279,8 @@ test('deriveNextAction switches a cooling fast retry to idle standard immediatel
     ],
   });
 
-  assert.equal(next.action, '约 30 秒内 走 标准');
-  assert.equal(next.reason, '标准车道空闲，将在下次调度检查时切换提交。');
+  assert.equal(next.action, '约 30 秒内 等待任一车道');
+  assert.equal(next.reason, '重试任务位于共享待调度池；任一启用车道空闲后提交，实际车道在提交发生后确定。');
 });
 
 test('deriveNextAction shows generation review retry at queue tail', () => {
@@ -308,5 +335,5 @@ test('deriveTimelineEvents includes execution start and does not truncate full h
   assert.ok(events.length > 8);
   assert.ok(events.some((event) => event.title === 'Fast 开始'));
   assert.ok(events.some((event) => event.title === 'Fast 完成'));
-  assert.ok(events.some((event) => event.title === '进入队列'));
+  assert.ok(events.some((event) => event.title === '进入共享待调度池'));
 });

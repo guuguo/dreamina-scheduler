@@ -198,6 +198,84 @@ export function getCommandPreviewPresentation(commandText) {
   };
 }
 
+export function getTaskDetailSectionOrder(status) {
+  if (status === 'succeeded') return ['results', 'timeline', 'resources'];
+  if (['draft', 'paused', 'scheduled'].includes(status)) return ['resources', 'timeline', 'results'];
+  return ['timeline', 'resources', 'results'];
+}
+
+export function deriveTaskDetailMetrics(task, {
+  nowMs = Date.now(),
+  sharedPoolCount = 0,
+  nextCheckSeconds = 30,
+  actualLaneLabel = '',
+  nextQueryAt = '',
+} = {}) {
+  if (!task) return [];
+  const status = task.status || 'draft';
+  const metrics = [];
+  const add = (label, value) => {
+    const text = String(value ?? '').trim();
+    if (text && text !== '—') metrics.push({ label, value: text });
+  };
+  const attemptCount = Number(task.attempt_count || 0);
+  const queuedAt = task.queued_at || task.created_at || '';
+  const queuedMs = queuedAt ? new Date(queuedAt).getTime() : NaN;
+
+  if (status === 'queued' || status === 'retry_wait') {
+    add('共享池', `${Math.max(0, Number(sharedPoolCount || 0))} 个`);
+    if (Number.isFinite(queuedMs)) add('已等待', formatDetailDuration(nowMs - queuedMs));
+    add('重试', `${attemptCount} 次`);
+    if (status === 'retry_wait' && task.next_run_at) {
+      add('下次重试', formatDetailClock(task.next_run_at));
+    } else {
+      add('下次检查', `${Math.max(1, Number(nextCheckSeconds || 30))} 秒`);
+    }
+    return metrics.slice(0, 4);
+  }
+
+  if (['submitting', 'submitted', 'querying'].includes(status)) {
+    add('实际车道', actualLaneLabel);
+    if (task.queue_info?.queue_idx != null) {
+      add('远端排位', `#${task.queue_info.queue_idx}${task.queue_info.queue_length != null ? ` / ${task.queue_info.queue_length}` : ''}`);
+    }
+    add('提交时间', formatDetailClock(task.submitted_at));
+    add('下次查询', formatDetailClock(nextQueryAt));
+    return metrics.slice(0, 4);
+  }
+
+  const records = task.execution_records || [];
+  const latestRecord = records.reduce((latest, record) => {
+    if (!latest) return record;
+    const latestTime = new Date(latest.finished_at || latest.started_at || '').getTime();
+    const recordTime = new Date(record.finished_at || record.started_at || '').getTime();
+    if (!Number.isFinite(recordTime)) return latest;
+    return !Number.isFinite(latestTime) || recordTime >= latestTime ? record : latest;
+  }, null);
+
+  if (status === 'succeeded') {
+    add('生成结果', `${getTaskResultItems(task).length} 个`);
+    add('完成时间', formatDetailClock(latestRecord?.finished_at || task.updated_at));
+    add('实际车道', actualLaneLabel);
+    add('尝试', `${Math.max(1, attemptCount)} 次`);
+    return metrics.slice(0, 4);
+  }
+
+  if (status === 'failed' || status === 'schema_error') {
+    add('失败类型', latestRecord?.error_kind || '执行失败');
+    add('尝试', `${attemptCount} 次`);
+    add('失败时间', formatDetailClock(latestRecord?.finished_at || task.updated_at));
+    add('实际车道', actualLaneLabel);
+    return metrics.slice(0, 4);
+  }
+
+  add('状态', status);
+  add('模型', task.params?.model_version);
+  add('计划生成', `${Math.max(1, Number(task.planned_submit_count || 1))} 次`);
+  add('计划时间', formatDetailClock(task.scheduled_at));
+  return metrics.slice(0, 4);
+}
+
 export function deriveTaskDispatchInfo(task, {
   nowMs = Date.now(),
   schedulerTickSeconds = 30,
@@ -283,7 +361,6 @@ export function deriveTaskDispatchInfo(task, {
   }
 
   if (status === 'queued') {
-    const routeLabel = task?.params?.model_version === 'seedance2.0fast' ? 'Fast' : '标准';
     const nextSummary = nextRunAt && isFutureNextRun
       ? `${formatDispatchClock(nextTime)} 前后`
       : fallbackCheckSummary;
@@ -297,7 +374,9 @@ export function deriveTaskDispatchInfo(task, {
       nextAt: nextRunAt || fallbackCheckAt,
       nextText: isDueNextRun ? '即将尝试' : fallbackCheckText,
       nextSummary,
-      reason: nextRunAt && isFutureNextRun ? `等待调度窗口，预计 ${nextSummary}走${routeLabel}` : `预计 ${nextSummary}调度，走${routeLabel}车道`,
+      reason: nextRunAt && isFutureNextRun
+        ? `等待调度窗口，预计 ${nextSummary}从共享待调度池选择空闲车道`
+        : `预计 ${nextSummary}从共享待调度池选择空闲车道`,
       compactText: `尝试 ${attemptCount} 次 · ${nextRunAt && isFutureNextRun ? nextSummary : fallbackCheckText}`,
     };
   }
@@ -331,6 +410,25 @@ function formatDispatchClock(ms) {
   const date = new Date(ms);
   if (Number.isNaN(date.getTime())) return '';
   return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+}
+
+function formatDetailClock(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+}
+
+function formatDetailDuration(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return '';
+  const minutes = Math.floor(ms / 60000);
+  if (minutes < 1) return '刚刚';
+  if (minutes < 60) return `${minutes}分钟`;
+  const hours = Math.floor(minutes / 60);
+  const remain = minutes % 60;
+  if (hours < 24) return remain ? `${hours}小时${remain}分` : `${hours}小时`;
+  const days = Math.floor(hours / 24);
+  return `${days}天${hours % 24}小时`;
 }
 
 function basename(value) {

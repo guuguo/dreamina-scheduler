@@ -8,9 +8,8 @@
 const FAST_MODEL = 'seedance2.0fast';
 const STANDARD_MODEL = 'seedance2.0';
 
-/** 等待队列中的状态 */
-const WAITING_STATUSES = ['draft', 'queued', 'scheduled', 'retry_wait'];
-const LOCAL_LANE_STATUSES = ['queued', 'retry_wait'];
+const SHARED_WAITING_STATUSES = ['queued', 'retry_wait'];
+const ASSIGNED_STATUSES = ['submitting', 'submitted', 'querying', 'succeeded', 'failed'];
 
 /**
  * 从一个模型版本字符串推导车道。
@@ -226,21 +225,41 @@ export function taskSubmitQueueKind(task) {
 }
 
 /**
- * 车道卡片“本地队列”统计包含的任务，只展示真正等待调度或重试的任务。
+ * 未提交任务没有实际车道，统一属于共享待调度池。
  */
-export function getLaneLocalTasks(tasks, kind) {
-  return (tasks || []).filter((task) => (
-    LOCAL_LANE_STATUSES.includes(task?.status) && taskSubmitQueueKind(task) === kind
-  ));
+export function getSharedWaitingTasks(tasks = []) {
+  return tasks.filter((task) => SHARED_WAITING_STATUSES.includes(task?.status));
+}
+
+/**
+ * 只有发生提交后才返回实际车道。queued/retry_wait 始终返回 null。
+ */
+export function getActualTaskQueueKind(task) {
+  if (!task || !ASSIGNED_STATUSES.includes(task.status)) return null;
+  const records = task.execution_records || [];
+  const submitId = String(task.submit_id || '').trim();
+  let record = submitId
+    ? records.find((item) => String(item?.submit_id || '').trim() === submitId)
+    : null;
+  if (!record) {
+    record = records.reduce((latest, item) => {
+      if (!item?.input_snapshot?.params?.model_version) return latest;
+      if (!latest) return item;
+      const itemTime = new Date(item.finished_at || item.started_at || '').getTime();
+      const latestTime = new Date(latest.finished_at || latest.started_at || '').getTime();
+      if (!Number.isFinite(itemTime)) return latest;
+      return !Number.isFinite(latestTime) || itemTime >= latestTime ? item : latest;
+    }, null);
+  }
+  if (record) return executionRecordQueueKind(record);
+  return modelToQueueKind(task.params?.model_version || '');
 }
 
 function deriveLaneStatus(tasks, kind, nowMs = Date.now()) {
   const active = activeLaneOccupant(tasks, kind, nowMs);
   const coolingTasks = tasks.filter(t => isCurrentConcurrencyCooldown(t, kind, nowMs));
 
-  const waitingCount = tasks.filter(t => {
-    return WAITING_STATUSES.includes(t.status) && taskSubmitQueueKind(t) === kind;
-  }).length;
+  const sharedWaitingTaskCount = getSharedWaitingTasks(tasks).length;
 
   let nextCheckAt = '';
   if (active) {
@@ -248,11 +267,7 @@ function deriveLaneStatus(tasks, kind, nowMs = Date.now()) {
   } else if (coolingTasks.length > 0) {
     nextCheckAt = coolingTasks.map(t => t.next_run_at).sort()[0] || '';
   } else {
-    const dueTasks = tasks.filter(t => {
-      return ['queued', 'retry_wait', 'scheduled'].includes(t.status) &&
-        taskSubmitQueueKind(t) === kind &&
-        t.next_run_at;
-    });
+    const dueTasks = getSharedWaitingTasks(tasks).filter((task) => task.next_run_at);
     nextCheckAt = dueTasks.map(t => t.next_run_at).sort()[0] || '';
   }
 
@@ -272,7 +287,8 @@ function deriveLaneStatus(tasks, kind, nowMs = Date.now()) {
     queuePosition: qi?.queue_idx ?? null,
     queueLength: qi?.queue_length ?? null,
     nextCheckAt,
-    waitingTaskCount: waitingCount,
+    waitingTaskCount: 0,
+    sharedWaitingTaskCount,
   };
 }
 
@@ -361,9 +377,16 @@ export function formatNextCheckAt(isoTime, nowMs = Date.now()) {
  * @returns {{ kind: 'standard'|'fast', label: string }}
  */
 export function getTaskRouteInfo(task) {
-  if (!task) return { kind: 'standard', label: '标准' };
-  const kind = taskSubmitQueueKind(task);
-  return { kind, label: laneLabel(kind) };
+  if (!task) return { kind: null, label: '未分配', assigned: false };
+  const kind = getActualTaskQueueKind(task);
+  if (!kind) {
+    return {
+      kind: null,
+      label: SHARED_WAITING_STATUSES.includes(task.status) ? '共享池' : '未分配',
+      assigned: false,
+    };
+  }
+  return { kind, label: laneLabel(kind), assigned: true };
 }
 
 /**
@@ -397,33 +420,26 @@ export function formatTaskNextTime(task, nowMs = Date.now()) {
  */
 export function deriveNextAction(task, nowMs = Date.now(), { schedulerTickSeconds = 30, laneStatuses = [] } = {}) {
   if (!task) return { action: '', reason: '' };
-  const kind = taskSubmitQueueKind(task);
+  const kind = getActualTaskQueueKind(task) || taskSubmitQueueKind(task);
   const lane = laneLabel(kind);
   const availableLane = resolveNextEnabledLane(laneStatuses);
-  const targetKind = availableLane?.queueKind || kind;
-  const targetLane = laneLabel(targetKind);
   const status = task.status;
 
   if (status === 'draft') {
     return { action: '等待提交', reason: '任务尚未进入队列，需手动排队或等待调度。' };
   }
   if (status === 'queued') {
-    const nextTime = availableLane
-      ? formatSchedulerTickEta(nowMs, schedulerTickSeconds)
-      : task.next_run_at
+    const nextTime = task.next_run_at && !availableLane
       ? formatTaskDueActionTime(task.next_run_at, nowMs, '应立即提交')
       : formatSchedulerTickEta(nowMs, schedulerTickSeconds);
-    const nextClock = !availableLane && task.next_run_at
-      ? formatTaskClock(task.next_run_at)
-      : formatClockFromMs(nowMs + Math.max(1, Number(schedulerTickSeconds || 30)) * 1000);
     return {
-      action: `${nextTime} 走 ${targetLane}`,
-      reason: `任务在队列中等待，预计 ${nextClock} 前后提交到${targetLane}车道。`,
+      action: `${nextTime} 等待任一车道`,
+      reason: '任务位于共享待调度池；任一启用车道空闲后提交，实际车道在提交发生后确定。',
     };
   }
   if (status === 'scheduled') {
     const time = task.scheduled_at ? formatTaskDueActionTime(task.scheduled_at, nowMs, '应立即入队') : '等待预定时间';
-    return { action: `${time} 进入队列`, reason: `等待预定时间到达后自动进入${lane}车道队列。` };
+    return { action: `${time} 进入共享池`, reason: '等待预定时间到达后自动进入共享待调度池。' };
   }
   if (status === 'submitting') {
     return { action: `提交到${lane}车道中`, reason: '正在调用远端 API 提交生成任务。' };
@@ -456,20 +472,20 @@ export function deriveNextAction(task, nowMs = Date.now(), { schedulerTickSecond
     const isConcurrency = isConcurrencyLimitError(task.last_error) ||
       (task.execution_records || []).some(r => r.error_kind === 'ConcurrencyLimit');
     if (isConcurrency) {
-      if (availableLane && targetKind !== kind) {
+      if (availableLane) {
         return {
-          action: `${formatSchedulerTickEta(nowMs, schedulerTickSeconds)} 走 ${targetLane}`,
-          reason: `${targetLane}车道空闲，将在下次调度检查时切换提交。`,
+          action: `${formatSchedulerTickEta(nowMs, schedulerTickSeconds)} 等待任一车道`,
+          reason: '重试任务位于共享待调度池；任一启用车道空闲后提交，实际车道在提交发生后确定。',
         };
       }
       return {
-        action: `${nextTime} 走 ${lane}（冷却中）`,
-        reason: `${lane}车道触发并发限制，冷却结束后自动重试。`,
+        action: `${nextTime} 返回共享池（冷却中）`,
+        reason: '上次提交触发并发限制，冷却结束后回到共享待调度池。',
       };
     }
     return {
-      action: `${nextTime} 走 ${lane}`,
-      reason: `上次提交遇到临时错误，等待重试冷却结束后走${lane}车道。`,
+      action: `${nextTime} 返回共享池`,
+      reason: '上次提交遇到临时错误，冷却结束后回到共享待调度池。',
     };
   }
   if (status === 'succeeded') {
@@ -498,12 +514,6 @@ function formatSchedulerTickEta(nowMs, schedulerTickSeconds) {
   const remainMinutes = minutes % 60;
   if (remainMinutes === 0) return `约 ${hours} 小时内`;
   return `约 ${hours} 小时 ${remainMinutes} 分钟内`;
-}
-
-function formatTaskClock(isoTime) {
-  const time = new Date(isoTime).getTime();
-  if (!Number.isFinite(time)) return '稍后';
-  return formatClockFromMs(time);
 }
 
 function formatClockFromMs(ms) {
@@ -566,8 +576,8 @@ export function deriveTimelineEvents(task) {
   // 添加排队开始事件
   if (task.queued_at) {
     pushTimelineEvent(events, task.queued_at, now, {
-      title: '进入队列',
-      detail: '按排队开始时间排序，先进入的优先。',
+      title: '进入共享待调度池',
+      detail: '按星级优先，其余任务使用稳定随机顺序；实际车道在提交发生后确定。',
     });
   }
 

@@ -3,10 +3,10 @@ use dreamina_scheduler_lib::{
     extract_generated_task_title, format_ai_model_test_log, format_image_model_settings_log,
     parse_credit_info, parse_imagegen_json_response, parse_mcp_queue_videos_input,
     parse_mcp_video_task_input, parse_submit_output, queue_mcp_video_task, queue_mcp_video_tasks,
-    resolve_task_inputs, sanitize_generated_task_title, AiModelConfig, AppData, AppStore, Asset,
-    AssetKind, ConcurrencyLimitPolicy, DreaminaErrorKind, ImageModelConfig, McpQueueVideosInput,
-    McpVideoTaskDefaults, McpVideoTaskInput, Role, ScheduledTask, SchedulerSettings, TaskDraft,
-    VideoParams,
+    resolve_task_inputs, sanitize_generated_task_title, update_failed_mcp_video_task_draft,
+    AiModelConfig, AppData, AppStore, Asset, AssetKind, ConcurrencyLimitPolicy, DreaminaErrorKind,
+    ImageModelConfig, McpQueueVideosInput, McpQueuedTaskUpdateInput, McpVideoTaskDefaults,
+    McpVideoTaskInput, Role, ScheduledTask, SchedulerSettings, TaskAttempt, TaskDraft, VideoParams,
 };
 
 fn image_asset(id: &str, name: &str, path: &str) -> Asset {
@@ -145,6 +145,73 @@ fn app_store_refreshes_disk_state_across_process_like_instances() {
 }
 
 #[test]
+fn app_store_refuses_to_overwrite_malformed_state() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("store");
+    std::fs::create_dir_all(&root).expect("create store dir");
+    let state_path = root.join("state.json");
+    let malformed = r#"{"tasks":["#;
+    std::fs::write(&state_path, malformed).expect("write malformed state");
+
+    let store = AppStore::load(root);
+    let result = store.mutate(|data| {
+        data.tasks.push(persistence_test_task("must-not-overwrite"));
+        Ok(())
+    });
+
+    assert!(result.is_err(), "损坏状态存在时必须拒绝写入");
+    assert_eq!(
+        std::fs::read_to_string(state_path).expect("read malformed state"),
+        malformed,
+        "失败写入不能覆盖原始损坏文件，必须保留给恢复使用"
+    );
+}
+
+#[test]
+fn app_store_serializes_concurrent_mutations_across_instances() {
+    const WRITERS: usize = 12;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("store");
+    AppStore::load(root.clone())
+        .mutate(|_| Ok(()))
+        .expect("create initial state");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+    let mut handles = Vec::new();
+
+    for index in 0..WRITERS {
+        let store = AppStore::load(root.clone());
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            store.mutate(|data| {
+                let mut task = persistence_test_task(&format!("writer-{index}"));
+                task.prompt = "x".repeat(128 * 1024);
+                data.tasks.push(task);
+                Ok(())
+            })
+        }));
+    }
+
+    for handle in handles {
+        assert!(
+            handle.join().expect("writer thread").is_ok(),
+            "并发写入不应因共享临时文件或竞态失败"
+        );
+    }
+
+    let reloaded = AppStore::load(root).snapshot();
+    for index in 0..WRITERS {
+        assert!(
+            reloaded
+                .tasks
+                .iter()
+                .any(|task| task.title == format!("writer-{index}")),
+            "并发写入丢失 writer-{index}"
+        );
+    }
+}
+
+#[test]
 fn mcp_queue_video_imports_direct_assets_and_maps_simple_params() {
     let temp = tempfile::tempdir().expect("temp dir");
     let source_dir = temp.path().join("source");
@@ -261,6 +328,178 @@ fn mcp_queue_video_resolves_numbered_image_and_audio_mentions() {
         queued.task.audio_asset_ids,
         vec![queued.imported_assets[2].id.clone()]
     );
+}
+
+#[test]
+fn mcp_update_failed_task_draft_preserves_failure_history_without_requeueing() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let source_dir = temp.path().join("source");
+    let assets_dir = temp.path().join("assets");
+    std::fs::create_dir_all(&source_dir).expect("create source dir");
+    let old_image = source_dir.join("old.png");
+    let new_image = source_dir.join("new.png");
+    std::fs::write(&old_image, b"old-image").expect("write old image");
+    std::fs::write(&new_image, b"new-image").expect("write new image");
+    let mut data = AppData::default();
+
+    let queued = queue_mcp_video_task(
+        &mut data,
+        &assets_dir,
+        McpVideoTaskInput {
+            title: "旧标题".to_string(),
+            prompt: "旧版 @图1".to_string(),
+            image_paths: vec![old_image.to_string_lossy().to_string()],
+            model: Some("standard".to_string()),
+            ..McpVideoTaskInput::default()
+        },
+    )
+    .expect("queue original task");
+    let task = data.tasks.first_mut().expect("queued task");
+    task.status = "failed".to_string();
+    task.submit_id = "submit-original".to_string();
+    task.attempt_count = 1;
+    task.last_error = "generation failed".to_string();
+    task.result_paths = vec!["/tmp/old-result.mp4".to_string()];
+    task.attempts.push(TaskAttempt {
+        id: "attempt-1".to_string(),
+        started_at: "2026-07-19T21:32:00+08:00".to_string(),
+        finished_at: "2026-07-19T21:57:00+08:00".to_string(),
+        status: "failed".to_string(),
+        command_preview: queued.task.command_preview.clone(),
+        stdout: String::new(),
+        stderr: "generation failed".to_string(),
+        error_kind: "generation_failed".to_string(),
+        duration_seconds: 1500.0,
+        error_detail: "generation failed".to_string(),
+    });
+
+    let updated = update_failed_mcp_video_task_draft(
+        &mut data,
+        &assets_dir,
+        McpQueuedTaskUpdateInput {
+            task_id: queued.task.id.clone(),
+            task: McpVideoTaskInput {
+                title: "新版标题".to_string(),
+                prompt: "新版 @图1".to_string(),
+                image_paths: vec![new_image.to_string_lossy().to_string()],
+                duration: Some(15),
+                ..McpVideoTaskInput::default()
+            },
+        },
+    )
+    .expect("update failed task draft");
+
+    assert_eq!(updated.task.id, queued.task.id);
+    assert_eq!(updated.task.status, "failed", "保存新版不能自动重排");
+    assert_eq!(updated.task.submit_id, "submit-original");
+    assert_eq!(updated.task.attempt_count, 1);
+    assert_eq!(updated.task.attempts.len(), 1);
+    assert_eq!(updated.task.last_error, "generation failed");
+    assert_eq!(updated.task.result_paths, vec!["/tmp/old-result.mp4"]);
+    assert_eq!(updated.task.title, "新版标题");
+    assert_eq!(updated.task.prompt, "新版 @图1");
+    assert_eq!(updated.imported_assets.len(), 1);
+}
+
+#[test]
+fn mcp_update_retry_wait_task_draft_stops_automatic_retry_and_preserves_history() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let source_dir = temp.path().join("source");
+    let assets_dir = temp.path().join("assets");
+    std::fs::create_dir_all(&source_dir).expect("create source dir");
+    let old_image = source_dir.join("old.png");
+    let new_image = source_dir.join("new.png");
+    std::fs::write(&old_image, b"old-image").expect("write old image");
+    std::fs::write(&new_image, b"new-image").expect("write new image");
+    let mut data = AppData::default();
+
+    let queued = queue_mcp_video_task(
+        &mut data,
+        &assets_dir,
+        McpVideoTaskInput {
+            prompt: "旧版 @图1".to_string(),
+            image_paths: vec![old_image.to_string_lossy().to_string()],
+            ..McpVideoTaskInput::default()
+        },
+    )
+    .expect("queue original task");
+    let task = data.tasks.first_mut().expect("queued task");
+    task.status = "retry_wait".to_string();
+    task.next_run_at = Some("2026-07-20T16:00:00+08:00".to_string());
+    task.attempt_count = 2;
+    task.last_error = "temporary network error".to_string();
+    task.attempts.push(TaskAttempt {
+        id: "attempt-1".to_string(),
+        started_at: "2026-07-20T15:00:00+08:00".to_string(),
+        finished_at: "2026-07-20T15:01:00+08:00".to_string(),
+        status: "retry_wait".to_string(),
+        command_preview: queued.task.command_preview.clone(),
+        stdout: String::new(),
+        stderr: "temporary network error".to_string(),
+        error_kind: "Transient".to_string(),
+        duration_seconds: 60.0,
+        error_detail: "temporary network error".to_string(),
+    });
+
+    let updated = update_failed_mcp_video_task_draft(
+        &mut data,
+        &assets_dir,
+        McpQueuedTaskUpdateInput {
+            task_id: queued.task.id.clone(),
+            task: McpVideoTaskInput {
+                prompt: "新版 @图1".to_string(),
+                image_paths: vec![new_image.to_string_lossy().to_string()],
+                ..McpVideoTaskInput::default()
+            },
+        },
+    )
+    .expect("update retry-wait task draft");
+
+    assert_eq!(updated.task.id, queued.task.id);
+    assert_eq!(updated.task.status, "failed");
+    assert_eq!(updated.task.next_run_at, None);
+    assert_eq!(updated.task.attempt_count, 2);
+    assert_eq!(updated.task.attempts.len(), 1);
+    assert_eq!(updated.task.last_error, "temporary network error");
+    assert_eq!(updated.task.prompt, "新版 @图1");
+}
+
+#[test]
+fn mcp_update_failed_task_draft_rejects_non_failed_task() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let source_dir = temp.path().join("source");
+    let assets_dir = temp.path().join("assets");
+    std::fs::create_dir_all(&source_dir).expect("create source dir");
+    let image = source_dir.join("image.png");
+    std::fs::write(&image, b"image").expect("write image");
+    let mut data = AppData::default();
+
+    let queued = queue_mcp_video_task(
+        &mut data,
+        &assets_dir,
+        McpVideoTaskInput {
+            prompt: "原版 @图1".to_string(),
+            image_paths: vec![image.to_string_lossy().to_string()],
+            ..McpVideoTaskInput::default()
+        },
+    )
+    .expect("queue original task");
+    let result = update_failed_mcp_video_task_draft(
+        &mut data,
+        &assets_dir,
+        McpQueuedTaskUpdateInput {
+            task_id: queued.task.id,
+            task: McpVideoTaskInput {
+                prompt: "不应写入".to_string(),
+                image_paths: vec![image.to_string_lossy().to_string()],
+                ..McpVideoTaskInput::default()
+            },
+        },
+    );
+
+    assert!(result.is_err());
+    assert_eq!(data.tasks[0].prompt, "原版 @图1");
+    assert_eq!(data.tasks[0].status, "queued");
 }
 
 #[test]
@@ -1446,4 +1685,16 @@ fn tos_upload_connection_reset_classified_as_transient() {
     );
     assert_eq!(classified.kind, DreaminaErrorKind::Transient);
     assert_eq!(classified.next_status, "retry_wait");
+}
+
+#[test]
+fn commit_image_upload_bad_gateway_classified_as_transient() {
+    let settings = SchedulerSettings::default();
+    let classified = classify_dreamina_error(
+        r#"upload resource "/tmp/scene.png": upload image: commit phase, commit byte, CommitImageUpload: unmarshal response, request 2026071123374119216803110509922C2, code 201007, request to backend service failed, bad gateway"#,
+        &settings,
+    );
+    assert_eq!(classified.kind, DreaminaErrorKind::Transient);
+    assert_eq!(classified.next_status, "retry_wait");
+    assert!(classified.retry_after_seconds.is_some());
 }

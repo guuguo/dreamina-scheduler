@@ -1,8 +1,10 @@
 #![recursion_limit = "256"]
 
 use dreamina_scheduler_lib::{
-    default_store_dir, parse_mcp_queue_videos_input, parse_mcp_video_task_input,
-    process_queue_for_store_blocking, queue_mcp_video_task, queue_mcp_video_tasks, AppStore,
+    default_store_dir, parse_mcp_queue_videos_input, parse_mcp_queued_task_update_input,
+    parse_mcp_video_task_input, process_queue_for_store_blocking, queue_mcp_video_task,
+    queue_mcp_video_tasks, update_failed_mcp_video_task_draft, update_queued_mcp_video_task,
+    AppStore,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -11,6 +13,8 @@ use std::io::{self, BufRead, Write};
 const ARGUMENT_WRAPPER_KEYS: &[&str] = &["arguments", "args", "input", "parameters"];
 const TOOL_ARGUMENT_HINT_KEYS: &[&str] = &[
     "title",
+    "task_id",
+    "taskId",
     "prompt",
     "image_paths",
     "imagePaths",
@@ -137,6 +141,12 @@ fn handle_tool_call(store: &AppStore, id: Value, params: Value) -> Value {
     let result = match name {
         "dreamina_queue_video" => call_queue_video(store, arguments, &params, &argument_source),
         "dreamina_queue_videos" => call_queue_videos(store, arguments, &params, &argument_source),
+        "dreamina_update_queued_task" => {
+            call_update_queued_task(store, arguments, &params, &argument_source)
+        }
+        "dreamina_update_failed_task_draft" => {
+            call_update_failed_task_draft(store, arguments, &params, &argument_source)
+        }
         "dreamina_process_queue_once" => call_process_queue_once(store),
         "dreamina_get_queue_snapshot" => call_get_queue_snapshot(store),
         _ => Err(format!("Unknown tool: {name}")),
@@ -145,6 +155,50 @@ fn handle_tool_call(store: &AppStore, id: Value, params: Value) -> Value {
         Ok(value) => json_rpc_result(id, tool_success(value)),
         Err(message) => json_rpc_result(id, tool_error(message)),
     }
+}
+
+fn call_update_queued_task(
+    store: &AppStore,
+    arguments: Value,
+    params: &Value,
+    argument_source: &str,
+) -> Result<Value, String> {
+    let argument_hint = argument_hint(params, &arguments, argument_source);
+    let input = parse_mcp_queued_task_update_input(arguments)
+        .map_err(|error| format!("{error}；{argument_hint}"))?;
+    let assets_dir = store.assets_dir();
+    store
+        .mutate(|data| {
+            update_queued_mcp_video_task(data, &assets_dir, input).map(|updated| {
+                json!({
+                    "task": updated.task,
+                    "imported_assets": updated.imported_assets,
+                })
+            })
+        })
+        .map_err(|error| format!("{error}；{argument_hint}"))
+}
+
+fn call_update_failed_task_draft(
+    store: &AppStore,
+    arguments: Value,
+    params: &Value,
+    argument_source: &str,
+) -> Result<Value, String> {
+    let argument_hint = argument_hint(params, &arguments, argument_source);
+    let input = parse_mcp_queued_task_update_input(arguments)
+        .map_err(|error| format!("{error}；{argument_hint}"))?;
+    let assets_dir = store.assets_dir();
+    store
+        .mutate(|data| {
+            update_failed_mcp_video_task_draft(data, &assets_dir, input).map(|updated| {
+                json!({
+                    "task": updated.task,
+                    "imported_assets": updated.imported_assets,
+                })
+            })
+        })
+        .map_err(|error| format!("{error}；{argument_hint}"))
 }
 
 fn call_queue_video(
@@ -517,6 +571,64 @@ fn tool_definitions() -> Value {
                             }
                         }
                     }
+                }
+            }
+        },
+        {
+            "name": "dreamina_update_queued_task",
+            "description": "Replace prompt and media of one never-executed queued task in place. Preserves task ID and execution history; rejects submitted/running/completed tasks.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["prompt"],
+                "allOf": [
+                    { "anyOf": [{ "required": ["task_id"] }, { "required": ["taskId"] }] },
+                    { "anyOf": [{ "required": ["image_paths"] }, { "required": ["imagePaths"] }, { "required": ["images"] }] }
+                ],
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "taskId": { "type": "string" },
+                    "title": { "type": "string" },
+                    "prompt": { "type": "string" },
+                    "image_paths": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                    "imagePaths": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                    "images": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                    "audio_paths": { "type": "array", "items": { "type": "string" } },
+                    "audioPaths": { "type": "array", "items": { "type": "string" } },
+                    "audios": { "type": "array", "items": { "type": "string" } },
+                    "orientation": { "type": "string", "enum": ["portrait", "landscape"] },
+                    "model": { "type": "string", "enum": ["fast", "standard"] },
+                    "duration": { "type": "integer", "minimum": 4, "maximum": 15 },
+                    "video_resolution": { "type": "string", "enum": ["720p"] },
+                    "videoResolution": { "type": "string", "enum": ["720p"] }
+                }
+            }
+        },
+        {
+            "name": "dreamina_update_failed_task_draft",
+            "description": "Replace prompt and media of one failed or retry-wait task in place as the draft for its next manual retry. Retry-wait tasks become failed drafts so automatic retries stop. Preserves task ID, submit ID, attempts, execution history, results, and errors; never requeues or reruns the task.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["prompt"],
+                "allOf": [
+                    { "anyOf": [{ "required": ["task_id"] }, { "required": ["taskId"] }] },
+                    { "anyOf": [{ "required": ["image_paths"] }, { "required": ["imagePaths"] }, { "required": ["images"] }] }
+                ],
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "taskId": { "type": "string" },
+                    "title": { "type": "string" },
+                    "prompt": { "type": "string" },
+                    "image_paths": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                    "imagePaths": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                    "images": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                    "audio_paths": { "type": "array", "items": { "type": "string" } },
+                    "audioPaths": { "type": "array", "items": { "type": "string" } },
+                    "audios": { "type": "array", "items": { "type": "string" } },
+                    "orientation": { "type": "string", "enum": ["portrait", "landscape"] },
+                    "model": { "type": "string", "enum": ["fast", "standard"] },
+                    "duration": { "type": "integer", "minimum": 4, "maximum": 15 },
+                    "video_resolution": { "type": "string", "enum": ["720p"] },
+                    "videoResolution": { "type": "string", "enum": ["720p"] }
                 }
             }
         },

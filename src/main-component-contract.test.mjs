@@ -58,15 +58,46 @@ test('queue center keeps actions in the right detail column and exposes lane swi
   assert.match(source, /className="qc-detail-column"/);
   assert.match(source, /onToggleLane=\{handleToggleLane\}/);
   assert.match(source, /invoke\('set_lane_enabled_command'/);
-  assert.match(source, /> 排队</);
+  assert.match(source, /> 立即排队</);
+});
+
+test('queue center exposes task search above the paginated task list', () => {
+  assert.match(source, /const \[searchQuery, setSearchQuery\] = useState\(''\);/);
+  assert.match(source, /filterTasks\(tasks, \{ searchQuery \}\)/);
+  assert.match(source, /className="qc-task-searchbar"/);
+  assert.match(source, /aria-label="搜索任务"/);
+  assert.match(source, /placeholder="搜索任务名称、提示词或提交 ID"/);
+  assert.match(source, /const handleSearchChange = useCallback/);
+  assert.match(source, /setPage\(1\)/);
+});
+
+test('queue center exposes atomic batch pause for selected waiting tasks', () => {
+  assert.match(source, /const pausableSelectedTasks = useMemo/);
+  assert.match(source, /invoke\('pause_tasks_command', \{ taskIds \}\)/);
+  assert.match(source, /批量暂停/);
+  assert.match(tauriSource, /pub fn pause_tasks_command/);
+  assert.match(tauriSource, /commands::pause_tasks_command/);
 });
 
 test('queue center exposes two-level queue priority controls', () => {
   assert.match(source, /invoke\('set_task_queue_priority_command'/);
-  assert.match(source, /className="qc-priority-picker"/);
+  assert.match(source, /className="qc-console-priority"/);
   assert.match(source, /★★ 下一位/);
   assert.match(source, /★ 第二优先/);
   assert.match(source, /taskPriorities/);
+});
+
+test('queue detail uses a compact state-adaptive timeline console', () => {
+  assert.match(source, /deriveTaskDetailMetrics/);
+  assert.match(source, /getTaskDetailSectionOrder/);
+  assert.match(source, /className="qc-compact-console"/);
+  assert.match(source, /className="qc-console-metrics"/);
+  assert.match(source, /过程时间线/);
+  assert.match(source, /taskPriorities=\{state\.taskPriorities\}/);
+  assert.doesNotMatch(source, />执行概览</);
+  assert.doesNotMatch(source, />排队参数</);
+  assert.doesNotMatch(source, /className="qc-selected-side-panel"/);
+  assert.doesNotMatch(source, /className="qc-summary-grid qc-summary-grid-side"/);
 });
 
 test('recent history exposes one unified show-all records control', () => {
@@ -78,7 +109,7 @@ test('recent history exposes one unified show-all records control', () => {
 });
 
 test('queue detail primary actions always expose task deletion', () => {
-  const detailActions = source.match(/<div className="qc-selected-actions qc-selected-actions-stack">[\s\S]*?<\/div>/)?.[0] || '';
+  const detailActions = source.match(/<div className="qc-console-actions">[\s\S]*?<\/div>/)?.[0] || '';
   assert.doesNotMatch(detailActions, /canDeleteTask\(selectedTask\)/);
   assert.match(detailActions, /handleDeleteTask\(selectedTask\)/);
   assert.match(detailActions, /删除任务/);
@@ -107,6 +138,12 @@ test('queue center shows all tasks without rarely used toolbar actions', () => {
   assert.doesNotMatch(source, /清空已完成/);
   assert.doesNotMatch(source, /执行策略/);
   assert.doesNotMatch(source, /运行一次/);
+});
+
+test('polling UI does not present the obsolete fixed interval as active behavior', () => {
+  assert.doesNotMatch(source, /轮询间隔（秒）/);
+  assert.doesNotMatch(source, /查询间隔<\/span><b>\{state\.settings\?\.poll_interval_seconds/);
+  assert.match(source, /自适应轮询/);
 });
 
 test('role library is grid-only and exposes series plus disabled editing', () => {

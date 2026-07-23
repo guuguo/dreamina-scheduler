@@ -3,8 +3,8 @@ use dreamina_scheduler_lib::{
     backfill_draft_command_previews, backfill_execution_records_from_attempts, build_install_plan,
     build_login_plan, classify_dreamina_error, compact_retry_execution_records_for_display,
     create_draft_task, create_task_with_preview, delete_execution_record_from_data, delete_role,
-    delete_task_from_data, import_media_to_role, needs_keep_awake, pause_task, peek_due_task_cli,
-    process_next_due_task_with_runner, query_task_submit_id_once_with_runner,
+    delete_task_from_data, import_media_to_role, needs_keep_awake, pause_task, pause_tasks,
+    peek_due_task_cli, process_next_due_task_with_runner, query_task_submit_id_once_with_runner,
     queue_tasks_with_batch_schedule, queue_tasks_with_model_strategy, record_lifecycle_event,
     record_scheduler_tick, recover_tasks_on_load, remove_media_from_role, reschedule_task,
     resume_task, save_clipboard_image_asset, update_task_from_data, upsert_role, AppData, Asset,
@@ -896,6 +896,43 @@ fn pause_task_rejected_from_submitting() {
     data.tasks.push(task);
     let result = pause_task(&mut data, "task-1");
     assert!(result.is_err());
+}
+
+#[test]
+fn pause_tasks_pauses_all_supported_waiting_states() {
+    let mut data = default_data();
+    let queued = queued_task("task-queued");
+    let mut scheduled = queued_task("task-scheduled");
+    scheduled.status = "scheduled".to_string();
+    let mut retry_wait = queued_task("task-retry");
+    retry_wait.status = "retry_wait".to_string();
+    data.tasks.extend([queued, scheduled, retry_wait]);
+
+    let ids = vec![
+        "task-queued".to_string(),
+        "task-scheduled".to_string(),
+        "task-retry".to_string(),
+    ];
+    let paused = pause_tasks(&mut data, &ids).expect("batch pause should succeed");
+
+    assert_eq!(paused.len(), 3);
+    assert!(paused.iter().all(|task| task.status == "paused"));
+}
+
+#[test]
+fn pause_tasks_rejects_mixed_invalid_batch_without_partial_changes() {
+    let mut data = default_data();
+    let queued = queued_task("task-queued");
+    let mut submitting = queued_task("task-submitting");
+    submitting.status = "submitting".to_string();
+    data.tasks.extend([queued, submitting]);
+
+    let ids = vec!["task-queued".to_string(), "task-submitting".to_string()];
+    let result = pause_tasks(&mut data, &ids);
+
+    assert!(result.is_err());
+    assert_eq!(data.tasks[0].status, "queued");
+    assert_eq!(data.tasks[1].status, "submitting");
 }
 
 #[test]
@@ -2108,26 +2145,39 @@ fn submitting_task_blocks_new_submissions() {
 }
 
 #[test]
-fn querying_task_with_submit_id_is_prioritized() {
+fn batch_schedule_keeps_each_task_bound_to_its_own_plan_when_fast_items_are_skipped() {
     let mut data = default_data();
-    let mut querying_task = queued_task("task-q");
-    querying_task.status = "querying".to_string();
-    querying_task.submit_id = "submit-123".to_string();
-    data.tasks.push(querying_task);
-    data.tasks.push(queued_task("task-2"));
+    let mut already_fast = queued_task("already-fast");
+    already_fast.params.model_version = "seedance2.0fast".to_string();
+    let standard = queued_task("standard-after-fast");
+    data.tasks.push(already_fast);
+    data.tasks.push(standard);
+    let first_time = (Utc::now() + Duration::hours(1)).to_rfc3339();
+    let second_time = (Utc::now() + Duration::hours(2)).to_rfc3339();
+    let plan = vec![
+        BatchQueuePlanItem {
+            task_id: "already-fast".to_string(),
+            scheduled_at: Some(first_time),
+        },
+        BatchQueuePlanItem {
+            task_id: "standard-after-fast".to_string(),
+            scheduled_at: Some(second_time.clone()),
+        },
+    ];
 
-    let runner = |args: &[String]| -> Result<(String, String), String> {
-        assert_eq!(args[0], "query_result");
-        Ok((r#"{"gen_status":"success","result_paths":["/tmp/video.mp4"],"result_urls":["https://cdn.example.com/video.mp4"]}"#.to_string(), String::new()))
-    };
-    let result = process_next_due_task_with_runner(&mut data, runner)
-        .expect("process queue")
-        .expect("task found");
-    assert_eq!(result.status, "succeeded");
+    let updated =
+        queue_tasks_with_batch_schedule(&mut data, &plan, 1, true).expect("queue batch schedule");
+
+    assert_eq!(updated.len(), 1);
+    assert_eq!(updated[0].id, "standard-after-fast");
+    assert_eq!(
+        updated[0].scheduled_at.as_deref(),
+        Some(second_time.as_str())
+    );
 }
 
 #[test]
-fn queueing_over_two_hours_submits_fast_fallback() {
+fn queueing_over_two_hours_does_not_submit_fast_fallback() {
     let mut data = default_data();
     let mut task = queued_task("task-slow-queue");
     task.status = "querying".to_string();
@@ -2168,12 +2218,10 @@ fn queueing_over_two_hours_submits_fast_fallback() {
     data.tasks.push(task);
 
     let result = process_next_due_task_with_runner(&mut data, |args| {
-        assert_eq!(args[0], "multimodal2video");
-        assert!(args
-            .iter()
-            .any(|arg| arg == "--model_version=seedance2.0fast"));
+        assert_eq!(args[0], "query_result");
+        assert_eq!(args[1], "--submit_id=slow-123");
         Ok((
-            r#"{"submit_id":"fast-123","gen_status":"querying"}"#.to_string(),
+            r#"{"gen_status":"querying","queue_info":{"queue_status":"Queueing","queue_idx":4680,"queue_length":300031}}"#.to_string(),
             String::new(),
         ))
     })
@@ -2182,16 +2230,15 @@ fn queueing_over_two_hours_submits_fast_fallback() {
 
     assert_eq!(result.status, "querying");
     assert_eq!(result.submit_id, "slow-123");
+    assert_eq!(result.execution_records.len(), 1);
     assert!(result
         .execution_records
         .iter()
-        .any(|record| record.submit_id == "fast-123"
-            && record.status == "querying"
-            && record.input_snapshot.params.model_version == "seedance2.0fast"));
+        .all(|record| record.submit_id != "fast-123"));
 }
 
 #[test]
-fn active_fast_fallback_is_queried_instead_of_duplicated() {
+fn active_historical_fast_record_is_queried_after_current_submit_without_duplication() {
     let mut data = default_data();
     let mut task = queued_task("task-fast-active");
     task.status = "querying".to_string();
@@ -2233,6 +2280,35 @@ fn active_fast_fallback_is_queried_instead_of_duplicated() {
     });
     data.tasks.push(task);
 
+    let first = process_next_due_task_with_runner(&mut data, |args| {
+        assert_eq!(
+            args,
+            &[
+                "query_result".to_string(),
+                "--submit_id=slow-123".to_string()
+            ]
+        );
+        Ok((
+            r#"{"gen_status":"querying","queue_info":{"queue_status":"Queueing","queue_idx":4680,"queue_length":300031}}"#.to_string(),
+            String::new(),
+        ))
+    })
+    .expect("process current submit")
+    .expect("current task processed");
+    assert_eq!(first.status, "querying");
+    assert!(!data.tasks[0].auto_query_stopped);
+    assert_eq!(data.tasks[0].execution_records[0].status, "querying");
+    assert!(data.tasks[0].execution_records[0].finished_at.is_empty());
+    let planned = peek_due_task_cli(&data)
+        .expect("plan historical query")
+        .expect("historical query should be due");
+    assert_eq!(
+        planned.action,
+        DueTaskCliAction::Query {
+            submit_id: "fast-123".to_string()
+        }
+    );
+
     let result = process_next_due_task_with_runner(&mut data, |args| {
         assert_eq!(
             args,
@@ -2261,7 +2337,7 @@ fn active_fast_fallback_is_queried_instead_of_duplicated() {
 }
 
 #[test]
-fn successful_fast_fallback_completes_task() {
+fn successful_historical_fast_execution_completes_task() {
     let mut data = default_data();
     let mut task = queued_task("task-fast-success");
     task.status = "querying".to_string();
@@ -2297,22 +2373,22 @@ fn successful_fast_fallback_completes_task() {
     });
     data.tasks.push(task);
 
-    let result = process_next_due_task_with_runner(&mut data, |args| {
-        assert_eq!(
-            args,
-            &[
-                "query_result".to_string(),
-                "--submit_id=fast-123".to_string()
-            ]
-        );
-        Ok((
-            r#"{"gen_status":"success","result_urls":["https://cdn.example.com/fast.mp4"]}"#
-                .to_string(),
-            String::new(),
-        ))
-    })
-    .expect("process queue")
-    .expect("task processed");
+    let result =
+        query_task_submit_id_once_with_runner(&mut data, "task-fast-success", "fast-123", |args| {
+            assert_eq!(
+                args,
+                &[
+                    "query_result".to_string(),
+                    "--submit_id=fast-123".to_string()
+                ]
+            );
+            Ok((
+                r#"{"gen_status":"success","result_urls":["https://cdn.example.com/fast.mp4"]}"#
+                    .to_string(),
+                String::new(),
+            ))
+        })
+        .expect("query historical fast execution");
 
     assert_eq!(result.status, "succeeded");
     assert_eq!(result.submit_id, "fast-123");
@@ -2648,6 +2724,21 @@ fn delete_task_removes_from_list() {
     delete_task_from_data(&mut data, "task-1").expect("delete");
     assert_eq!(data.tasks.len(), 1);
     assert_eq!(data.tasks[0].id, "task-2");
+}
+
+#[test]
+fn delete_task_rejects_active_remote_task() {
+    let mut data = default_data();
+    let mut task = queued_task("task-active");
+    task.status = "querying".to_string();
+    task.submit_id = "submit-active".to_string();
+    data.tasks.push(task);
+
+    let error = delete_task_from_data(&mut data, "task-active")
+        .expect_err("active remote task must not be deleted");
+
+    assert!(error.to_string().contains("不可删除"));
+    assert_eq!(data.tasks.len(), 1);
 }
 
 #[test]

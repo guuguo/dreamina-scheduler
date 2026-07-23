@@ -20,7 +20,6 @@ import {
   findLatestSuccessfulResultPath,
 } from './app-logic.js';
 import { buildMentionItems } from './mention-utils.js';
-import PromptMentionEditor from './components/PromptMentionEditor.jsx';
 import { applyEditorUpdate, applyMentionRefsToTaskForm } from './prompt-editor-utils.js';
 import {
   deriveCurrentExecutionRecord,
@@ -61,7 +60,7 @@ import {
   deriveTimelineEvents,
   selectKeyTimelineRecords,
   laneLabel,
-  taskSubmitQueueKind,
+  getSharedWaitingTasks,
 } from './lane-utils.js';
 import {
   AlertCircle,
@@ -85,11 +84,13 @@ import {
   ListChecks,
   Loader2,
   MoreHorizontal,
+  Pause,
   Pencil,
   Play,
   Plus,
   RefreshCcw,
   Save,
+  Search,
   Settings,
   ShieldCheck,
   Sparkles,
@@ -108,11 +109,12 @@ import {
   paginateTasks,
   formatPaginationLabel,
   deriveTaskDispatchInfo,
-  deriveQueueStats,
   canDeleteTask,
   getTaskResultItems,
   getTaskHitResources,
   getCommandPreviewPresentation,
+  deriveTaskDetailMetrics,
+  getTaskDetailSectionOrder,
 } from './queue-view-utils.js';
 import {
   buildBatchQueuePlan,
@@ -134,6 +136,8 @@ import { PasswordInput } from './components/ui/PasswordInput.jsx';
 import { CopyableInput } from './components/ui/CopyableInput.jsx';
 import { resolveMediaSrc } from './media-src.js';
 import './styles.css';
+
+const PromptMentionEditor = React.lazy(() => import('./components/PromptMentionEditor.jsx'));
 
 const ratios = ['9:16', '16:9', '1:1', '3:4', '4:3', '21:9'];
 const modelVersions = ['seedance2.0', 'seedance2.0fast'];
@@ -188,6 +192,9 @@ const tauriRuntimeAvailable = typeof window !== 'undefined' && Boolean(window.__
 function App() {
   const [activeView, setActiveView] = useState('queue');
   const [state, setState] = useState(emptyState);
+  useEffect(() => {
+    document.getElementById('boot-screen')?.remove();
+  }, []);
   const [cli, setCli] = useState({ available: false, path: '', message: '等待检测', version: '', commit: '', build_time: '', version_raw: '', installed_release_version: '', installed_release_date: '', installed_release_notes: '', installed_release_path: '' });
   const [cliUpdate, setCliUpdate] = useState(null);
   const [cliUpdateStatus, setCliUpdateStatus] = useState('idle'); // idle | checking | success | failed
@@ -219,6 +226,7 @@ function App() {
   const refreshStateRef = useRef(null);
   // 记录上次拉取的状态签名，空闲时签名不变即跳过整份 get_app_state，省去大文件读解析。
   const lastStateSignatureRef = useRef('');
+  const resumeRefreshInFlightRef = useRef(null);
   const [lastTickAt, setLastTickAt] = useState(null);
   const [selectedTaskId, setSelectedTaskId] = useState('');
   const [selectedRoleId, setSelectedRoleId] = useState('');
@@ -280,6 +288,32 @@ function App() {
   // 每次渲染都更新 ref，让 useEffect([]) 内的闭包始终拿到最新版本
   refreshStateRef.current = refreshState;
 
+  async function refreshStateIfChanged({ force = false } = {}) {
+    if (resumeRefreshInFlightRef.current) return resumeRefreshInFlightRef.current;
+
+    const request = (async () => {
+      if (!force) {
+        try {
+          const sig = await invoke('get_state_signature');
+          if (sig === lastStateSignatureRef.current) return false;
+        } catch {
+          // 签名读取失败时退化为完整刷新，保证前台状态最终一致。
+        }
+      }
+      await refreshStateRef.current?.();
+      return true;
+    })();
+
+    resumeRefreshInFlightRef.current = request;
+    try {
+      return await request;
+    } finally {
+      if (resumeRefreshInFlightRef.current === request) {
+        resumeRefreshInFlightRef.current = null;
+      }
+    }
+  }
+
   async function checkCli() {
     const result = await invoke('check_dreamina_cli');
     setCli(result);
@@ -316,7 +350,7 @@ function App() {
   }
 
   useEffect(() => {
-    refreshState();
+    refreshStateIfChanged({ force: true });
     checkHostPlatform().catch(() => {});
     checkCli().catch((error) => setFeedback(`CLI 检测失败：${String(error)}`));
   }, []);
@@ -359,14 +393,8 @@ function App() {
   // 空闲优化：先取廉价签名（仅 stat 文件，不读整份状态），签名未变则跳过 get_app_state，
   // 避免空闲时每 30s 读+解析整份大状态文件。
   useEffect(() => {
-    const timer = window.setInterval(async () => {
-      try {
-        const sig = await invoke('get_state_signature');
-        if (sig === lastStateSignatureRef.current) return; // 无变化，跳过整份刷新
-      } catch {
-        // 取签名失败则退化为照常全量刷新
-      }
-      refreshStateRef.current?.();
+    const timer = window.setInterval(() => {
+      refreshStateIfChanged();
     }, 30000);
     return () => {
       window.clearInterval(timer);
@@ -376,6 +404,7 @@ function App() {
   // 记录前端生命周期，辅助判断是进程退出、WebView 暂停，还是后端调度仍在运行。
   useEffect(() => {
     if (!tauriRuntimeAvailable) return undefined;
+    let visibleRefreshFrame = 0;
     const logLifecycle = (eventType, message) => {
       invoke('record_lifecycle_event_command', {
         eventType,
@@ -383,10 +412,18 @@ function App() {
         detail: `visibility=${document.visibilityState}`,
       }).catch(() => {});
     };
+    function scheduleVisibleStateRefresh() {
+      if (document.hidden) return;
+      if (visibleRefreshFrame) window.cancelAnimationFrame(visibleRefreshFrame);
+      visibleRefreshFrame = window.requestAnimationFrame(() => {
+        visibleRefreshFrame = 0;
+        refreshStateIfChanged();
+      });
+    }
     logLifecycle('frontend_ready', '前端页面就绪');
     const handleFocus = () => {
       logLifecycle('frontend_focus', '窗口聚焦');
-      refreshStateRef.current?.();
+      scheduleVisibleStateRefresh();
     };
     const handleBlur = () => logLifecycle('frontend_blur', '窗口失焦');
     const handleVisibility = () => {
@@ -394,7 +431,7 @@ function App() {
         logLifecycle('frontend_hidden', '页面隐藏');
       } else {
         logLifecycle('frontend_visible', '页面恢复可见');
-        refreshStateRef.current?.();
+        scheduleVisibleStateRefresh();
       }
     };
     const handlePageHide = () => logLifecycle('frontend_pagehide', '页面卸载或进入缓存');
@@ -407,6 +444,7 @@ function App() {
       window.removeEventListener('blur', handleBlur);
       window.removeEventListener('pagehide', handlePageHide);
       document.removeEventListener('visibilitychange', handleVisibility);
+      if (visibleRefreshFrame) window.cancelAnimationFrame(visibleRefreshFrame);
     };
   }, []);
 
@@ -1335,19 +1373,21 @@ function CreateTaskView({ state, assetById, taskForm, setTaskForm, setActiveView
                     <em>自动匹配可用的 @图片、角色图片和音频素材</em>
                   </button>
                 ) : null}
-                <PromptMentionEditor
-                  value={taskForm.prompt}
-                  promptDoc={taskForm.prompt_doc}
-                  mentionItems={mentionItems}
-                  maxLength={TASK_PROMPT_MAX_LENGTH}
-                  placeholder="@女主日常服 在海边漫步，阳光照在身上，海浪轻轻打沙滩，微风拂动长发，画面唯美治愈。"
-                  onUpdate={handleEditorUpdate}
-                  onPasteImage={handlePasteImageForEditor}
-                  onPasteSystemImage={handlePasteSystemImageForEditor}
-                  onPasteAudio={handlePasteAudioForEditor}
-                  onMentionClick={handleMentionClick}
-                  tempImagePaths={taskForm.temp_image_paths}
-                />
+                <React.Suspense fallback={<div className="prompt-editor-loading"><Loader2 size={16} /> 正在载入编辑器</div>}>
+                  <PromptMentionEditor
+                    value={taskForm.prompt}
+                    promptDoc={taskForm.prompt_doc}
+                    mentionItems={mentionItems}
+                    maxLength={TASK_PROMPT_MAX_LENGTH}
+                    placeholder="@女主日常服 在海边漫步，阳光照在身上，海浪轻轻打沙滩，微风拂动长发，画面唯美治愈。"
+                    onUpdate={handleEditorUpdate}
+                    onPasteImage={handlePasteImageForEditor}
+                    onPasteSystemImage={handlePasteSystemImageForEditor}
+                    onPasteAudio={handlePasteAudioForEditor}
+                    onMentionClick={handleMentionClick}
+                    tempImagePaths={taskForm.temp_image_paths}
+                  />
+                </React.Suspense>
                 <div className="info-strip">
                   <Sparkles size={13} />
                   输入 @ 可引用具体图片（如 @女主厨师服）、音频或临时图片。
@@ -1686,7 +1726,6 @@ const TaskCard = React.memo(function TaskCard({ task, index, selected, selectedF
   const routeTime = useMemo(() => formatTaskNextTime(task), [task]);
   const handleClick = useCallback(() => onSelect(task.id), [onSelect, task.id]);
 
-  const isActive = ['submitting', 'submitted', 'querying'].includes(task.status);
   const isDone = task.status === 'succeeded';
   const isFailed = task.status === 'failed';
 
@@ -1726,7 +1765,7 @@ const TaskCard = React.memo(function TaskCard({ task, index, selected, selectedF
       <div className="qc-task-right">
         <StatusBadge task={task} />
         <div className={`qc-route${routeInfo.kind === 'fast' ? ' fast' : ''}`}>
-          <b>{isActive ? '执行中' : `${routeInfo.label}车道`}</b>
+          <b>{routeInfo.assigned ? `${routeInfo.label}车道` : routeInfo.label}</b>
           {isDone || isFailed ? null : (
             <span>{routeTime || dispatchInfo.nextText || '—'}</span>
           )}
@@ -1784,6 +1823,7 @@ function QueueView({
   // ── local state ──────────────────────────────────────────────────────────
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(12);
+  const [searchQuery, setSearchQuery] = useState('');
   const [resourcePreview, setResourcePreview] = useState(null);
   const [selectedBatchIds, setSelectedBatchIds] = useState([]);
   const [selectedExecutionId, setSelectedExecutionId] = useState(null);
@@ -1794,13 +1834,14 @@ function QueueView({
   const [pendingLaneKind, setPendingLaneKind] = useState('');
   const [pendingProbeLaneKind, setPendingProbeLaneKind] = useState('');
   const [pendingPriority, setPendingPriority] = useState(false);
+  const [pendingBatchPause, setPendingBatchPause] = useState(false);
 
   // ── derived data ─────────────────────────────────────────────────────────
-  const stats = useMemo(() => deriveQueueStats(tasks), [tasks]);
   const filteredSorted = useMemo(
-    () => sortTasks(filterTasks(tasks, {})),
-    [tasks]
+    () => sortTasks(filterTasks(tasks, { searchQuery })),
+    [tasks, searchQuery]
   );
+  const sharedWaitingTasks = useMemo(() => getSharedWaitingTasks(tasks), [tasks]);
   const paged = useMemo(() => paginateTasks(filteredSorted, page, pageSize), [filteredSorted, page, pageSize]);
 
   const selectedTask = useMemo(
@@ -1862,13 +1903,18 @@ function QueueView({
   const selectedNextAction = useMemo(
     () => deriveNextAction(selectedTask, Date.now(), {
       laneStatuses,
-      schedulerTickSeconds: state.settings?.poll_interval_seconds ?? 30,
+      schedulerTickSeconds: 30,
     }),
-    [selectedTask, laneStatuses, state.settings?.poll_interval_seconds]
+    [selectedTask, laneStatuses]
   );
   const allQueryAttempts = useMemo(
     () => deriveCurrentQueryRecords(selectedTask, selectedExecutionId).slice().reverse(),
     [selectedTask, selectedExecutionId]
+  );
+  const timelineEvents = useMemo(() => deriveTimelineEvents(selectedTask), [selectedTask]);
+  const keyTimelineRecords = useMemo(
+    () => selectKeyTimelineRecords(timelineEvents, allQueryAttempts, 4),
+    [timelineEvents, allQueryAttempts]
   );
   const commandText = useMemo(
     () => executionView?.command_preview?.join(' \\\n  ') || '',
@@ -1879,13 +1925,38 @@ function QueueView({
     [commandText]
   );
   const selectedSubmitId = selectedTask?.submit_id || currentExecution?.submit_id || '';
-  const executionSubmittedAt = selectedTask?.submitted_at || currentExecution?.started_at || '';
-  const latestQueryAt = allQueryAttempts[0]?.finished_at || allQueryAttempts[0]?.started_at || '';
   const hitResources = useMemo(() => getTaskHitResources(executionView, assetById), [executionView, assetById]);
   const resultItems = useMemo(() => getTaskResultItems(executionView), [executionView]);
+  const selectedRouteInfo = useMemo(() => getTaskRouteInfo(executionView), [executionView]);
+  const selectedLaneStatus = selectedRouteInfo.kind
+    ? laneStatuses.find((lane) => lane.queueKind === selectedRouteInfo.kind)
+    : null;
+  const detailMetrics = useMemo(() => deriveTaskDetailMetrics(executionView, {
+    sharedPoolCount: sharedWaitingTasks.length,
+    nextCheckSeconds: 30,
+    actualLaneLabel: selectedRouteInfo.assigned ? selectedRouteInfo.label : '',
+    nextQueryAt: selectedLaneStatus?.nextCheckAt || '',
+  }), [executionView, sharedWaitingTasks.length, selectedRouteInfo, selectedLaneStatus?.nextCheckAt]);
+  const detailSectionOrder = useMemo(
+    () => getTaskDetailSectionOrder(executionView?.status || selectedTask?.status),
+    [executionView?.status, selectedTask?.status]
+  );
+  const detailHealth = (() => {
+    const status = executionView?.status || selectedTask?.status;
+    if (status === 'succeeded') return { tone: 'done', label: '已完成' };
+    if (status === 'failed' || status === 'schema_error') return { tone: 'fail', label: '需要处理' };
+    if (selectedTask?.auto_query_stopped) return { tone: 'fail', label: '查询已停止' };
+    if (status === 'retry_wait') return { tone: 'retry', label: '自动重试' };
+    if (['submitting', 'submitted', 'querying'].includes(status)) return { tone: 'running', label: '自动运行' };
+    return { tone: 'idle', label: '无需干预' };
+  })();
   const selectedBatchTasks = useMemo(
     () => selectedBatchIds.map((id) => tasks.find((task) => task.id === id)).filter(Boolean),
     [selectedBatchIds, tasks]
+  );
+  const pausableSelectedTasks = useMemo(
+    () => selectedBatchTasks.filter((task) => ['scheduled', 'queued', 'retry_wait'].includes(task.status)),
+    [selectedBatchTasks]
   );
   const schedulablePagedIds = useMemo(
     () => paged.items.filter(canScheduleTask).map((task) => task.id),
@@ -2015,6 +2086,21 @@ function QueueView({
       title: `批量排队 ${taskIds.length} 个任务`,
     });
   };
+  const pauseSelectedTasks = async () => {
+    const taskIds = pausableSelectedTasks.map((task) => task.id);
+    if (!taskIds.length || pendingBatchPause) return;
+    setPendingBatchPause(true);
+    try {
+      await invoke('pause_tasks_command', { taskIds });
+      setFeedback(`已暂停 ${taskIds.length} 个任务`);
+      setSelectedBatchIds([]);
+      await refreshState();
+    } catch (error) {
+      setFeedback(String(error));
+    } finally {
+      setPendingBatchPause(false);
+    }
+  };
   const applySchedulePlan = async ({ scheduledAt, intervalMinutes, plannedSubmitCount }) => {
     if (!scheduleModal?.taskIds?.length) return;
     try {
@@ -2068,10 +2154,24 @@ function QueueView({
     setActiveView('create');
   };
   const handleSelectLaneTask = useCallback((taskId) => {
-    const taskIndex = filteredSorted.findIndex((task) => task.id === taskId);
+    let taskIndex = filteredSorted.findIndex((task) => task.id === taskId);
+    if (taskIndex < 0) {
+      setSearchQuery('');
+      taskIndex = sortTasks(tasks).findIndex((task) => task.id === taskId);
+    }
     if (taskIndex >= 0) setPage(Math.floor(taskIndex / pageSize) + 1);
     setSelectedTaskId(taskId);
-  }, [filteredSorted, pageSize, setSelectedTaskId]);
+  }, [filteredSorted, pageSize, setSelectedTaskId, tasks]);
+
+  const handleSearchChange = useCallback((event) => {
+    setSearchQuery(event.target.value);
+    setPage(1);
+  }, []);
+
+  const clearSearch = useCallback(() => {
+    setSearchQuery('');
+    setPage(1);
+  }, []);
 
   return (
     <div className="queue-center">
@@ -2081,7 +2181,7 @@ function QueueView({
           <h1 className="qc-title">任务中心</h1>
           <p className="qc-subtitle">统一管理任务保存、单个排期、批量排队、执行状态与结果回看</p>
           <p className="qc-scheduler-hint">
-            <Clock3 size={11} /> 本地调度每 30 秒自动检查
+            <Clock3 size={11} /> 有任务时每 30 秒自动检查
             {lastTickAt ? <> · 上次检查 {lastTickAt.toLocaleTimeString()} </> : null}
             {(() => {
               const next = tasks.filter((t) => t.status === 'scheduled' && t.scheduled_at).sort((a, b) => new Date(a.scheduled_at) - new Date(b.scheduled_at))[0];
@@ -2100,12 +2200,12 @@ function QueueView({
         laneStatuses={laneStatuses}
         tasks={tasks}
         nowMs={Date.now()}
-        queryIntervalSeconds={state.settings?.poll_interval_seconds ?? 30}
         onToggleLane={handleToggleLane}
         onProbeLane={handleProbeLane}
         onSelectTask={handleSelectLaneTask}
         assetById={assetById}
         roles={state.roles}
+        taskPriorities={state.taskPriorities}
         pendingLaneKind={pendingLaneKind}
         pendingProbeLaneKind={pendingProbeLaneKind}
       />
@@ -2114,6 +2214,26 @@ function QueueView({
       <div className="qc-body-dual">
         {/* ── LEFT: task list ── */}
         <div className="qc-task-list">
+          <div className="qc-task-searchbar">
+            <label className="qc-task-search">
+              <Search size={13} aria-hidden="true" />
+              <input
+                type="search"
+                value={searchQuery}
+                onChange={handleSearchChange}
+                placeholder="搜索任务名称、提示词或提交 ID"
+                aria-label="搜索任务"
+              />
+              {searchQuery ? (
+                <button type="button" onClick={clearSearch} title="清空搜索" aria-label="清空任务搜索">
+                  <X size={12} />
+                </button>
+              ) : null}
+            </label>
+            <span className="qc-task-search-count">
+              {searchQuery.trim() ? `${filteredSorted.length} 个结果` : `共 ${tasks.length} 个`}
+            </span>
+          </div>
           <div className="qc-task-rows">
             {paged.items.length ? paged.items.map((task, idx) => (
               <TaskCard key={task.id} task={task} index={paged.startIndex + idx + 1}
@@ -2125,8 +2245,9 @@ function QueueView({
                 onToggleSelection={toggleTaskSelection} />
             )) : (
               <div className="qc-empty">
-                <ClipboardList size={22} />
-                <p>暂无任务，先创建一个</p>
+                {searchQuery.trim() ? <Search size={22} /> : <ClipboardList size={22} />}
+                <p>{searchQuery.trim() ? `没有找到“${searchQuery.trim()}”` : '暂无任务，先创建一个'}</p>
+                {searchQuery.trim() ? <button type="button" className="qc-mini-link" onClick={clearSearch}>清空搜索</button> : null}
               </div>
             )}
           </div>
@@ -2161,6 +2282,11 @@ function QueueView({
             <button type="button" className="qc-btn" onClick={openBatchSchedule} disabled={!selectedBatchTasks.length}>
               <CalendarClock size={13} /> 批量排队{selectedBatchTasks.length ? `（${selectedBatchTasks.length}）` : ''}
             </button>
+            <button type="button" className="qc-btn qc-btn-pause" onClick={pauseSelectedTasks}
+              disabled={!pausableSelectedTasks.length || pendingBatchPause}>
+              {pendingBatchPause ? <Loader2 size={13} className="spin" /> : <Pause size={13} />}
+              {pendingBatchPause ? '暂停中' : `批量暂停${pausableSelectedTasks.length ? `（${pausableSelectedTasks.length}）` : ''}`}
+            </button>
           </div>
           <div className="qc-selected">
           {selectedTask ? (
@@ -2183,267 +2309,67 @@ function QueueView({
                 </div>
                 <div>
                   <h3 className="qc-selected-title">{selectedTask.title || '未命名任务'}</h3>
-                  <p className="qc-selected-note">{selectedNextAction.reason || dispatchInfo.reason || (selectedTask.params?.model_version ? `${selectedTask.params.model_version} / ${selectedTask.params?.ratio || '—'}` : '')}</p>
+                  <p className="qc-selected-note">
+                    {selectedTask.params?.ratio || '比例未设置'} · {selectedTask.params?.duration || 15} 秒 · {selectedTask.params?.video_resolution || '720p'} · {selectedRouteInfo.assigned ? `${selectedRouteInfo.label}车道` : selectedRouteInfo.label}
+                  </p>
                 </div>
                 <StatusBadge task={selectedTask} />
               </div>
 
-              <div className="qc-selected-main-grid">
-                <div className="qc-selected-main-column">
-                  {/* Action card (下一步) */}
-                  {(() => {
-                    const nextAct = selectedNextAction;
-                    return nextAct.action ? (
-                      <div className="qc-action-card">
-                        <small>下一步</small>
-                        <b>{nextAct.action}</b>
-                        <p>{nextAct.reason}</p>
-                        {dispatchInfo.nextSummary ? (
-                          <div className="qc-action-eta">
-                            <Clock3 size={12} />
-                            <span>预计 {dispatchInfo.nextSummary}</span>
-                            <em>{dispatchInfo.nextText}</em>
-                          </div>
-                        ) : null}
-                      </div>
-                    ) : null;
-                  })()}
-
-                  {/* Recent events + query attempts */}
-                  {(() => {
-                    const allEvents = deriveTimelineEvents(selectedTask);
-                    const keyRecords = selectKeyTimelineRecords(allEvents, allQueryAttempts, 5);
-                    const allRecordCount = allEvents.length + allQueryAttempts.length;
-                    const hasHiddenRecords = allRecordCount > keyRecords.length;
-                    if (!keyRecords.length) return null;
-                    return (
-                      <div className="qc-timeline">
-                        <div className="qc-section-inline-head">
-                          <h4>最近记录与查询</h4>
-                          <div className="qc-section-inline-actions">
-                            <span className="qc-record-count">显示 {keyRecords.length} / {allRecordCount}</span>
-                            {hasHiddenRecords ? (
-                              <button type="button" className="qc-mini-link" onClick={() => setRecordsModal({
-                                title: selectedTask.title || '未命名任务',
-                                events: allEvents,
-                                queryAttempts: allQueryAttempts,
-                              })}>
-                                查看全部记录（{allRecordCount}）
-                              </button>
-                            ) : null}
-                          </div>
-                        </div>
-                        <div className="qc-timeline-stream">
-                          {keyRecords.map((record) => {
-                            if (record.kind === 'event') {
-                              const evt = record.event;
-                              return (
-                                <div key={record.id} className="qc-timeline-event">
-                                  <time>{evt.time}</time>
-                                  <div>
-                                    <b>{evt.title}</b>
-                                    <span>{evt.detail}</span>
-                                  </div>
-                                </div>
-                              );
-                            }
-                            const attempt = record.attempt;
-                            const qi = attempt.status === 'querying' ? parseAttemptQueueInfo(attempt.stdout) : null;
-                            return (
-                              <div key={record.id} className="qc-recent-query-row compact">
-                                <span className={`qc-recent-query-dot ${attempt.status === 'failed' ? 'fail' : attempt.status === 'succeeded' ? 'done' : 'running'}`} />
-                                <time>{formatDatePart(attempt.finished_at || attempt.started_at, 'time') || '—'}</time>
-                                <b>查询 {statusLabel(attempt.status)}</b>
-                                {qi ? <span>#{qi.queue_idx ?? '-'} / {qi.queue_length ?? '-'} {qi.queue_status || ''}</span> : <span>—</span>}
-                                {attempt.error_detail ? <span className="qc-recent-query-error">{attempt.error_detail}</span> : null}
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </div>
-                    );
-                  })()}
-
-                  {/* Command preview */}
-                  {commandPresentation.hasCommand ? (
-                    <section className="qc-section">
-                      <h4 className="qc-section-title">命令预览</h4>
-                      <button type="button" className="qc-command-collapsed" onClick={openCommandPreview}>
-                        <Command size={13} />
-                        <span>{commandPresentation.hint}</span>
-                      </button>
-                    </section>
-                  ) : null}
-
-                  {/* Hit resources */}
-                  {hitResources.length > 0 ? (
-                    <section className="qc-section">
-                      <h4 className="qc-section-title">命中资源</h4>
-                      <div className="qc-resource-grid">
-                        {hitResources.map(({ type, displayType, label, asset }) => (
-                          <button
-                            key={`${displayType}:${asset.id}`}
-                            type="button"
-                            className={`qc-resource-item ${type} ${displayType}`}
-                            title={`预览${label}：${asset.name || asset.id.slice(0, 8)}`}
-                            onClick={() => setResourcePreview({ type, displayType, asset })}
-                          >
-                            {type === 'image' && asset.stored_path ? (
-                              <img src={resolveMediaSrc(asset.stored_path)} alt="" className="qc-resource-thumb" />
-                            ) : (
-                              <div className="qc-resource-icon">{type === 'audio' ? <FileAudio size={16} /> : <Image size={16} />}</div>
-                            )}
-                            <span className="qc-resource-tag">{label}</span>
-                            <span className="qc-resource-name">{asset.name || asset.id.slice(0, 8)}</span>
-                          </button>
-                        ))}
-                      </div>
-                    </section>
-                  ) : null}
-
-              {/* Results */}
-              {resultItems.length > 0 ? (
-                <section className="qc-section">
-                  <h4 className="qc-section-title">生成结果</h4>
-	                  {resultItems.map((item) => (
-	                    <div key={`${item.kind}:${item.value}`} className="qc-result-card">
-	                      {previewResultValue === item.value ? (
-	                        <video
-	                          className="qc-result-video"
-	                          src={item.kind === 'path' ? convertFileSrc(item.value) : item.value}
-	                          controls
-	                          preload="none"
-	                        />
-	                      ) : (
-	                        <div className="qc-result-placeholder">
-	                          <Play size={14} />
-	                          <span>视频结果已就绪，按需预览</span>
-	                        </div>
-	                      )}
-	                      <div className="qc-result-row">
-	                        <span className="mono qc-result-path" title={item.value}>{item.label}</span>
-	                        <button
-	                          type="button"
-	                          className="qc-mini-link qc-result-preview-btn"
-	                          onClick={() => setPreviewResultValue((value) => value === item.value ? '' : item.value)}
-	                        >
-	                          {previewResultValue === item.value ? '收起' : '预览'}
-	                        </button>
-	                        {item.kind === 'path' ? (
-	                          <button type="button" className="icon-ghost mini" title="打开所在目录"
-	                            onClick={async () => { try { await invoke('open_result_dir_command', { path: item.value }); } catch (e) { setFeedback(String(e)); } }}>
-                            <FolderOpen size={12} />
-                          </button>
-                        ) : (
-                          <button type="button" className="icon-ghost mini" title="复制链接"
-                            onClick={() => navigator.clipboard?.writeText(item.value).then(() => setFeedback('已复制结果链接')).catch(() => setFeedback('复制失败'))}>
-                            <Copy size={12} />
-                          </button>
-                        )}
-                      </div>
+              <section className="qc-compact-console">
+                <div className="qc-console-status-row">
+                  <div className="qc-console-current">
+                    <span className="qc-console-accent" />
+                    <div>
+                      <small>当前</small>
+                      <b>{selectedNextAction.action || statusLabel(executionView?.status || selectedTask.status)}</b>
+                      <p>{selectedNextAction.reason || dispatchInfo.reason || '等待调度器处理'}</p>
                     </div>
-                  ))}
-                </section>
-              ) : null}
-
-              {/* Execution History */}
-              {taskHistory.length > 0 ? (
-                <section className="qc-section">
-                  <h4 className="qc-section-title">执行记录</h4>
-                  <div className="qc-history-list">
-                    {taskHistory.map((item, idx) => (
-                      <div
-                        key={item.id}
-                        className={`qc-history-item${currentExecution?.id === item.id ? ' selected' : ''}`}
-                        role="button" tabIndex={0}
-                        onClick={() => setSelectedExecutionId(item.id)}
-                        onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setSelectedExecutionId(item.id); } }}
-                      >
-                        <div className="qc-history-header">
-                          <span className="qc-history-label">{historyItemLabel(item, taskHistory.length - idx)}</span>
-                          <span className={`status-badge ${item.status}`}>{item.status}</span>
-                          {currentExecution?.id === item.id ? <span className="qc-history-current">当前查看</span> : null}
-                          {item.finished_at ? <span className="qc-history-time">{item.finished_at.slice(0, 16).replace('T', ' ')}</span> : null}
-                          <div className="qc-history-item-actions">
-                            {item.submit_id ? (
-                              <button type="button" className="icon-ghost mini" title={`查询此次结果（${item.submit_id.slice(0, 8)}）`}
-                                disabled={pendingExecutionOps[item.id]?.query}
-                                onClick={(event) => { event.stopPropagation(); queryExecutionRecord(selectedTask.id, item.id, item.submit_id); }}>
-                                {pendingExecutionOps[item.id]?.query ? <Loader2 size={11} className="spin" /> : <RefreshCcw size={11} />}
-                              </button>
-                            ) : null}
-                            <button type="button" className="icon-ghost mini danger" title="删除此条执行记录"
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                handleDeleteExecutionRecord(selectedTask.id, item.id, historyItemLabel(item, taskHistory.length - idx));
-                              }}>
-                              <Trash2 size={11} />
-                            </button>
-                          </div>
-                        </div>
-                        {item.result_paths.length > 0 || item.result_urls.length > 0 ? (
-                          <div className="qc-history-file-list">
-                            {item.result_paths.map((p) => (
-                              <div key={p} className="qc-history-file-row">
-                                <span className="mono qc-result-path" title={p}>{p.split('/').pop()}</span>
-                                <button type="button" className="icon-ghost mini" title="打开所在目录"
-                                  onClick={async (event) => { event.stopPropagation(); try { await invoke('open_result_dir_command', { path: p }); } catch (e) { setFeedback(String(e)); } }}>
-                                  <FolderOpen size={12} />
-                                </button>
-                              </div>
-                            ))}
-                            {item.result_paths.length === 0 && item.result_urls.map((u) => (
-                              <div key={u} className="qc-history-file-row">
-                                <span className="mono qc-result-path" title={u}>{u.split('/').pop()?.slice(0, 40) || u}</span>
-                                <button type="button" className="icon-ghost mini" title="复制链接"
-                                  onClick={(event) => { event.stopPropagation(); navigator.clipboard?.writeText(u).then(() => setFeedback('已复制结果链接')).catch(() => setFeedback('复制失败')); }}>
-                                  <Copy size={12} />
-                                </button>
-                              </div>
-                            ))}
-                          </div>
-                        ) : null}
-                        {item.error_detail && !isInterruptNotice(item.error_detail) && item.result_paths.length === 0 && item.result_urls.length === 0 ? (
-                          <p className="qc-error-text" style={{ marginTop: 4 }}>{item.error_detail}</p>
-                        ) : null}
+                    <span className={`qc-console-health ${detailHealth.tone}`}>{detailHealth.label}</span>
+                  </div>
+                  <div className="qc-console-metrics">
+                    {detailMetrics.map((metric) => (
+                      <div key={metric.label} className="qc-console-metric">
+                        <span>{metric.label}</span>
+                        <b>{metric.value}</b>
                       </div>
                     ))}
                   </div>
-                </section>
-              ) : null}
-
                 </div>
-
-                <aside className="qc-selected-side-panel">
-                  <div className="qc-priority-picker">
+                <div className="qc-console-tools">
+                  <div className="qc-console-priority" role="group" aria-label="排队优先级">
                     <span><Star size={12} /> 排队优先</span>
-                    <div role="group" aria-label="排队优先级">
-                      <button type="button" className={selectedQueuePriority === 0 ? 'active' : ''}
-                        disabled={pendingPriority} onClick={() => handleSetQueuePriority(0)}>随机</button>
-                      <button type="button" className={selectedQueuePriority === 1 ? 'active' : ''}
-                        disabled={pendingPriority} onClick={() => handleSetQueuePriority(1)}>★ 第二优先</button>
-                      <button type="button" className={selectedQueuePriority === 2 ? 'active' : ''}
-                        disabled={pendingPriority} onClick={() => handleSetQueuePriority(2)}>★★ 下一位</button>
-                    </div>
+                    <button type="button" className={selectedQueuePriority === 0 ? 'active' : ''}
+                      disabled={pendingPriority} onClick={() => handleSetQueuePriority(0)}>随机</button>
+                    <button type="button" className={selectedQueuePriority === 1 ? 'active' : ''}
+                      disabled={pendingPriority} onClick={() => handleSetQueuePriority(1)}>★ 第二优先</button>
+                    <button type="button" className={selectedQueuePriority === 2 ? 'active' : ''}
+                      disabled={pendingPriority} onClick={() => handleSetQueuePriority(2)}>★★ 下一位</button>
                   </div>
-                  <div className="qc-selected-actions qc-selected-actions-stack">
-                    <button type="button" className="qc-btn qc-btn-primary" onClick={() => openPrepareGenerate(selectedTask)}
-                      disabled={!canScheduleTask(selectedTask) || pendingTaskOps[selectedTask.id]?.submit}>
-                      {pendingTaskOps[selectedTask.id]?.submit ? <><Loader2 size={13} className="spin" /> 排队中</> : <><Play size={13} /> 排队</>}
-                    </button>
-                    <button type="button" className="qc-btn" onClick={() => queryTask(selectedTask.id, selectedSubmitId || null)}
-                      disabled={!selectedSubmitId || pendingTaskOps[selectedTask.id]?.query}>
-                      {pendingTaskOps[selectedTask.id]?.query ? <><Loader2 size={13} className="spin" /> 查询中</> : <><RefreshCcw size={13} /> 查询本次结果</>}
-                    </button>
+                  <div className="qc-console-actions">
+                    {selectedTask.status === 'paused' ? (
+                      <button type="button" className="qc-btn qc-btn-primary" onClick={() => resumeTask(selectedTask.id, 'immediate')}><Play size={13} /> 立即恢复</button>
+                    ) : selectedSubmitId && ['submitted', 'querying'].includes(executionView?.status) ? (
+                      <button type="button" className="qc-btn qc-btn-primary" onClick={() => queryTask(selectedTask.id, selectedSubmitId)}
+                        disabled={pendingTaskOps[selectedTask.id]?.query}>
+                        {pendingTaskOps[selectedTask.id]?.query ? <><Loader2 size={13} className="spin" /> 查询中</> : <><RefreshCcw size={13} /> 查询本次结果</>}
+                      </button>
+                    ) : executionView?.status === 'succeeded' && resultItems.length ? (
+                      <button type="button" className="qc-btn qc-btn-primary" onClick={() => setPreviewResultValue(resultItems[0].value)}><Play size={13} /> 查看结果</button>
+                    ) : (
+                      <button type="button" className="qc-btn qc-btn-primary" onClick={() => openPrepareGenerate(selectedTask)}
+                        disabled={!canScheduleTask(selectedTask) || pendingTaskOps[selectedTask.id]?.submit}>
+                        {pendingTaskOps[selectedTask.id]?.submit ? <><Loader2 size={13} className="spin" /> 排队中</> : <><Play size={13} /> 立即排队</>}
+                      </button>
+                    )}
                     <button type="button" className="qc-btn" onClick={() => handleEditTask(selectedTask)}><Pencil size={13} /> 编辑</button>
                     <button type="button" className="qc-btn" onClick={() => handleDuplicateTask(selectedTask)}><Copy size={13} /> 复制</button>
                     {['scheduled', 'queued', 'retry_wait'].includes(selectedTask.status) ? (
                       <button type="button" className="qc-btn" onClick={() => pauseTask(selectedTask.id)}>暂停</button>
                     ) : null}
-                    {selectedTask.status === 'paused' ? (<>
-                      <button type="button" className="qc-btn" onClick={() => resumeTask(selectedTask.id, 'immediate')}>立即恢复</button>
-                      {selectedTask.scheduled_at ? <button type="button" className="qc-btn" onClick={() => resumeTask(selectedTask.id, 'scheduled')}>按计划恢复</button> : null}
-                    </>) : null}
+                    {selectedTask.status === 'paused' && selectedTask.scheduled_at ? (
+                      <button type="button" className="qc-btn" onClick={() => resumeTask(selectedTask.id, 'scheduled')}>按计划恢复</button>
+                    ) : null}
                     {selectedTask.status === 'scheduled' ? (
                       <button type="button" className="qc-btn" onClick={() => askConfirm({
                         title: '取消预定', body: '只取消计划时间，任务、执行记录和素材不会被删除。取消后任务回到待生成状态。', confirmText: '取消预定',
@@ -2452,75 +2378,130 @@ function QueueView({
                     ) : null}
                     <button type="button" className="qc-btn qc-btn-danger" onClick={() => handleDeleteTask(selectedTask)}><Trash2 size={13} /> 删除任务</button>
                   </div>
+                </div>
+              </section>
 
-                  <div>
-                    <h4 className="qc-overview-title">执行概览</h4>
-                    <div className="qc-summary-grid qc-summary-grid-side">
-                      <div className="qc-detail-item">
-                        <span>提交状态</span>
-                        <b>{statusLabel(executionView?.status || selectedTask.status)}</b>
-                        <small>{selectedTask.auto_query_stopped ? '自动查询已停止' : '—'}</small>
-                      </div>
-                      <div className="qc-detail-item">
-                        <span>本地入队</span>
-                        <b>{formatDatePart(selectedTask.queued_at || selectedTask.created_at, 'time') || '—'}</b>
-                        <small>{formatDatePart(selectedTask.queued_at || selectedTask.created_at, 'date') || '—'}</small>
-                      </div>
-                      <div className="qc-detail-item">
-                        <span>远端提交</span>
-                        <b>{formatDatePart(executionSubmittedAt, 'time') || '—'}</b>
-                        <small>{selectedSubmitId ? `submit #${selectedSubmitId.slice(0, 8)}` : '尚未拿到 submit id'}</small>
-                      </div>
-                      <div className="qc-detail-item">
-                        <span>最近查询</span>
-                        <b>{formatDatePart(latestQueryAt, 'time') || '—'}</b>
-                        <small>{allQueryAttempts.length ? `共 ${allQueryAttempts.length} 次查询` : '暂无查询记录'}</small>
-                      </div>
-                      <div className="qc-detail-item">
-                        <span>远端队列</span>
-                        <b>{executionView?.queue_info ? `#${executionView.queue_info.queue_idx ?? '-'} / ${executionView.queue_info.queue_length ?? '-'}` : '—'}</b>
-                        <small>{executionView?.queue_info?.queue_status || '暂无队列信息'}</small>
-                      </div>
-                      <div className="qc-detail-item">
-                        <span>重试次数</span>
-                        <b>{selectedTask.attempt_count ?? 0}</b>
-                        <small>{selectedTask.consecutive_no_result_queries ? `连续 ${selectedTask.consecutive_no_result_queries} 次无结果` : '—'}</small>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="qc-strategy-box">
-                    <h4>排队参数</h4>
-                    <div className="qc-strategy-row"><span>模型</span><b>{selectedTask.params?.model_version || '—'}</b></div>
-                    <div className="qc-strategy-row"><span>计划生成</span><b>{selectedTask.planned_submit_count || 1} 次</b></div>
-                    <div className="qc-strategy-row"><span>查询间隔</span><b>{state.settings?.poll_interval_seconds ?? 30} 秒</b></div>
-                    <div className="qc-strategy-row"><span>并发重试</span><b>{selectedTask.concurrency_retry_count || 0} 次</b></div>
-                  </div>
-
-                  <div className="qc-health-hint">
-                    {executionView?.status === 'succeeded' ? (
-                      <span className="qc-health done"><CheckCircle2 size={12} /> 任务已成功完成</span>
-                    ) : ['failed'].includes(executionView?.status) ? (
-                      <span className="qc-health fail"><AlertCircle size={12} /> 任务失败，可重新提交</span>
-                    ) : executionView?.status === 'submitted' && selectedTask?.auto_query_stopped ? (
-                      <span className="qc-health fail"><AlertCircle size={12} /> 自动查询已停止（等待超过 4 小时），请手动查询</span>
-                    ) : executionView?.status === 'submitted' ? (
-                      <span className="qc-health running"><Clock3 size={12} /> 已提交，等待自动查询</span>
-                    ) : executionView?.status === 'querying' ? (
-                      <span className="qc-health running"><Loader2 size={12} className="spin" /> {executionView.queue_info ? '排队等待生成中' : '查询结果中'}</span>
-                    ) : executionView?.status === 'submitting' ? (
-                      <span className="qc-health running"><Loader2 size={12} className="spin" /> 提交中</span>
-                    ) : executionView?.status === 'retry_wait' ? (
-                      <span className="qc-health retry"><RefreshCcw size={12} /> {selectedNextAction.reason || dispatchInfo.reason || '等待重试'}</span>
-                    ) : executionView?.status === 'queued' ? (
-                      <span className="qc-health idle"><Clock3 size={12} /> {selectedNextAction.reason || dispatchInfo.reason || '等待调度器空闲'}</span>
-                    ) : executionView?.status === 'scheduled' ? (
-                      <span className="qc-health idle"><Clock3 size={12} /> {selectedNextAction.reason || dispatchInfo.reason || '等待预定开始时间'}</span>
-                    ) : (
-                      <span className="qc-health idle"><Clock3 size={12} /> 等待调度</span>
-                    )}
-                  </div>
-                </aside>
+              <div className="qc-adaptive-detail">
+                {detailSectionOrder.map((sectionKey) => {
+                  if (sectionKey === 'timeline') {
+                    const allRecordCount = timelineEvents.length + allQueryAttempts.length;
+                    return (
+                      <section className="qc-process-timeline" key="timeline">
+                        <div className="qc-section-inline-head">
+                          <h4>过程时间线</h4>
+                          {allRecordCount > keyTimelineRecords.length ? (
+                            <button type="button" className="qc-mini-link" onClick={() => setRecordsModal({
+                              title: selectedTask.title || '未命名任务',
+                              events: timelineEvents,
+                              queryAttempts: allQueryAttempts,
+                            })}>查看全部记录（{allRecordCount}）</button>
+                          ) : null}
+                        </div>
+                        <div className="qc-process-step next">
+                          <time>下一步</time>
+                          <div><b>{selectedNextAction.action || '等待调度'}</b><span>{selectedNextAction.reason || dispatchInfo.reason || '等待调度器处理'}</span></div>
+                        </div>
+                        {keyTimelineRecords.map((record) => {
+                          if (record.kind === 'event') {
+                            return <div className="qc-process-step" key={record.id}><time>{record.event.time}</time><div><b>{record.event.title}</b><span>{record.event.detail}</span></div></div>;
+                          }
+                          const attempt = record.attempt;
+                          const qi = attempt.status === 'querying' ? parseAttemptQueueInfo(attempt.stdout) : null;
+                          return (
+                            <div className={`qc-process-step ${attempt.status === 'failed' ? 'fail' : ''}`} key={record.id}>
+                              <time>{formatDatePart(attempt.finished_at || attempt.started_at, 'time') || '—'}</time>
+                              <div><b>查询 {statusLabel(attempt.status)}</b><span>{qi ? `#${qi.queue_idx ?? '-'} / ${qi.queue_length ?? '-'} ${qi.queue_status || ''}` : attempt.error_detail || '等待远端返回'}</span></div>
+                            </div>
+                          );
+                        })}
+                      </section>
+                    );
+                  }
+                  if (sectionKey === 'results') {
+                    if (!resultItems.length) return null;
+                    return (
+                      <section className="qc-section qc-results-section" key="results">
+                        <h4 className="qc-section-title">生成结果</h4>
+                        {resultItems.map((item) => (
+                          <div key={`${item.kind}:${item.value}`} className="qc-result-card">
+                            {previewResultValue === item.value ? (
+                              <video className="qc-result-video" src={item.kind === 'path' ? convertFileSrc(item.value) : item.value} controls preload="none" />
+                            ) : (
+                              <div className="qc-result-placeholder"><Play size={14} /><span>视频结果已就绪，按需预览</span></div>
+                            )}
+                            <div className="qc-result-row">
+                              <span className="mono qc-result-path" title={item.value}>{item.label}</span>
+                              <button type="button" className="qc-mini-link qc-result-preview-btn"
+                                onClick={() => setPreviewResultValue((value) => value === item.value ? '' : item.value)}>
+                                {previewResultValue === item.value ? '收起' : '预览'}
+                              </button>
+                              {item.kind === 'path' ? (
+                                <button type="button" className="icon-ghost mini" title="打开所在目录"
+                                  onClick={async () => { try { await invoke('open_result_dir_command', { path: item.value }); } catch (e) { setFeedback(String(e)); } }}><FolderOpen size={12} /></button>
+                              ) : (
+                                <button type="button" className="icon-ghost mini" title="复制链接"
+                                  onClick={() => navigator.clipboard?.writeText(item.value).then(() => setFeedback('已复制结果链接')).catch(() => setFeedback('复制失败'))}><Copy size={12} /></button>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </section>
+                    );
+                  }
+                  return (
+                    <section className="qc-detail-folds" key="resources">
+                      {hitResources.length ? (
+                        <details open={['draft', 'paused', 'scheduled'].includes(executionView?.status)}>
+                          <summary><span>命中资源</span><b>{hitResources.length} 个</b></summary>
+                          <div className="qc-resource-grid">
+                            {hitResources.map(({ type, displayType, label, asset }) => (
+                              <button key={`${displayType}:${asset.id}`} type="button" className={`qc-resource-item ${type} ${displayType}`}
+                                title={`预览${label}：${asset.name || asset.id.slice(0, 8)}`} onClick={() => setResourcePreview({ type, displayType, asset })}>
+                                {type === 'image' && asset.stored_path ? <img src={resolveMediaSrc(asset.stored_path)} alt="" className="qc-resource-thumb" /> : <div className="qc-resource-icon">{type === 'audio' ? <FileAudio size={16} /> : <Image size={16} />}</div>}
+                                <span className="qc-resource-tag">{label}</span><span className="qc-resource-name">{asset.name || asset.id.slice(0, 8)}</span>
+                              </button>
+                            ))}
+                          </div>
+                        </details>
+                      ) : null}
+                      {taskHistory.length ? (
+                        <details>
+                          <summary><span>执行历史</span><b>{taskHistory.length} 次</b></summary>
+                          <div className="qc-history-list">
+                            {taskHistory.map((item, idx) => (
+                              <div key={item.id} className={`qc-history-item${currentExecution?.id === item.id ? ' selected' : ''}`} role="button" tabIndex={0}
+                                onClick={() => setSelectedExecutionId(item.id)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setSelectedExecutionId(item.id); } }}>
+                                <div className="qc-history-header">
+                                  <span className="qc-history-label">{historyItemLabel(item, taskHistory.length - idx)}</span>
+                                  <span className={`status-badge ${item.status}`}>{item.status}</span>
+                                  {currentExecution?.id === item.id ? <span className="qc-history-current">当前查看</span> : null}
+                                  {item.finished_at ? <span className="qc-history-time">{item.finished_at.slice(0, 16).replace('T', ' ')}</span> : null}
+                                  <div className="qc-history-item-actions">
+                                    {item.submit_id ? <button type="button" className="icon-ghost mini" title={`查询此次结果（${item.submit_id.slice(0, 8)}）`} disabled={pendingExecutionOps[item.id]?.query}
+                                      onClick={(event) => { event.stopPropagation(); queryExecutionRecord(selectedTask.id, item.id, item.submit_id); }}>{pendingExecutionOps[item.id]?.query ? <Loader2 size={11} className="spin" /> : <RefreshCcw size={11} />}</button> : null}
+                                    <button type="button" className="icon-ghost mini danger" title="删除此条执行记录" onClick={(event) => { event.stopPropagation(); handleDeleteExecutionRecord(selectedTask.id, item.id, historyItemLabel(item, taskHistory.length - idx)); }}><Trash2 size={11} /></button>
+                                  </div>
+                                </div>
+                                {item.error_detail && !isInterruptNotice(item.error_detail) && !item.result_paths.length && !item.result_urls.length ? <p className="qc-error-text" style={{ marginTop: 4 }}>{item.error_detail}</p> : null}
+                              </div>
+                            ))}
+                          </div>
+                        </details>
+                      ) : null}
+                      {commandPresentation.hasCommand ? (
+                        <details>
+                          <summary><span>命令与参数</span><b>完整</b></summary>
+                          <div className="qc-fold-params">
+                            <div><span>模型</span><b>{selectedTask.params?.model_version || '—'}</b></div>
+                            {Number(selectedTask.planned_submit_count || 1) > 1 ? <div><span>计划生成</span><b>{selectedTask.planned_submit_count} 次</b></div> : null}
+                            {Number(selectedTask.concurrency_retry_count || 0) > 0 ? <div><span>并发重试</span><b>{selectedTask.concurrency_retry_count} 次</b></div> : null}
+                          </div>
+                          <button type="button" className="qc-command-collapsed" onClick={openCommandPreview}><Command size={13} /><span>{commandPresentation.hint}</span></button>
+                        </details>
+                      ) : null}
+                    </section>
+                  );
+                })}
               </div>
             </div>
           ) : (
@@ -3028,24 +3009,8 @@ function SettingsView({ cli, settingsForm, setSettingsForm, checkCli, checkCliUp
           <ToggleSwitch
             checked={settingsForm.auto_query_enabled ?? true}
             onChange={(v) => setSettingsForm({ ...settingsForm, auto_query_enabled: v })}
-            label="提交后自动查询结果"
+            label="提交后自动查询结果（自适应轮询）"
           />
-          <label>
-            轮询间隔（秒）
-            <div className="settings-input-hint-row">
-              <input type="number" min="10" max="300" value={settingsForm.poll_interval_seconds ?? 60}
-                onChange={(e) => setSettingsForm({ ...settingsForm, poll_interval_seconds: Number(e.target.value) })} />
-              <span className="settings-range-hint">10-300</span>
-            </div>
-          </label>
-          <label>
-            日志保留条数
-            <div className="settings-input-hint-row">
-              <input type="number" min="50" max="10000" value={settingsForm.log_retention_count ?? 500}
-                onChange={(e) => setSettingsForm({ ...settingsForm, log_retention_count: Number(e.target.value) })} />
-              <span className="settings-range-hint">50-10000</span>
-            </div>
-          </label>
           <ToggleSwitch
             checked={settingsForm.prevent_sleep ?? true}
             onChange={(v) => setSettingsForm({ ...settingsForm, prevent_sleep: v })}
