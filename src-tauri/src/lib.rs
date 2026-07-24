@@ -1,8 +1,10 @@
 mod keep_awake;
+mod sqlite_store;
 use chrono::{DateTime, Duration, Utc};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use sha2::{Digest, Sha256};
+pub use sqlite_store::AppStore;
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
@@ -10,10 +12,7 @@ use std::{
     io::{Cursor, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Mutex,
-    },
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration as StdDuration, UNIX_EPOCH},
 };
 use tauri::Manager;
@@ -46,8 +45,6 @@ const SCHEDULER_TICK_INTERVAL_SECS: u64 = 30;
 const DEFAULT_CONCURRENCY_RETRY_DELAY_SECONDS: u64 = 300;
 const LEGACY_CONCURRENCY_RETRY_DELAY_SECONDS: u64 = 30;
 const FAST_FALLBACK_MODEL_VERSION: &str = "seedance2.0fast";
-const STATE_WRITE_LOCK_WAIT_SECS: u64 = 30;
-const STATE_WRITE_LOCK_STALE_SECS: i64 = 120;
 static PROCESS_QUEUE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -722,7 +719,7 @@ impl Default for LogSource {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LogEntry {
     pub id: String,
@@ -899,7 +896,7 @@ impl Default for AppData {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageGenHistoryItem {
     pub id: String,
@@ -1473,230 +1470,6 @@ pub enum SchedulerError {
     Io(String),
     #[error("计划时间不能是过去时间")]
     ScheduledAtInPast,
-}
-
-#[derive(Debug)]
-pub struct AppStore {
-    root_dir: PathBuf,
-    data: Mutex<AppData>,
-}
-
-struct StateWriteLockGuard {
-    path: PathBuf,
-    token: String,
-}
-
-impl Drop for StateWriteLockGuard {
-    fn drop(&mut self) {
-        let expected_token = format!("token={}", self.token);
-        let owns_lock = fs::read_to_string(&self.path)
-            .map(|content| content.lines().any(|line| line == expected_token))
-            .unwrap_or(false);
-        if owns_lock {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
-fn create_state_write_lock(
-    lock_path: &Path,
-) -> Result<Option<StateWriteLockGuard>, SchedulerError> {
-    let token = Uuid::new_v4().simple().to_string();
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(lock_path)
-    {
-        Ok(mut file) => {
-            if let Err(error) = writeln!(file, "token={token}")
-                .and_then(|_| writeln!(file, "pid={}", std::process::id()))
-                .and_then(|_| writeln!(file, "created_at={}", now_rfc3339()))
-            {
-                drop(file);
-                let _ = fs::remove_file(lock_path);
-                return Err(SchedulerError::Io(error.to_string()));
-            }
-            Ok(Some(StateWriteLockGuard {
-                path: lock_path.to_path_buf(),
-                token,
-            }))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
-        Err(error) => Err(SchedulerError::Io(error.to_string())),
-    }
-}
-
-#[cfg(unix)]
-fn state_write_lock_owner_is_dead(content: &str) -> bool {
-    let Some(pid) = content.lines().find_map(|line| {
-        line.strip_prefix("pid=")
-            .and_then(|value| value.trim().parse::<u32>().ok())
-    }) else {
-        return false;
-    };
-    if pid == 0 || pid == std::process::id() || pid > i32::MAX as u32 {
-        return false;
-    }
-    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if result == 0 {
-        return false;
-    }
-    !matches!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::EPERM)
-    )
-}
-
-#[cfg(not(unix))]
-fn state_write_lock_owner_is_dead(_content: &str) -> bool {
-    false
-}
-
-fn acquire_state_write_lock(root_dir: &Path) -> Result<StateWriteLockGuard, SchedulerError> {
-    fs::create_dir_all(root_dir).map_err(|error| SchedulerError::Io(error.to_string()))?;
-    let lock_path = root_dir.join("state.write.lock");
-    let deadline = std::time::Instant::now() + StdDuration::from_secs(STATE_WRITE_LOCK_WAIT_SECS);
-
-    loop {
-        if let Some(guard) = create_state_write_lock(&lock_path)? {
-            return Ok(guard);
-        }
-        let owner_is_dead = fs::read_to_string(&lock_path)
-            .map(|content| state_write_lock_owner_is_dead(&content))
-            .unwrap_or(false);
-        let stale_by_age = fs::metadata(&lock_path)
-            .and_then(|meta| meta.modified())
-            .ok()
-            .and_then(|modified| modified.elapsed().ok())
-            .map(|age| age >= StdDuration::from_secs(STATE_WRITE_LOCK_STALE_SECS as u64))
-            .unwrap_or(false);
-        if owner_is_dead || stale_by_age {
-            let _ = fs::remove_file(&lock_path);
-            continue;
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(SchedulerError::Io(
-                "等待 state.json 写锁超时，请稍后重试".to_string(),
-            ));
-        }
-        std::thread::sleep(StdDuration::from_millis(10));
-    }
-}
-
-impl AppStore {
-    pub fn load(root_dir: PathBuf) -> Self {
-        let (data, should_compact) = match load_app_data_from_disk(&root_dir) {
-            Ok(data) => (data, true),
-            Err(_) => (AppData::default(), false),
-        };
-        let store = Self {
-            root_dir,
-            data: Mutex::new(data),
-        };
-        if should_compact {
-            store.compact_on_disk_if_oversized();
-        }
-        store
-    }
-
-    /// 启动时一次性压实：当磁盘 `state.json` 明显大于规整（紧凑序列化 + 历史裁剪）后的数据时，
-    /// 重写一次使旧的 pretty 格式 / 历史臃肿文件立即瘦身。压实后磁盘体积≈紧凑数据，不会重复触发。
-    fn compact_on_disk_if_oversized(&self) {
-        let mut data = self.data.lock().expect("store lock");
-        let path = self.root_dir.join("state.json");
-        let Ok(_write_lock) = acquire_state_write_lock(&self.root_dir) else {
-            return;
-        };
-        let Ok(meta) = fs::metadata(&path) else {
-            return;
-        };
-        let Ok(latest) = load_app_data_from_disk(&self.root_dir) else {
-            return;
-        };
-        let Ok(serialized) = serde_json::to_string(&latest) else {
-            return;
-        };
-        // 留 10% 余量，避免等大文件的无谓重写。
-        if meta.len() as usize > serialized.len() + serialized.len() / 10
-            && self.persist(&latest).is_err()
-        {
-            return;
-        }
-        *data = latest;
-    }
-
-    pub fn snapshot(&self) -> AppData {
-        let mut data = self.data.lock().expect("store lock");
-        if let Ok(latest) = load_app_data_from_disk(&self.root_dir) {
-            *data = latest;
-        }
-        data.lane_status = compute_lane_status(&data, Utc::now());
-        data.clone()
-    }
-
-    pub fn assets_dir(&self) -> PathBuf {
-        self.root_dir.join("role-media")
-    }
-
-    pub fn imagegen_dir(&self) -> PathBuf {
-        self.root_dir.join("imagegen")
-    }
-
-    pub fn mutate<F, T>(&self, mutate: F) -> Result<T, SchedulerError>
-    where
-        F: FnOnce(&mut AppData) -> Result<T, SchedulerError>,
-    {
-        let mut data = self.data.lock().expect("store lock");
-        let _write_lock = acquire_state_write_lock(&self.root_dir)?;
-        let mut latest = load_app_data_from_disk(&self.root_dir)?;
-        let result = mutate(&mut latest)?;
-        self.persist(&latest)?;
-        *data = latest;
-        Ok(result)
-    }
-
-    /// 廉价变更签名：仅 stat `state.json`（不读取/解析内容），返回 `体积:mtime毫秒`。
-    /// 供前端轮询比对——签名不变即跳过整份状态拉取，空闲时彻底省去大文件读解析。
-    /// 基于文件元数据，可捕获本进程与外部进程（如 MCP）的任何写入。
-    pub fn state_signature(&self) -> String {
-        let path = self.root_dir.join("state.json");
-        match fs::metadata(&path) {
-            Ok(meta) => {
-                let mtime = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
-                format!("{}:{}", meta.len(), mtime)
-            }
-            Err(_) => "0:0".to_string(),
-        }
-    }
-
-    fn persist(&self, data: &AppData) -> Result<(), SchedulerError> {
-        fs::create_dir_all(&self.root_dir)
-            .map_err(|error| SchedulerError::Io(error.to_string()))?;
-        let state_path = self.root_dir.join("state.json");
-        let temp_path = self.root_dir.join(format!(
-            "state.json.tmp.{}.{}",
-            std::process::id(),
-            Uuid::new_v4().simple()
-        ));
-        // 紧凑序列化：state.json 为机器状态文件，pretty 缩进会让磁盘体积近乎翻倍，
-        // 加重每次读/写/解析的 I/O 与 CPU。compact 不改变可读回的数据。
-        let content =
-            serde_json::to_string(data).map_err(|error| SchedulerError::Io(error.to_string()))?;
-        if let Err(error) = fs::write(&temp_path, content) {
-            let _ = fs::remove_file(&temp_path);
-            return Err(SchedulerError::Io(error.to_string()));
-        }
-        if let Err(error) = fs::rename(&temp_path, state_path) {
-            let _ = fs::remove_file(&temp_path);
-            return Err(SchedulerError::Io(error.to_string()));
-        }
-        Ok(())
-    }
 }
 
 fn load_app_data_from_disk(root_dir: &Path) -> Result<AppData, SchedulerError> {
@@ -6129,50 +5902,6 @@ pub fn download_result_urls(urls: &[String], results_dir: &Path) -> Vec<String> 
     saved
 }
 
-fn attach_downloaded_result_paths(
-    data: &mut AppData,
-    task_id: &str,
-    submit_id: &str,
-    downloaded: &[String],
-) {
-    let Some(task) = data.tasks.iter_mut().find(|task| task.id == task_id) else {
-        return;
-    };
-    if task.submit_id == submit_id {
-        for path in downloaded {
-            push_unique(&mut task.result_paths, path.clone());
-        }
-    }
-    if let Some(record) = task
-        .execution_records
-        .iter_mut()
-        .find(|record| record.submit_id == submit_id)
-    {
-        for path in downloaded {
-            push_unique(&mut record.result_paths, path.clone());
-        }
-    }
-    task.updated_at = now_rfc3339();
-}
-
-fn spawn_result_download(root_dir: PathBuf, task_id: String, submit_id: String, urls: Vec<String>) {
-    if urls.is_empty() {
-        return;
-    }
-    std::thread::spawn(move || {
-        let results_dir = root_dir.join("role-media").join("results");
-        let downloaded = download_result_urls(&urls, &results_dir);
-        if downloaded.is_empty() {
-            return;
-        }
-        let store = AppStore::load(root_dir);
-        let _ = store.mutate(|data| {
-            attach_downloaded_result_paths(data, &task_id, &submit_id, &downloaded);
-            Ok(())
-        });
-    });
-}
-
 #[derive(Debug, Clone)]
 pub struct DueTaskCli {
     pub task_id: String,
@@ -7932,7 +7661,7 @@ pub fn process_queue_for_store_blocking(
 
     // 锁外：探测下一步应执行的 CLI 调用
     let due = {
-        let data = store.snapshot();
+        let data = store.try_snapshot().map_err(|error| error.to_string())?;
         peek_due_task_cli(&data)
     };
     let DueTaskCli {
@@ -8094,14 +7823,6 @@ pub fn process_queue_for_store_blocking(
         .map_err(|error| error.to_string())?;
     drop(store_lock);
     drop(process_guard);
-    if task.status == "succeeded" && !task.result_urls.is_empty() {
-        spawn_result_download(
-            store.root_dir.clone(),
-            task.id.clone(),
-            task.submit_id.clone(),
-            task.result_urls.clone(),
-        );
-    }
     Ok(Some(task))
 }
 
@@ -8111,7 +7832,13 @@ fn start_background_scheduler(app_handle: tauri::AppHandle) {
         let waker = app_handle.state::<SchedulerWaker>();
 
         // 单次快照供「空闲短路」与「等待时长」共用，避免一个 tick 内重复读盘。
-        let snapshot = store.snapshot();
+        let snapshot = match store.try_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                waker.wait(StdDuration::from_secs(SCHEDULER_TICK_INTERVAL_SECS));
+                continue;
+            }
+        };
 
         // 完全空闲时跳过重函数：不写 started/no_due_task 噪音日志、不整份序列化落盘。
         // 若这次 tick 刚让某任务到达终态（成功/失败），说明队列腾出来了——不进入等待，
@@ -8234,6 +7961,7 @@ pub fn run() {
             commands::resume_task_command,
             commands::reschedule_task_command,
             commands::open_result_dir_command,
+            commands::open_external_url_command,
             commands::download_result_url_command,
             commands::install_dreamina_cli_command,
             commands::login_dreamina_cli_command,
@@ -8269,11 +7997,14 @@ pub mod commands {
     use tauri::State;
 
     #[tauri::command(async)]
-    pub fn get_app_state(store: State<'_, AppStore>) -> AppData {
-        frontend_app_state(store.snapshot())
+    pub fn get_app_state(store: State<'_, AppStore>) -> Result<AppData, String> {
+        store
+            .try_snapshot()
+            .map(frontend_app_state)
+            .map_err(|error| error.to_string())
     }
 
-    /// 廉价变更签名（仅 stat，不读取整份状态）。前端轮询比对，未变则跳过 `get_app_state`。
+    /// 廉价变更签名（仅读取 SQLite revision）。前端轮询比对，未变则跳过 `get_app_state`。
     #[tauri::command]
     pub fn get_state_signature(store: State<'_, AppStore>) -> String {
         store.state_signature()
@@ -8744,7 +8475,7 @@ pub mod commands {
             .ok_or_else(|| "调度器正在执行提交或查询，请稍后再试".to_string())?;
         // 锁外：从快照构建 CLI 参数
         let args = {
-            let data = store.snapshot();
+            let data = store.try_snapshot().map_err(|error| error.to_string())?;
             let task = data
                 .tasks
                 .iter()
@@ -8810,15 +8541,6 @@ pub mod commands {
             })
             .map_err(|e| e.to_string())?;
         drop(store_lock);
-        // 锁外：下载结果（如有）
-        if task.status == "succeeded" && !task.result_urls.is_empty() {
-            spawn_result_download(
-                store.root_dir.clone(),
-                task.id.clone(),
-                task.submit_id.clone(),
-                task.result_urls.clone(),
-            );
-        }
         Ok(task)
     }
 
@@ -8830,7 +8552,7 @@ pub mod commands {
     ) -> Result<ScheduledTask, String> {
         // 锁外：取 submit_id
         let submit_id = {
-            let data = store.snapshot();
+            let data = store.try_snapshot().map_err(|error| error.to_string())?;
             let task = data
                 .tasks
                 .iter()
@@ -8900,21 +8622,6 @@ pub mod commands {
             })
             .map_err(|e| e.to_string())?;
         drop(store_lock);
-        // 锁外：下载结果
-        let result_urls = task
-            .execution_records
-            .iter()
-            .find(|record| record.submit_id == submit_id)
-            .map(|record| record.result_urls.clone())
-            .unwrap_or_else(|| task.result_urls.clone());
-        if !result_urls.is_empty() {
-            spawn_result_download(
-                store.root_dir.clone(),
-                task.id.clone(),
-                submit_id.clone(),
-                result_urls,
-            );
-        }
         Ok(task)
     }
 
@@ -8945,7 +8652,10 @@ pub mod commands {
         store: State<'_, AppStore>,
         prompt: String,
     ) -> Result<String, String> {
-        let settings = store.snapshot().settings;
+        let settings = store
+            .try_snapshot()
+            .map_err(|error| error.to_string())?
+            .settings;
         let config = settings
             .ai_model_configs
             .iter()
@@ -9156,7 +8866,10 @@ pub mod commands {
         size: String,
         reference_asset_ids: Option<Vec<String>>,
     ) -> Result<ImageGenHistoryItem, String> {
-        let settings = store.snapshot().settings;
+        let settings = store
+            .try_snapshot()
+            .map_err(|error| error.to_string())?
+            .settings;
         let config = active_image_model_config(&settings)
             .cloned()
             .ok_or_else(|| "未配置图片生成模型，请先在设置中填写".to_string())?;
@@ -9177,7 +8890,7 @@ pub mod commands {
         let ref_data_uris: Vec<String> = if ref_ids.is_empty() {
             Vec::new()
         } else {
-            let data = store.snapshot();
+            let data = store.try_snapshot().map_err(|error| error.to_string())?;
             ref_ids
                 .iter()
                 .map(|id| {
@@ -9339,7 +9052,7 @@ pub mod commands {
         history_id: String,
     ) -> Result<ImageGenHistoryItem, String> {
         // 取出当前历史项
-        let snapshot = store.snapshot();
+        let snapshot = store.try_snapshot().map_err(|error| error.to_string())?;
         let item = snapshot
             .imagegen_history
             .iter()
@@ -9524,7 +9237,8 @@ pub mod commands {
         history_id: String,
     ) -> Result<ImageGenHistoryItem, String> {
         let item = store
-            .snapshot()
+            .try_snapshot()
+            .map_err(|error| error.to_string())?
             .imagegen_history
             .iter()
             .find(|item| item.id == history_id)
@@ -9546,7 +9260,8 @@ pub mod commands {
         history_id: String,
     ) -> Result<ImageGenHistoryItem, String> {
         let item = store
-            .snapshot()
+            .try_snapshot()
+            .map_err(|error| error.to_string())?
             .imagegen_history
             .iter()
             .find(|item| item.id == history_id)
@@ -9566,7 +9281,8 @@ pub mod commands {
         history_id: String,
     ) -> Result<String, String> {
         let item = store
-            .snapshot()
+            .try_snapshot()
+            .map_err(|error| error.to_string())?
             .imagegen_history
             .iter()
             .find(|item| item.id == history_id)
@@ -9596,7 +9312,8 @@ pub mod commands {
         history_id: String,
     ) -> Result<(), String> {
         let item = store
-            .snapshot()
+            .try_snapshot()
+            .map_err(|error| error.to_string())?
             .imagegen_history
             .iter()
             .find(|item| item.id == history_id)
@@ -10101,6 +9818,27 @@ pub mod commands {
     }
 
     #[tauri::command]
+    pub fn open_external_url_command(url: String) -> Result<(), String> {
+        let parsed = reqwest::Url::parse(&url).map_err(|_| "结果链接无效".to_string())?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err("只允许打开 HTTP 或 HTTPS 结果链接".to_string());
+        }
+        #[cfg(target_os = "macos")]
+        let status = Command::new("open").arg(parsed.as_str()).status();
+        #[cfg(target_os = "windows")]
+        let status = Command::new("cmd")
+            .args(["/C", "start", "", parsed.as_str()])
+            .status();
+        #[cfg(target_os = "linux")]
+        let status = Command::new("xdg-open").arg(parsed.as_str()).status();
+        status
+            .map_err(|error| format!("打开结果链接失败：{error}"))?
+            .success()
+            .then_some(())
+            .ok_or_else(|| "打开结果链接失败".to_string())
+    }
+
+    #[tauri::command]
     pub async fn download_result_url_command(
         store: State<'_, AppStore>,
         url: String,
@@ -10120,7 +9858,10 @@ pub mod commands {
     pub async fn install_dreamina_cli_command(
         store: State<'_, AppStore>,
     ) -> Result<String, String> {
-        let settings = store.snapshot().settings;
+        let settings = store
+            .try_snapshot()
+            .map_err(|error| error.to_string())?
+            .settings;
         let plan =
             build_install_plan(&settings, std::env::consts::OS).map_err(|e| e.to_string())?;
         let (msg, stdout_log, stderr_log) = tauri::async_runtime::spawn_blocking(
@@ -10385,7 +10126,10 @@ pub mod commands {
         store: State<'_, AppStore>,
         guard: State<'_, keep_awake::KeepAwakeGuard>,
     ) -> bool {
-        let data = store.snapshot();
+        let Ok(data) = store.try_snapshot() else {
+            guard.release();
+            return false;
+        };
         if data.settings.prevent_sleep && needs_keep_awake(&data.tasks) {
             guard.acquire();
         } else {
@@ -10639,38 +10383,6 @@ mod tests {
             .expect("应找到第二次执行记录");
         assert_eq!(current_record.status, "querying");
         assert!(current_record.query_records.is_empty());
-    }
-
-    #[test]
-    fn downloaded_result_paths_are_attached_to_the_matching_submit_only() {
-        let mut data = AppData {
-            tasks: vec![make_task_with_execution_records()],
-            ..AppData::default()
-        };
-
-        attach_downloaded_result_paths(
-            &mut data,
-            "task-1",
-            "sub-1",
-            &["/downloaded/old.mp4".to_string()],
-        );
-        assert!(data.tasks[0].result_paths.is_empty());
-        assert_eq!(
-            data.tasks[0].execution_records[0].result_paths,
-            vec!["/old.mp4", "/downloaded/old.mp4"]
-        );
-
-        attach_downloaded_result_paths(
-            &mut data,
-            "task-1",
-            "sub-2",
-            &["/downloaded/current.mp4".to_string()],
-        );
-        assert_eq!(data.tasks[0].result_paths, vec!["/downloaded/current.mp4"]);
-        assert_eq!(
-            data.tasks[0].execution_records[1].result_paths,
-            vec!["/downloaded/current.mp4"]
-        );
     }
 
     fn make_pre_tns_querying_task(submit_id: &str) -> ScheduledTask {
@@ -11055,21 +10767,12 @@ mod tests {
         assert_eq!(store.state_signature(), s2, "空闲时签名应稳定不变");
     }
 
-    #[cfg(unix)]
     #[test]
-    fn state_write_lock_from_dead_process_is_reclaimable_immediately() {
-        let dead_pid = i32::MAX as u32;
-        let content = format!("token=old\npid={dead_pid}\ncreated_at={}\n", now_rfc3339());
-        assert!(state_write_lock_owner_is_dead(&content));
-
+    fn app_store_initializes_sqlite_without_legacy_lock_file() {
         let temp = tempfile::tempdir().expect("temp dir");
-        std::fs::write(temp.path().join("state.write.lock"), content)
-            .expect("write dead owner lock");
-        let started = std::time::Instant::now();
-        let guard =
-            acquire_state_write_lock(temp.path()).expect("dead owner lock should be reclaimed");
-        assert!(started.elapsed() < StdDuration::from_secs(1));
-        drop(guard);
+        let _store = AppStore::load(temp.path().to_path_buf());
+        assert!(temp.path().join("state.sqlite3").exists());
+        assert!(!temp.path().join("state.write.lock").exists());
     }
 
     // ── lock_is_stale（陈旧锁回收）─────────────────────────────────────────
@@ -11333,9 +11036,9 @@ mod tests {
     }
 
     #[test]
-    fn load_compacts_and_trims_oversized_existing_file() {
+    fn load_migrates_and_trims_legacy_state_json() {
         let temp = tempfile::tempdir().expect("temp dir");
-        // 手工写入 pretty + 超额 query_records 的 state.json（绕过 normalize 的裁剪）
+        // 手工写入旧版 state.json，首次 load 应迁移到 SQLite。
         let mut task = make_queued_task_for_submit("big");
         task.execution_records = vec![TaskExecutionRecord {
             id: "rec".to_string(),
@@ -11357,31 +11060,24 @@ mod tests {
         };
         let path = temp.path().join("state.json");
         std::fs::write(&path, serde_json::to_string_pretty(&data).expect("ser")).expect("write");
-        let big_size = std::fs::metadata(&path).expect("meta").len();
 
-        // load 应触发一次性压实（紧凑 + 裁剪）落盘
-        let _store = AppStore::load(temp.path().to_path_buf());
-
-        let after = std::fs::read_to_string(&path).expect("read");
-        assert!(!after.contains('\n'), "应压成紧凑 JSON");
-        assert!(
-            (after.len() as u64) < big_size,
-            "文件应明显变小：{} -> {}",
-            big_size,
-            after.len()
-        );
-        // 回读确认 query_records 上限 500，45 条不触发裁剪
         let reloaded = AppStore::load(temp.path().to_path_buf()).snapshot();
+        assert!(temp.path().join("state.sqlite3").exists());
+        assert!(!path.exists(), "迁移成功后旧状态不能继续作为数据源");
+        assert!(
+            temp.path().join("state.json.migrated.bak").exists(),
+            "必须保留迁移前原始备份"
+        );
         assert_eq!(
             reloaded.tasks[0].execution_records[0].query_records.len(),
             45
         );
     }
 
-    // ── persist 紧凑序列化 ─────────────────────────────────────────────────
+    // ── SQLite 行级持久化 ──────────────────────────────────────────────────
 
     #[test]
-    fn persist_writes_compact_json_not_pretty() {
+    fn persist_writes_sqlite_and_can_reload() {
         let temp = tempfile::tempdir().expect("temp dir");
         let store = AppStore::load(temp.path().to_path_buf());
         store
@@ -11390,16 +11086,252 @@ mod tests {
                 Ok(())
             })
             .expect("mutate");
-        let content =
-            std::fs::read_to_string(temp.path().join("state.json")).expect("read state.json");
-        assert!(
-            !content.contains('\n'),
-            "state.json 应为紧凑 JSON（无换行/缩进），实际包含换行"
-        );
-        // 紧凑写入后仍能正确回读
+        assert!(temp.path().join("state.sqlite3").exists());
+        assert!(!temp.path().join("state.json").exists());
         let reloaded = AppStore::load(temp.path().to_path_buf()).snapshot();
         assert_eq!(reloaded.tasks.len(), 1);
         assert_eq!(reloaded.tasks[0].id, "compact-1");
+    }
+
+    #[test]
+    fn sqlite_mutation_updates_only_changed_task_row() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = AppStore::load(temp.path().to_path_buf());
+        store
+            .mutate(|data| {
+                data.tasks.push(make_queued_task_for_submit("changed"));
+                data.tasks.push(make_queued_task_for_submit("untouched"));
+                Ok(())
+            })
+            .expect("seed tasks");
+        let connection =
+            rusqlite::Connection::open(temp.path().join("state.sqlite3")).expect("open sqlite");
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE task_update_audit (task_id TEXT NOT NULL);
+                CREATE TRIGGER audit_task_update
+                AFTER UPDATE ON tasks
+                BEGIN
+                    INSERT INTO task_update_audit (task_id) VALUES (NEW.id);
+                END;
+                ",
+            )
+            .expect("install audit trigger");
+
+        store
+            .mutate(|data| {
+                data.tasks[0].status = "paused".to_string();
+                Ok(())
+            })
+            .expect("update one task");
+
+        let updated_ids = connection
+            .prepare("SELECT task_id FROM task_update_audit")
+            .expect("prepare audit query")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query audit")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect audit");
+        assert_eq!(updated_ids, vec!["changed"]);
+    }
+
+    #[test]
+    fn sqlite_noop_mutation_keeps_revision_stable() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = AppStore::load(temp.path().to_path_buf());
+        let before = store.state_signature();
+        store.mutate(|_| Ok(())).expect("no-op mutation");
+        assert_eq!(store.state_signature(), before);
+    }
+
+    #[test]
+    fn sqlite_delete_and_head_insert_do_not_update_unchanged_rows() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = AppStore::load(temp.path().to_path_buf());
+        store
+            .mutate(|data| {
+                data.tasks.push(make_queued_task_for_submit("delete-me"));
+                data.tasks.push(make_queued_task_for_submit("keep-me"));
+                data.imagegen_history.push(ImageGenHistoryItem {
+                    id: "old-image".to_string(),
+                    prompt: "old".to_string(),
+                    size: "1:1".to_string(),
+                    stored_path: String::new(),
+                    size_bytes: 0,
+                    mime: String::new(),
+                    reference_asset_ids: vec![],
+                    created_at: now_rfc3339(),
+                    status: "completed".to_string(),
+                    task_id: None,
+                    error: None,
+                });
+                Ok(())
+            })
+            .expect("seed rows");
+        let connection =
+            rusqlite::Connection::open(temp.path().join("state.sqlite3")).expect("open sqlite");
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE row_update_audit (table_name TEXT NOT NULL, row_id TEXT NOT NULL);
+                CREATE TRIGGER audit_task_row_update
+                AFTER UPDATE ON tasks
+                BEGIN
+                    INSERT INTO row_update_audit VALUES ('tasks', NEW.id);
+                END;
+                CREATE TRIGGER audit_image_row_update
+                AFTER UPDATE ON imagegen_history
+                BEGIN
+                    INSERT INTO row_update_audit VALUES ('imagegen_history', NEW.id);
+                END;
+                ",
+            )
+            .expect("install audit triggers");
+
+        store
+            .mutate(|data| {
+                data.tasks.remove(0);
+                data.imagegen_history.insert(
+                    0,
+                    ImageGenHistoryItem {
+                        id: "new-image".to_string(),
+                        prompt: "new".to_string(),
+                        size: "1:1".to_string(),
+                        stored_path: String::new(),
+                        size_bytes: 0,
+                        mime: String::new(),
+                        reference_asset_ids: vec![],
+                        created_at: now_rfc3339(),
+                        status: "completed".to_string(),
+                        task_id: None,
+                        error: None,
+                    },
+                );
+                Ok(())
+            })
+            .expect("delete and prepend");
+
+        let update_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM row_update_audit", [], |row| {
+                row.get(0)
+            })
+            .expect("count updates");
+        assert_eq!(update_count, 0);
+        let reloaded = AppStore::load(temp.path().to_path_buf()).snapshot();
+        assert_eq!(reloaded.tasks[0].id, "keep-me");
+        assert_eq!(reloaded.imagegen_history[0].id, "new-image");
+        assert_eq!(reloaded.imagegen_history[1].id, "old-image");
+    }
+
+    #[test]
+    fn sqlite_persists_restart_normalization() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = AppStore::load(temp.path().to_path_buf());
+        store
+            .mutate(|data| {
+                let mut task = make_queued_task_for_submit("recover");
+                task.status = "submitting".to_string();
+                data.tasks.push(task);
+                Ok(())
+            })
+            .expect("seed interrupted task");
+        drop(store);
+
+        let _reloaded = AppStore::load(temp.path().to_path_buf());
+        let connection =
+            rusqlite::Connection::open(temp.path().join("state.sqlite3")).expect("open sqlite");
+        let stored_json = connection
+            .query_row("SELECT data_json FROM tasks LIMIT 1", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .expect("read task row");
+        let stored: ScheduledTask = serde_json::from_str(&stored_json).expect("parse task row");
+        assert_eq!(stored.status, "queued");
+    }
+
+    #[test]
+    fn sqlite_preserves_existing_entity_reorder() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = AppStore::load(temp.path().to_path_buf());
+        store
+            .mutate(|data| {
+                data.tasks.push(make_queued_task_for_submit("first"));
+                data.tasks.push(make_queued_task_for_submit("second"));
+                Ok(())
+            })
+            .expect("seed tasks");
+        store
+            .mutate(|data| {
+                data.tasks.swap(0, 1);
+                Ok(())
+            })
+            .expect("reorder tasks");
+
+        let reloaded = AppStore::load(temp.path().to_path_buf()).snapshot();
+        let ids = reloaded
+            .tasks
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["second", "first"]);
+    }
+
+    #[test]
+    fn sqlite_rejects_newer_schema_version() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = AppStore::load(temp.path().to_path_buf());
+        drop(store);
+        let connection =
+            rusqlite::Connection::open(temp.path().join("state.sqlite3")).expect("open sqlite");
+        connection
+            .pragma_update(None, "user_version", 2)
+            .expect("set future schema");
+        drop(connection);
+
+        let incompatible = AppStore::load(temp.path().to_path_buf());
+        let error = incompatible
+            .try_snapshot()
+            .expect_err("must reject newer schema");
+        assert!(error.to_string().contains("高于当前支持版本"));
+        assert!(incompatible.mutate(|_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn sqlite_preserves_newest_first_image_history_order() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = AppStore::load(temp.path().to_path_buf());
+        store
+            .mutate(|data| {
+                for id in ["older", "newer"] {
+                    data.imagegen_history.insert(
+                        0,
+                        ImageGenHistoryItem {
+                            id: id.to_string(),
+                            prompt: id.to_string(),
+                            size: "1:1".to_string(),
+                            stored_path: String::new(),
+                            size_bytes: 0,
+                            mime: String::new(),
+                            reference_asset_ids: vec![],
+                            created_at: now_rfc3339(),
+                            status: "completed".to_string(),
+                            task_id: None,
+                            error: None,
+                        },
+                    );
+                }
+                Ok(())
+            })
+            .expect("mutate");
+
+        let reloaded = AppStore::load(temp.path().to_path_buf()).snapshot();
+        let ids = reloaded
+            .imagegen_history
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["newer", "older"]);
     }
 
     #[test]

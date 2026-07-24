@@ -25,6 +25,7 @@ import {
   deriveCurrentExecutionRecord,
   deriveCurrentQueryRecords,
   deriveTaskHistory,
+  buildGenerationStats,
   historyItemLabel,
   isInterruptNotice,
 } from './task-history-utils.js';
@@ -77,6 +78,7 @@ import {
   Command,
   Copy,
   Download,
+  ExternalLink,
   FileAudio,
   FolderOpen,
   Image,
@@ -1843,6 +1845,7 @@ function QueueView({
     [tasks, searchQuery]
   );
   const sharedWaitingTasks = useMemo(() => getSharedWaitingTasks(tasks), [tasks]);
+  const generationStats = useMemo(() => buildGenerationStats(tasks), [tasks]);
   const paged = useMemo(() => paginateTasks(filteredSorted, page, pageSize), [filteredSorted, page, pageSize]);
 
   const selectedTask = useMemo(
@@ -2230,6 +2233,7 @@ function QueueView({
       <LaneStrip
         laneStatuses={laneStatuses}
         tasks={tasks}
+        generationStats={generationStats}
         nowMs={Date.now()}
         onToggleLane={handleToggleLane}
         onProbeLane={handleProbeLane}
@@ -2461,23 +2465,34 @@ function QueueView({
                         <h4 className="qc-section-title">生成结果</h4>
                         {resultItems.map((item) => (
                           <div key={`${item.kind}:${item.value}`} className="qc-result-card">
-                            {previewResultValue === item.value ? (
-                              <video className="qc-result-video" src={item.kind === 'path' ? convertFileSrc(item.value) : item.value} controls preload="none" />
+                            {item.kind === 'path' && previewResultValue === item.value ? (
+                              <video className="qc-result-video" src={convertFileSrc(item.value)} controls preload="none" />
                             ) : (
-                              <div className="qc-result-placeholder"><Play size={14} /><span>视频结果已就绪，按需预览</span></div>
+                              <div className="qc-result-placeholder">
+                                {item.kind === 'url' ? <ExternalLink size={14} /> : <Play size={14} />}
+                                <span>{item.kind === 'url' ? '远程视频已就绪，点击链接按需查看' : '视频结果已就绪，按需预览'}</span>
+                              </div>
                             )}
                             <div className="qc-result-row">
                               <span className="mono qc-result-path" title={item.value}>{item.label}</span>
-                              <button type="button" className="qc-mini-link qc-result-preview-btn"
-                                onClick={() => setPreviewResultValue((value) => value === item.value ? '' : item.value)}>
-                                {previewResultValue === item.value ? '收起' : '预览'}
-                              </button>
                               {item.kind === 'path' ? (
-                                <button type="button" className="icon-ghost mini" title="打开所在目录"
-                                  onClick={async () => { try { await invoke('open_result_dir_command', { path: item.value }); } catch (e) { setFeedback(String(e)); } }}><FolderOpen size={12} /></button>
+                                <>
+                                  <button type="button" className="qc-mini-link qc-result-preview-btn"
+                                    onClick={() => setPreviewResultValue((value) => value === item.value ? '' : item.value)}>
+                                    {previewResultValue === item.value ? '收起' : '预览'}
+                                  </button>
+                                  <button type="button" className="icon-ghost mini" title="打开所在目录"
+                                    onClick={async () => { try { await invoke('open_result_dir_command', { path: item.value }); } catch (e) { setFeedback(String(e)); } }}><FolderOpen size={12} /></button>
+                                </>
                               ) : (
-                                <button type="button" className="icon-ghost mini" title="复制链接"
-                                  onClick={() => navigator.clipboard?.writeText(item.value).then(() => setFeedback('已复制结果链接')).catch(() => setFeedback('复制失败'))}><Copy size={12} /></button>
+                                <>
+                                  <button type="button" className="qc-mini-link qc-result-preview-btn"
+                                    onClick={async () => { try { await invoke('open_external_url_command', { url: item.value }); } catch (e) { setFeedback(String(e)); } }}>
+                                    打开链接
+                                  </button>
+                                  <button type="button" className="icon-ghost mini" title="复制链接"
+                                    onClick={() => navigator.clipboard?.writeText(item.value).then(() => setFeedback('已复制结果链接')).catch(() => setFeedback('复制失败'))}><Copy size={12} /></button>
+                                </>
                               )}
                             </div>
                           </div>
@@ -2488,8 +2503,8 @@ function QueueView({
                   return (
                     <section className="qc-detail-folds" key="resources">
                       {hitResources.length ? (
-                        <details open={['draft', 'paused', 'scheduled'].includes(executionView?.status)}>
-                          <summary><span>命中资源</span><b>{hitResources.length} 个</b></summary>
+                        <div className="qc-detail-static">
+                          <div className="qc-detail-static-head"><span>命中资源</span><b>{hitResources.length} 个</b></div>
                           <div className="qc-resource-grid">
                             {hitResources.map(({ type, displayType, label, asset }) => (
                               <button key={`${displayType}:${asset.id}`} type="button" className={`qc-resource-item ${type} ${displayType}`}
@@ -2499,7 +2514,7 @@ function QueueView({
                               </button>
                             ))}
                           </div>
-                        </details>
+                        </div>
                       ) : null}
                       {taskHistory.length ? (
                         <details>
@@ -2526,15 +2541,15 @@ function QueueView({
                         </details>
                       ) : null}
                       {commandPresentation.hasCommand ? (
-                        <details>
-                          <summary><span>命令与参数</span><b>完整</b></summary>
+                        <div className="qc-detail-static">
+                          <div className="qc-detail-static-head"><span>命令与参数</span><b>完整</b></div>
                           <div className="qc-fold-params">
                             <div><span>模型</span><b>{selectedTask.params?.model_version || '—'}</b></div>
                             {Number(selectedTask.planned_submit_count || 1) > 1 ? <div><span>计划生成</span><b>{selectedTask.planned_submit_count} 次</b></div> : null}
                             {Number(selectedTask.concurrency_retry_count || 0) > 0 ? <div><span>并发重试</span><b>{selectedTask.concurrency_retry_count} 次</b></div> : null}
                           </div>
                           <button type="button" className="qc-command-collapsed" onClick={openCommandPreview}><Command size={13} /><span>{commandPresentation.hint}</span></button>
-                        </details>
+                        </div>
                       ) : null}
                     </section>
                   );

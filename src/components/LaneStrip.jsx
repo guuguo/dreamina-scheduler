@@ -23,6 +23,7 @@ const ACTIVE_STATUSES = ['submitting', 'submitted', 'querying'];
 export default function LaneStrip({
   laneStatuses = [],
   tasks = [],
+  generationStats = { today: 0, yesterday: 0, last7Days: 0, total: 0, days: [] },
   nowMs = Date.now(),
   onToggleLane,
   onProbeLane,
@@ -34,6 +35,7 @@ export default function LaneStrip({
   pendingProbeLaneKind = '',
 }) {
   const [sharedPoolOpen, setSharedPoolOpen] = React.useState(false);
+  const [generationStatsOpen, setGenerationStatsOpen] = React.useState(false);
   const standard = laneStatuses.find(s => s.queueKind === 'standard') || null;
   const fast = laneStatuses.find(s => s.queueKind === 'fast') || null;
   const enabledCount = laneStatuses.filter((lane) => lane.enabled !== false).length;
@@ -42,6 +44,7 @@ export default function LaneStrip({
 
   const selectTask = (taskId) => {
     setSharedPoolOpen(false);
+    setGenerationStatsOpen(false);
     onSelectTask?.(taskId);
   };
 
@@ -53,18 +56,27 @@ export default function LaneStrip({
       <LaneCard lane={fast} kind="fast" tasks={tasks} nowMs={nowMs} sharedTaskCount={sharedStats.total}
         onToggleLane={onToggleLane} onProbeLane={onProbeLane}
         pending={pendingLaneKind === 'fast'} probePending={pendingProbeLaneKind === 'fast'} canDisable={enabledCount > 1} />
-      <button type="button" className="shared-dispatch-pool" onClick={() => setSharedPoolOpen(true)}
-        disabled={sharedStats.total === 0} title={sharedStats.total ? '查看共享待调度池' : '共享待调度池为空'}>
-        <span className="shared-pool-icon">Q</span>
-        <span className="shared-pool-title">
-          <b>共享待调度池 {sharedStats.total} 个</b>
-          <em>任一启用车道空闲后动态分配，标准优先</em>
-        </span>
-        <span className="shared-pool-metric"><em>待排</em><b>{sharedStats.waiting}</b></span>
-        <span className="shared-pool-metric"><em>重试</em><b>{sharedStats.retry}</b></span>
-        <span className="shared-pool-metric"><em>最老等待</em><b>{sharedStats.queueAge}</b></span>
-        <ChevronRight size={16} />
-      </button>
+      <div className="lane-summary-row">
+        <button type="button" className="shared-dispatch-pool" onClick={() => setSharedPoolOpen(true)}
+          disabled={sharedStats.total === 0} title={sharedStats.total ? '查看共享待调度池' : '共享待调度池为空'}>
+          <span className="shared-pool-icon">Q</span>
+          <span className="shared-pool-title">
+            <b>共享待调度池 {sharedStats.total} 个</b>
+            <em>任一启用车道空闲后动态分配，标准优先</em>
+          </span>
+          <span className="shared-pool-metric"><em>待排</em><b>{sharedStats.waiting}</b></span>
+          <span className="shared-pool-metric"><em>重试</em><b>{sharedStats.retry}</b></span>
+          <span className="shared-pool-metric"><em>最老等待</em><b>{sharedStats.queueAge}</b></span>
+          <ChevronRight size={16} />
+        </button>
+        <button type="button" className="lane-generation-summary" onClick={() => setGenerationStatsOpen(true)}
+          title="查看视频生成统计">
+          <span className="lane-generation-title">生成统计</span>
+          <span className="lane-generation-metric"><em>昨日</em><b>{generationStats.yesterday}</b></span>
+          <span className="lane-generation-metric"><em>今日</em><b>{generationStats.today}</b></span>
+          <ChevronRight size={16} />
+        </button>
+      </div>
       {sharedPoolOpen ? (
         <SharedTasksModal
           tasks={sharedTasks}
@@ -75,7 +87,195 @@ export default function LaneStrip({
           onClose={() => setSharedPoolOpen(false)}
         />
       ) : null}
+      {generationStatsOpen ? (
+        <GenerationStatsModal
+          stats={generationStats}
+          tasks={tasks}
+          assetById={assetById}
+          roles={roles}
+          onSelectTask={selectTask}
+          onClose={() => setGenerationStatsOpen(false)}
+        />
+      ) : null}
     </section>
+  );
+}
+
+function GenerationStatsModal({ stats, tasks, assetById, roles, onSelectTask, onClose }) {
+  const [rangeKey, setRangeKey] = React.useState('last7Days');
+  const [modelKind, setModelKind] = React.useState('all');
+  const [selectedDayKey, setSelectedDayKey] = React.useState('');
+  const days = stats.days || [];
+  const selectedDay = days.find((day) => day.key === selectedDayKey) || null;
+  const range = selectedDay
+    ? {
+        total: selectedDay.count,
+        standard: selectedDay.standard,
+        fast: selectedDay.fast,
+        records: selectedDay.records,
+      }
+    : stats.ranges?.[rangeKey] || { total: 0, standard: 0, fast: 0, records: [] };
+  const filteredRecords = (range.records || []).filter(
+    (record) => modelKind === 'all' || record.modelKind === modelKind
+  );
+  const taskById = React.useMemo(
+    () => new Map((tasks || []).map((task) => [task.id, task])),
+    [tasks]
+  );
+  const maxDayCount = Math.max(...days.map((day) => day.count), 1);
+  const standardPercent = range.total ? Math.round((range.standard / range.total) * 100) : 0;
+  const fastPercent = range.total ? 100 - standardPercent : 0;
+  const highlightedDayKey = selectedDayKey
+    || (rangeKey === 'today' ? days[0]?.key : rangeKey === 'yesterday' ? days[1]?.key : '');
+  const rangeMeta = selectedDay
+    ? {
+        label: selectedDay.label === '今天'
+          ? '今日产出'
+          : selectedDay.label === '昨天'
+            ? '昨日产出'
+            : `${selectedDay.label}产出`,
+        note: '已选择单日',
+      }
+    : {
+        today: { label: '今日产出', note: `截至 ${formatClock(new Date().toISOString())}` },
+        yesterday: { label: '昨日产出', note: '按完成时间统计' },
+        last7Days: { label: '近 7 天产出', note: '点击柱子查看单日' },
+      }[rangeKey];
+
+  const selectChartDay = (day) => {
+    setSelectedDayKey(day.key);
+    if (day.key === days[0]?.key) setRangeKey('today');
+    else if (day.key === days[1]?.key) setRangeKey('yesterday');
+    else setRangeKey('day');
+  };
+
+  const selectPresetRange = (key) => {
+    setSelectedDayKey('');
+    setRangeKey(key);
+  };
+
+  React.useEffect(() => {
+    const closeOnEscape = (event) => {
+      if (event.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [onClose]);
+
+  return (
+    <div className="modal-backdrop lane-tasks-modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="lane-tasks-dialog generation-stats-dialog" role="dialog" aria-modal="true"
+        aria-labelledby="generation-stats-title" onMouseDown={(event) => event.stopPropagation()}>
+        <header className="lane-tasks-dialog-head">
+          <div>
+            <span>VIDEO OUTPUT</span>
+            <h2 id="generation-stats-title">生成统计</h2>
+          </div>
+          <strong>累计 {stats.total} 个</strong>
+          <button type="button" className="icon-ghost" onClick={onClose} title="关闭"><X size={17} /></button>
+        </header>
+
+        <div className="generation-stats-stage">
+          <article className="generation-trend-panel">
+            <span>{rangeMeta.label}</span>
+            <div className="generation-trend-total">
+              <b>{range.total}</b>
+              <em>个视频</em>
+              <strong>{rangeMeta.note}</strong>
+            </div>
+            <div className={`generation-sparkline${highlightedDayKey ? ' has-selection' : ''}`}
+              aria-label="最近七天逐日产出，点击柱子查看当天记录">
+              {[...days].reverse().map((day) => (
+                <button type="button" key={day.key}
+                  className={highlightedDayKey === day.key ? 'active' : ''}
+                  aria-label={`${day.label}，生成 ${day.count} 个视频`}
+                  aria-pressed={highlightedDayKey === day.key}
+                  title={`${day.label} ${day.count} 个`}
+                  onClick={() => selectChartDay(day)}>
+                  <b style={{ height: `${day.count ? Math.max(12, (day.count / maxDayCount) * 100) : 5}%` }} />
+                </button>
+              ))}
+            </div>
+          </article>
+
+          <article className="generation-model-panel">
+            <h3>模型贡献</h3>
+            <div className="generation-model-row">
+              <div><b>标准模型</b><span>{range.standard} · {standardPercent}%</span></div>
+              <i><b style={{ width: `${standardPercent}%` }} /></i>
+            </div>
+            <div className="generation-model-row fast">
+              <div><b>Fast 模型</b><span>{range.fast} · {fastPercent}%</span></div>
+              <i><b style={{ width: `${fastPercent}%` }} /></i>
+            </div>
+          </article>
+
+          <article className="generation-snapshot-panel">
+            <h3>产出快照</h3>
+            <div><span>今日生成</span><b>{stats.today}</b></div>
+            <div><span>昨日生成</span><b>{stats.yesterday}</b></div>
+            <div><span>累计生成</span><b>{stats.total}</b></div>
+          </article>
+        </div>
+
+        <div className="generation-stats-controls">
+          <div className="generation-model-tabs" role="tablist" aria-label="模型筛选">
+            {[
+              ['all', `全部 ${range.total}`],
+              ['standard', `标准 ${range.standard}`],
+              ['fast', `Fast ${range.fast}`],
+            ].map(([key, label]) => (
+              <button type="button" key={key} data-model={key}
+                className={modelKind === key ? 'active' : ''}
+                onClick={() => setModelKind(key)}>
+                {label}
+              </button>
+            ))}
+          </div>
+          <div className="generation-range-tabs" role="tablist" aria-label="时间范围">
+            {[
+              ['today', '今天'],
+              ['yesterday', '昨天'],
+              ['last7Days', '近 7 天'],
+            ].map(([key, label]) => (
+              <button type="button" key={key}
+                className={!selectedDayKey && rangeKey === key ? 'active' : (
+                  selectedDayKey && rangeKey === key && ['today', 'yesterday'].includes(key) ? 'active' : ''
+                )}
+                onClick={() => selectPresetRange(key)}>
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="lane-tasks-list generation-record-list">
+          {filteredRecords.length ? filteredRecords.map((record) => {
+            const task = taskById.get(record.taskId);
+            const thumbPath = findTaskThumbPath(task || {}, assetById, roles);
+            return (
+              <button type="button" className="lane-task-row generation-record-row"
+                key={`${record.taskId}:${record.id}`}
+                onClick={() => onSelectTask(record.taskId)}>
+                <span className="lane-task-thumb">
+                  {thumbPath ? <img src={resolveMediaSrc(thumbPath)} alt="" /> : <Image size={17} />}
+                </span>
+                <span className="lane-task-copy">
+                  <b>{record.taskTitle}</b>
+                  <em>{record.modelVersion} · {formatGenerationRecordTime(record.finishedAt)}</em>
+                </span>
+                <span className="generation-record-count">{record.count} 个视频</span>
+                <span className={`generation-record-model ${record.modelKind}`}>{record.modelKind === 'fast' ? 'Fast' : '标准'}</span>
+                <ChevronRight className="lane-task-open-icon" size={16} />
+              </button>
+            );
+          }) : (
+            <div className="generation-record-empty">当前筛选下暂无完成记录</div>
+          )}
+        </div>
+        <footer>点击完成记录可回到对应任务详情；本地文件与远程链接不会重复计数。</footer>
+      </section>
+    </div>
   );
 }
 
@@ -257,6 +457,19 @@ function laneTaskTimeLabel(task) {
   const time = new Date(value);
   if (!Number.isFinite(time.getTime())) return '—';
   return `${String(time.getMonth() + 1).padStart(2, '0')}-${String(time.getDate()).padStart(2, '0')} ${String(time.getHours()).padStart(2, '0')}:${String(time.getMinutes()).padStart(2, '0')}`;
+}
+
+function formatGenerationRecordTime(value, now = new Date()) {
+  const time = new Date(value);
+  if (!Number.isFinite(time.getTime())) return '完成时间未知';
+  const today = new Date(now);
+  today.setHours(0, 0, 0, 0);
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+  const clock = `${String(time.getHours()).padStart(2, '0')}:${String(time.getMinutes()).padStart(2, '0')}`;
+  if (time >= today) return `今天 ${clock}`;
+  if (time >= yesterday) return `昨天 ${clock}`;
+  return `${time.getMonth() + 1}月${time.getDate()}日 ${clock}`;
 }
 
 function getLanePressure(lane) {

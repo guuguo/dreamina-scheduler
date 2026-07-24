@@ -1,6 +1,6 @@
 [package]
 name = "dreamina-scheduler"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 default-run = "dreamina-scheduler"
 
@@ -26,6 +26,7 @@ reqwest = { version = "0.12", features = ["blocking", "multipart"] }
 base64 = "0.22"
 sha2 = "0.10"
 libc = "0.2"
+rusqlite = { version = "0.37.0", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"

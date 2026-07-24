@@ -3,6 +3,7 @@ import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 
 const source = readFileSync(new URL('./main.jsx', import.meta.url), 'utf8');
+const laneSource = readFileSync(new URL('./components/LaneStrip.jsx', import.meta.url), 'utf8');
 const tauriSource = readFileSync(new URL('../src-tauri/src/lib.rs', import.meta.url), 'utf8');
 
 test('QueueView receives execution-record operation props used by execution history actions', () => {
@@ -31,6 +32,22 @@ test('sidebar exposes disabled-aware latest output folder shortcut', () => {
   assert.match(source, /disabled=\{!latestSuccessfulResultPath\}/);
   assert.match(source, /产出文件夹/);
   assert.match(source, /invoke\('open_result_dir_command', \{ path: latestSuccessfulResultPath \}\)/);
+});
+
+test('queue center shows generation statistics and opens remote results without automatic downloads', () => {
+  assert.match(source, /buildGenerationStats\(tasks\)/);
+  assert.match(laneSource, /昨日生成/);
+  assert.match(source, /invoke\('open_external_url_command'/);
+  assert.match(tauriSource, /pub fn open_external_url_command/);
+  assert.match(tauriSource, /commands::open_external_url_command/);
+  assert.doesNotMatch(tauriSource, /spawn_result_download/);
+});
+
+test('resource and command sections stay expanded without details toggles', () => {
+  assert.match(source, /className="qc-detail-static-head"><span>命中资源/);
+  assert.match(source, /className="qc-detail-static-head"><span>命令与参数/);
+  assert.doesNotMatch(source, /<details[^>]*>\\s*<summary><span>命中资源/);
+  assert.doesNotMatch(source, /<details[^>]*>\\s*<summary><span>命令与参数/);
 });
 
 test('main app no longer includes README screenshot fixture mode', () => {

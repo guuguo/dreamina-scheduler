@@ -995,12 +995,551 @@
       font-weight: 850;
     }
 
+    .lane-summary {
+      display: grid;
+      grid-template-columns: minmax(0, 9fr) minmax(320px, 3fr);
+      gap: 10px;
+      margin: -2px 0 16px;
+    }
+
+    .pool-card,
+    .stats-trigger {
+      min-height: 66px;
+      border: 1px solid #d8dcff;
+      border-radius: 14px;
+      background: rgba(255, 255, 255, .96);
+      color: inherit;
+      box-shadow: 0 10px 30px rgba(25, 39, 72, .04);
+    }
+
+    .pool-card {
+      display: grid;
+      grid-template-columns: 38px minmax(260px, 1fr) auto auto auto 20px;
+      align-items: center;
+      gap: 14px;
+      padding: 9px 14px;
+      border-left: 4px solid var(--accent);
+    }
+
+    .pool-icon {
+      width: 36px;
+      height: 36px;
+      display: grid;
+      place-items: center;
+      border-radius: 10px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-family: var(--mono);
+      font-weight: 950;
+    }
+
+    .pool-copy b,
+    .pool-copy span,
+    .pool-metric b,
+    .pool-metric span {
+      display: block;
+    }
+
+    .pool-copy b {
+      font-size: 14px;
+    }
+
+    .pool-copy span {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .pool-metric {
+      min-width: 72px;
+      padding-left: 14px;
+      border-left: 1px solid var(--line-2);
+    }
+
+    .pool-metric span {
+      color: var(--faint);
+      font-size: 10px;
+    }
+
+    .pool-metric b {
+      margin-top: 4px;
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+
+    .pool-arrow,
+    .stats-arrow {
+      color: #8390a6;
+      font-size: 22px;
+      line-height: 1;
+    }
+
+    .stats-trigger {
+      position: relative;
+      display: grid;
+      grid-template-columns: minmax(86px, 1fr) auto auto 18px;
+      align-items: center;
+      gap: 12px;
+      padding: 9px 14px;
+      overflow: hidden;
+      text-align: left;
+    }
+
+    .stats-trigger::before {
+      content: "";
+      position: absolute;
+      width: 150px;
+      height: 150px;
+      right: -70px;
+      top: -100px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(81, 87, 242, .13), transparent 68%);
+      pointer-events: none;
+    }
+
+    .stats-trigger-title b,
+    .stats-trigger-title span,
+    .stats-trigger-metric b,
+    .stats-trigger-metric span {
+      display: block;
+    }
+
+    .stats-trigger-title b {
+      font-size: 13px;
+    }
+
+    .stats-trigger-title span {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 10px;
+    }
+
+    .stats-trigger-metric {
+      min-width: 48px;
+      padding-left: 12px;
+      border-left: 1px solid var(--line-2);
+    }
+
+    .stats-trigger-metric span {
+      color: var(--faint);
+      font-size: 10px;
+    }
+
+    .stats-trigger-metric b {
+      margin-top: 3px;
+      font-family: var(--mono);
+      font-size: 15px;
+    }
+
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 80;
+      display: none;
+      place-items: center;
+      padding: 28px;
+      background: rgba(20, 29, 49, .40);
+      backdrop-filter: blur(5px);
+    }
+
+    .modal-backdrop.open {
+      display: grid;
+    }
+
+    .stats-dialog {
+      width: min(760px, calc(100vw - 56px));
+      max-height: min(84vh, 780px);
+      overflow: hidden;
+      border: 1px solid rgba(218, 226, 238, .98);
+      border-radius: 20px;
+      background: #fff;
+      box-shadow: 0 32px 100px rgba(16, 26, 49, .28);
+    }
+
+    .stats-dialog-head {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto 34px;
+      align-items: center;
+      gap: 12px;
+      padding: 18px 20px 14px;
+    }
+
+    .stats-dialog-head h2 {
+      margin: 0;
+      font-size: 21px;
+      letter-spacing: -.03em;
+    }
+
+    .stats-dialog-head p {
+      margin: 5px 0 0;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .stats-total {
+      padding: 6px 10px;
+      border-radius: 9px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 950;
+    }
+
+    .close-modal {
+      width: 32px;
+      height: 32px;
+      border: 0;
+      border-radius: 9px;
+      background: transparent;
+      color: #738098;
+      font-size: 22px;
+    }
+
+    .close-modal:hover {
+      background: #f0f3f8;
+    }
+
+    .stats-stage {
+      display: grid;
+      grid-template-columns: repeat(12, minmax(0, 1fr));
+      grid-auto-flow: dense;
+      gap: 1px;
+      margin: 0 20px;
+      overflow: hidden;
+      border: 1px solid #e4e9f1;
+      border-radius: 16px;
+      background: #e4e9f1;
+    }
+
+    .trend-panel,
+    .model-panel,
+    .snapshot-panel {
+      position: relative;
+      min-height: 174px;
+      padding: 17px;
+      overflow: hidden;
+    }
+
+    .trend-panel {
+      grid-column: span 5;
+      color: #fff;
+      background:
+        radial-gradient(240px 130px at 90% 0%, rgba(100, 109, 255, .50), transparent 68%),
+        linear-gradient(145deg, #101a31, #1b2750);
+    }
+
+    .trend-panel::after {
+      content: "";
+      position: absolute;
+      inset: auto -30px -80px auto;
+      width: 180px;
+      height: 180px;
+      border-radius: 50%;
+      border: 36px solid rgba(255, 255, 255, .035);
+    }
+
+    .stat-kicker {
+      color: rgba(255, 255, 255, .66);
+      font-size: 10px;
+      font-weight: 850;
+    }
+
+    .trend-total {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      margin-top: 11px;
+    }
+
+    .trend-total strong {
+      font-family: var(--mono);
+      font-size: 43px;
+      line-height: 1;
+      letter-spacing: -.07em;
+    }
+
+    .trend-total span {
+      color: rgba(255, 255, 255, .68);
+      font-size: 11px;
+    }
+
+    .trend-delta {
+      margin-left: auto;
+      color: #8ff0c4;
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 900;
+    }
+
+    .sparkline {
+      position: absolute;
+      left: 17px;
+      right: 17px;
+      bottom: 17px;
+      height: 48px;
+      display: grid;
+      grid-template-columns: repeat(7, 1fr);
+      align-items: end;
+      gap: 7px;
+    }
+
+    .sparkline i {
+      display: block;
+      height: var(--h);
+      border-radius: 5px 5px 2px 2px;
+      background: linear-gradient(180deg, #878dff, rgba(135, 141, 255, .24));
+    }
+
+    .sparkline i:last-child {
+      background: linear-gradient(180deg, #6cf0b7, rgba(108, 240, 183, .28));
+    }
+
+    .model-panel {
+      grid-column: span 4;
+      background:
+        radial-gradient(180px 100px at 100% 0%, rgba(14, 169, 108, .07), transparent 70%),
+        #fff;
+    }
+
+    .model-panel h3,
+    .snapshot-panel h3 {
+      margin: 0;
+      color: #3d4a64;
+      font-size: 11px;
+    }
+
+    .model-row {
+      margin-top: 20px;
+    }
+
+    .model-row-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .model-row-head b {
+      font-size: 12px;
+    }
+
+    .model-row-head span {
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+    }
+
+    .model-track {
+      height: 8px;
+      margin-top: 8px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: #e9edf4;
+    }
+
+    .model-track i {
+      display: block;
+      width: var(--v);
+      height: 100%;
+      border-radius: inherit;
+      background: var(--std);
+    }
+
+    .model-row.fast .model-track i {
+      background: var(--fast);
+    }
+
+    .snapshot-panel {
+      grid-column: span 3;
+      display: grid;
+      align-content: start;
+      background: #f8faff;
+    }
+
+    .snapshot-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: baseline;
+      gap: 10px;
+      min-height: 40px;
+      padding: 10px 0;
+      border-bottom: 1px solid #e8edf4;
+    }
+
+    .snapshot-row:last-child {
+      border-bottom: 0;
+    }
+
+    .snapshot-row span {
+      color: var(--muted);
+      font-size: 10px;
+    }
+
+    .snapshot-row b {
+      font-family: var(--mono);
+      font-size: 17px;
+    }
+
+    .stats-controls {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 16px 20px 10px;
+    }
+
+    .stats-tabs {
+      display: inline-flex;
+      padding: 3px;
+      border-radius: 10px;
+      background: #f0f3f8;
+    }
+
+    .stats-tab {
+      height: 30px;
+      border: 0;
+      border-radius: 8px;
+      background: transparent;
+      color: #68758c;
+      padding: 0 12px;
+      font-size: 11px;
+      font-weight: 900;
+    }
+
+    .stats-tab.active {
+      color: var(--accent);
+      background: #fff;
+      box-shadow: 0 4px 14px rgba(25, 39, 72, .08);
+    }
+
+    .stats-tab[data-model="fast"].active {
+      color: var(--fast);
+    }
+
+    .stats-range {
+      display: inline-flex;
+      gap: 3px;
+      padding: 3px;
+      border: 1px solid #dfe5ef;
+      border-radius: 10px;
+      background: #fff;
+      box-shadow: 0 8px 22px rgba(30, 45, 75, .06);
+    }
+
+    .range-tab {
+      height: 30px;
+      padding: 0 12px;
+      border: 0;
+      border-radius: 8px;
+      color: #70809d;
+      background: transparent;
+      font: inherit;
+      font-size: 11px;
+      font-weight: 900;
+      cursor: pointer;
+      transition: color .18s ease, background .18s ease, box-shadow .18s ease;
+    }
+
+    .range-tab:hover {
+      color: #3d4f70;
+      background: #f5f7fb;
+    }
+
+    .range-tab.active {
+      color: #fff;
+      background: #111c3a;
+      box-shadow: 0 6px 16px rgba(17, 28, 58, .2);
+    }
+
+    .completion-list {
+      margin: 0 20px 16px;
+      overflow: hidden;
+      border: 1px solid #e6ebf3;
+      border-radius: 14px;
+    }
+
+    .completion-row {
+      display: grid;
+      grid-template-columns: 42px minmax(0, 1fr) 92px 62px 20px;
+      align-items: center;
+      gap: 11px;
+      min-height: 62px;
+      padding: 8px 12px;
+      border: 0;
+      border-bottom: 1px solid #edf1f6;
+      background: #fff;
+      color: inherit;
+      text-align: left;
+      width: 100%;
+    }
+
+    .completion-row:last-child {
+      border-bottom: 0;
+    }
+
+    .completion-row:hover {
+      background: #f8faff;
+    }
+
+    .completion-row .thumb {
+      width: 42px;
+      height: 42px;
+      border-radius: 9px;
+    }
+
+    .completion-copy b,
+    .completion-copy span {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .completion-copy b {
+      font-size: 12px;
+    }
+
+    .completion-copy span {
+      margin-top: 4px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 10px;
+    }
+
+    .completion-count {
+      color: var(--muted);
+      font-size: 10px;
+      text-align: right;
+    }
+
+    .completion-status {
+      color: var(--ok);
+      font-size: 11px;
+      font-weight: 950;
+      text-align: right;
+    }
+
+    .stats-dialog-foot {
+      padding: 11px 20px;
+      border-top: 1px solid #edf1f6;
+      color: var(--muted);
+      font-size: 10px;
+      text-align: center;
+    }
+
     @media (prefers-reduced-motion: no-preference) {
       .btn,
       .tab,
       .row,
       .lane,
-      .thumb {
+      .thumb,
+      .pool-card,
+      .stats-trigger,
+      .completion-row,
+      .trend-panel,
+      .model-panel,
+      .snapshot-panel {
         transition: transform .22s ease, box-shadow .22s ease, border-color .22s ease, filter .22s ease;
       }
 
@@ -1014,8 +1553,23 @@
         box-shadow: 0 18px 48px rgba(25, 39, 72, .075);
       }
 
+      .stats-trigger:hover,
+      .pool-card:hover {
+        transform: translateY(-2px);
+        border-color: #bdc5ff;
+        box-shadow: 0 16px 34px rgba(25, 39, 72, .08);
+      }
+
+      .trend-panel:hover,
+      .model-panel:hover,
+      .snapshot-panel:hover {
+        transform: translateY(-2px);
+        z-index: 2;
+      }
+
       .row:hover .thumb,
-      .selected-top:hover .thumb {
+      .selected-top:hover .thumb,
+      .completion-row:hover .thumb {
         transform: scale(1.045);
         filter: contrast(1.04);
       }
@@ -1151,6 +1705,26 @@
             </div>
           </div>
         </article>
+      </section>
+
+      <section class="lane-summary" aria-label="共享调度与生成统计">
+        <button class="pool-card" type="button">
+          <span class="pool-icon">Q</span>
+          <span class="pool-copy">
+            <b>共享待调度池 22 个</b>
+            <span>任一启用车道空闲后动态分配，标准优先</span>
+          </span>
+          <span class="pool-metric"><span>待排</span><b>19</b></span>
+          <span class="pool-metric"><span>重试</span><b>3</b></span>
+          <span class="pool-metric"><span>最老等待</span><b>2天23时</b></span>
+          <span class="pool-arrow">›</span>
+        </button>
+        <button class="stats-trigger" id="openStats" type="button" aria-haspopup="dialog">
+          <span class="stats-trigger-title"><b>生成统计</b><span>查看完成记录</span></span>
+          <span class="stats-trigger-metric"><span>昨日</span><b>8</b></span>
+          <span class="stats-trigger-metric"><span>今日</span><b>3</b></span>
+          <span class="stats-arrow">›</span>
+        </button>
       </section>
 
       <section class="workbench" aria-label="任务队列与选中任务">
@@ -1329,6 +1903,110 @@
     </main>
   </div>
 
+  <div class="modal-backdrop" id="statsModal" aria-hidden="true">
+    <section class="stats-dialog" role="dialog" aria-modal="true" aria-labelledby="statsTitle">
+      <header class="stats-dialog-head">
+        <div>
+          <h2 id="statsTitle">生成统计</h2>
+          <p>按执行完成时间统计成功视频，并关联到对应任务记录</p>
+        </div>
+        <span class="stats-total" id="statsTotalBadge">累计 186 个</span>
+        <button class="close-modal" id="closeStats" type="button" aria-label="关闭">×</button>
+      </header>
+
+      <section class="stats-stage" aria-label="生成概览">
+        <article class="trend-panel">
+          <span class="stat-kicker" id="rangeKicker">近 7 天产出</span>
+          <div class="trend-total">
+            <strong id="rangeTotal">31</strong>
+            <span>个视频</span>
+            <em class="trend-delta" id="rangeDelta">较上周 +18%</em>
+          </div>
+          <div class="sparkline" aria-label="最近七天逐日产出">
+            <i style="--h: 28%"></i>
+            <i style="--h: 42%"></i>
+            <i style="--h: 36%"></i>
+            <i style="--h: 64%"></i>
+            <i style="--h: 52%"></i>
+            <i style="--h: 82%"></i>
+            <i style="--h: 48%"></i>
+          </div>
+        </article>
+
+        <article class="model-panel">
+          <h3>模型贡献</h3>
+          <div class="model-row">
+            <div class="model-row-head"><b>标准模型</b><span id="standardContribution">19 · 61%</span></div>
+            <div class="model-track" id="standardTrack" style="--v: 61%"><i></i></div>
+          </div>
+          <div class="model-row fast">
+            <div class="model-row-head"><b>Fast 模型</b><span id="fastContribution">12 · 39%</span></div>
+            <div class="model-track" id="fastTrack" style="--v: 39%"><i></i></div>
+          </div>
+        </article>
+
+        <article class="snapshot-panel">
+          <h3>产出快照</h3>
+          <div class="snapshot-row"><span>今日生成</span><b>3</b></div>
+          <div class="snapshot-row"><span>昨日生成</span><b>8</b></div>
+          <div class="snapshot-row"><span>累计生成</span><b>186</b></div>
+        </article>
+      </section>
+
+      <div class="stats-controls">
+        <div class="stats-tabs" role="tablist" aria-label="模型筛选">
+          <button class="stats-tab active" type="button" data-model="all">全部 31</button>
+          <button class="stats-tab" type="button" data-model="standard">标准 19</button>
+          <button class="stats-tab" type="button" data-model="fast">Fast 12</button>
+        </div>
+        <div class="stats-range" role="tablist" aria-label="时间范围">
+          <button class="range-tab" type="button" data-range="today">今天</button>
+          <button class="range-tab" type="button" data-range="yesterday">昨天</button>
+          <button class="range-tab active" type="button" data-range="week">近 7 天</button>
+        </div>
+      </div>
+
+      <div class="completion-list" aria-label="完成记录">
+        <button class="completion-row" type="button" data-model="fast" data-day="today">
+          <span class="thumb dark"></span>
+          <span class="completion-copy"><b>员工旅行第1集｜scene-02</b><span>seedance2.0fast · 今天 10:42</span></span>
+          <span class="completion-count">1 个视频</span>
+          <span class="completion-status">成功</span>
+          <span class="stats-arrow">›</span>
+        </button>
+        <button class="completion-row" type="button" data-model="standard" data-day="today">
+          <span class="thumb"></span>
+          <span class="completion-copy"><b>第13集｜scene-01</b><span>seedance2.0 · 今天 09:18</span></span>
+          <span class="completion-count">2 个视频</span>
+          <span class="completion-status">成功</span>
+          <span class="stats-arrow">›</span>
+        </button>
+        <button class="completion-row" type="button" data-model="standard" data-day="yesterday">
+          <span class="thumb"></span>
+          <span class="completion-copy"><b>第12集｜scene-04</b><span>seedance2.0 · 昨天 23:16</span></span>
+          <span class="completion-count">1 个视频</span>
+          <span class="completion-status">成功</span>
+          <span class="stats-arrow">›</span>
+        </button>
+        <button class="completion-row" type="button" data-model="standard" data-day="yesterday">
+          <span class="thumb dark"></span>
+          <span class="completion-copy"><b>第12集｜scene-03</b><span>seedance2.0 · 昨天 22:48</span></span>
+          <span class="completion-count">2 个视频</span>
+          <span class="completion-status">成功</span>
+          <span class="stats-arrow">›</span>
+        </button>
+        <button class="completion-row" type="button" data-model="fast" data-day="yesterday">
+          <span class="thumb"></span>
+          <span class="completion-copy"><b>第11集｜scene-06</b><span>seedance2.0fast · 昨天 18:08</span></span>
+          <span class="completion-count">3 个视频</span>
+          <span class="completion-status">成功</span>
+          <span class="stats-arrow">›</span>
+        </button>
+      </div>
+      <footer class="stats-dialog-foot">点击完成记录可回到对应任务详情</footer>
+    </section>
+  </div>
+
   <script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/ScrollTrigger.min.js"></script>
   <script>
@@ -1345,7 +2023,113 @@
         ease: "power2.out",
         scrollTrigger: { trigger: ".selected", start: "top 85%" }
       });
+      gsap.from(".lane-summary > *", {
+        opacity: 0,
+        y: 12,
+        scale: 0.985,
+        duration: 0.46,
+        stagger: 0.07,
+        ease: "power3.out",
+        delay: 0.22
+      });
     }
+
+    const statsModal = document.getElementById("statsModal");
+    const openStats = document.getElementById("openStats");
+    const closeStats = document.getElementById("closeStats");
+
+    function showStats() {
+      statsModal.classList.add("open");
+      statsModal.setAttribute("aria-hidden", "false");
+      if (window.gsap) {
+        gsap.fromTo(".stats-dialog", { opacity: 0, y: 22, scale: .965 }, {
+          opacity: 1, y: 0, scale: 1, duration: .4, ease: "power3.out"
+        });
+        gsap.from(".stats-stage > *", {
+          opacity: 0, y: 12, duration: .38, stagger: .06, ease: "power2.out", delay: .08
+        });
+        gsap.from(".completion-row", {
+          opacity: 0, x: 14, duration: .32, stagger: .045, ease: "power2.out", delay: .14
+        });
+      }
+      closeStats.focus();
+    }
+
+    function hideStats() {
+      statsModal.classList.remove("open");
+      statsModal.setAttribute("aria-hidden", "true");
+      openStats.focus();
+    }
+
+    openStats.addEventListener("click", showStats);
+    closeStats.addEventListener("click", hideStats);
+    statsModal.addEventListener("click", (event) => {
+      if (event.target === statsModal) hideStats();
+    });
+    window.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && statsModal.classList.contains("open")) hideStats();
+    });
+
+    const rangeStats = {
+      today: { label: "今日产出", total: 3, standard: 2, fast: 1, delta: "截至当前 10:56" },
+      yesterday: { label: "昨日产出", total: 8, standard: 5, fast: 3, delta: "较前日 +14%" },
+      week: { label: "近 7 天产出", total: 31, standard: 19, fast: 12, delta: "较上周 +18%" }
+    };
+    let activeModel = "all";
+    let activeRange = "week";
+
+    function refreshCompletionList() {
+      document.querySelectorAll(".completion-row").forEach((row) => {
+        const matchesModel = activeModel === "all" || row.dataset.model === activeModel;
+        const matchesRange = activeRange === "week" || row.dataset.day === activeRange;
+        row.hidden = !(matchesModel && matchesRange);
+      });
+      if (window.gsap) {
+        gsap.from(".completion-row:not([hidden])", {
+          opacity: 0, x: 10, duration: .28, stagger: .04, ease: "power2.out"
+        });
+      }
+    }
+
+    function refreshRangeStats() {
+      const stats = rangeStats[activeRange];
+      const standardPercent = Math.round(stats.standard / stats.total * 100);
+      const fastPercent = 100 - standardPercent;
+      document.getElementById("rangeKicker").textContent = stats.label;
+      document.getElementById("rangeTotal").textContent = stats.total;
+      document.getElementById("rangeDelta").textContent = stats.delta;
+      document.getElementById("standardContribution").textContent = `${stats.standard} · ${standardPercent}%`;
+      document.getElementById("fastContribution").textContent = `${stats.fast} · ${fastPercent}%`;
+      document.getElementById("standardTrack").style.setProperty("--v", `${standardPercent}%`);
+      document.getElementById("fastTrack").style.setProperty("--v", `${fastPercent}%`);
+      document.querySelector('.stats-tab[data-model="all"]').textContent = `全部 ${stats.total}`;
+      document.querySelector('.stats-tab[data-model="standard"]').textContent = `标准 ${stats.standard}`;
+      document.querySelector('.stats-tab[data-model="fast"]').textContent = `Fast ${stats.fast}`;
+    }
+
+    document.querySelectorAll(".stats-tab").forEach((tab) => {
+      tab.addEventListener("click", () => {
+        document.querySelectorAll(".stats-tab").forEach((item) => item.classList.remove("active"));
+        tab.classList.add("active");
+        activeModel = tab.dataset.model;
+        refreshCompletionList();
+      });
+    });
+
+    document.querySelectorAll(".range-tab").forEach((tab) => {
+      tab.addEventListener("click", () => {
+        document.querySelectorAll(".range-tab").forEach((item) => item.classList.remove("active"));
+        tab.classList.add("active");
+        activeRange = tab.dataset.range;
+        refreshRangeStats();
+        refreshCompletionList();
+        if (window.gsap) {
+          gsap.fromTo("#rangeTotal", { y: 8, opacity: 0 }, {
+            y: 0, opacity: 1, duration: .26, ease: "power2.out"
+          });
+        }
+      });
+    });
   </script>
 </body>
 </html>

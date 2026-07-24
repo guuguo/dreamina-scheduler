@@ -407,7 +407,7 @@ fn call_process_queue_once(store: &AppStore) -> Result<Value, String> {
 }
 
 fn call_get_queue_snapshot(store: &AppStore) -> Result<Value, String> {
-    let data = store.snapshot();
+    let data = store.try_snapshot().map_err(|error| error.to_string())?;
     Ok(json!({
         "tasks": data.tasks,
         "assets": data.assets,

@@ -164,6 +164,140 @@ export function deriveTaskHistory(task) {
   return items;
 }
 
+function resultCount(item) {
+  const pathCount = new Set(item?.result_paths || []).size;
+  const urlCount = new Set(item?.result_urls || []).size;
+  return Math.max(pathCount, urlCount);
+}
+
+function localDayStart(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  date.setHours(0, 0, 0, 0);
+  return date;
+}
+
+function localDayKey(value) {
+  return [
+    value.getFullYear(),
+    String(value.getMonth() + 1).padStart(2, '0'),
+    String(value.getDate()).padStart(2, '0'),
+  ].join('-');
+}
+
+/**
+ * 按执行完成时间统计生成的视频结果数量。
+ * 同一次执行的本地路径与远程 URL 通常指向同一批结果，因此取两者较大值避免重复计数。
+ */
+export function buildGenerationStats(tasks = [], now = new Date()) {
+  const todayStart = localDayStart(now);
+  const emptyRange = () => ({ total: 0, standard: 0, fast: 0, records: [] });
+  if (!todayStart) {
+    return {
+      today: 0,
+      yesterday: 0,
+      last7Days: 0,
+      total: 0,
+      standard: 0,
+      fast: 0,
+      days: [],
+      ranges: {
+        today: emptyRange(),
+        yesterday: emptyRange(),
+        last7Days: emptyRange(),
+      },
+    };
+  }
+  const yesterdayStart = new Date(todayStart);
+  yesterdayStart.setDate(yesterdayStart.getDate() - 1);
+  const last7DaysStart = new Date(todayStart);
+  last7DaysStart.setDate(last7DaysStart.getDate() - 6);
+  const tomorrowStart = new Date(todayStart);
+  tomorrowStart.setDate(tomorrowStart.getDate() + 1);
+  const days = Array.from({ length: 7 }, (_, index) => {
+    const date = new Date(todayStart);
+    date.setDate(date.getDate() - index);
+    return {
+      key: localDayKey(date),
+      label: index === 0 ? '今天' : index === 1 ? '昨天' : `${date.getMonth() + 1}月${date.getDate()}日`,
+      count: 0,
+      standard: 0,
+      fast: 0,
+      records: [],
+    };
+  });
+  const dayByKey = new Map(days.map((day) => [day.key, day]));
+
+  const stats = {
+    today: 0,
+    yesterday: 0,
+    last7Days: 0,
+    total: 0,
+    standard: 0,
+    fast: 0,
+    days,
+    ranges: {
+      today: emptyRange(),
+      yesterday: emptyRange(),
+      last7Days: emptyRange(),
+    },
+  };
+
+  const addToRange = (range, record) => {
+    range.total += record.count;
+    range[record.modelKind] += record.count;
+    range.records.push(record);
+  };
+
+  for (const task of tasks || []) {
+    for (const item of deriveTaskHistory(task)) {
+      if (item.status !== 'succeeded') continue;
+      const count = resultCount(item);
+      if (!count) continue;
+      const modelVersion = executionModelVersion(item) || task?.params?.model_version || '';
+      const modelKind = modelVersion === 'seedance2.0fast' ? 'fast' : 'standard';
+      const record = {
+        id: item.id,
+        taskId: task.id,
+        taskTitle: task.title || '未命名任务',
+        finishedAt: item.finished_at || '',
+        count,
+        modelKind,
+        modelVersion: modelVersion || (modelKind === 'fast' ? 'seedance2.0fast' : 'seedance2.0'),
+      };
+      stats.total += count;
+      stats[modelKind] += count;
+      const finishedAt = new Date(item.finished_at || '');
+      if (Number.isNaN(finishedAt.getTime())) continue;
+      if (finishedAt >= todayStart && finishedAt < tomorrowStart) {
+        stats.today += count;
+        addToRange(stats.ranges.today, record);
+      }
+      if (finishedAt >= yesterdayStart && finishedAt < todayStart) {
+        stats.yesterday += count;
+        addToRange(stats.ranges.yesterday, record);
+      }
+      if (finishedAt >= last7DaysStart && finishedAt < tomorrowStart) {
+        stats.last7Days += count;
+        addToRange(stats.ranges.last7Days, record);
+        const day = dayByKey.get(localDayKey(finishedAt));
+        if (day) {
+          day.count += count;
+          day[record.modelKind] += count;
+          day.records.push(record);
+        }
+      }
+    }
+  }
+  Object.values(stats.ranges).forEach((range) => {
+    range.records.sort((a, b) => (b.finishedAt || '').localeCompare(a.finishedAt || ''));
+  });
+  stats.days.forEach((day) => {
+    day.records.sort((a, b) => (b.finishedAt || '').localeCompare(a.finishedAt || ''));
+  });
+  return stats;
+}
+
 /**
  * 派生当前查看/操作的执行记录。
  * 优先级：显式选中的执行记录 > task.submit_id 对应记录 > 最新执行记录/legacy。

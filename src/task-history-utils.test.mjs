@@ -4,6 +4,7 @@ import {
   deriveCurrentExecutionRecord,
   deriveCurrentQueryRecords,
   deriveTaskHistory,
+  buildGenerationStats,
   historyHasResults,
   historyItemLabel,
   isInterruptNotice,
@@ -18,6 +19,122 @@ test('null task returns empty array', () => {
 test('task with no history returns empty array', () => {
   const task = { id: 't1', status: 'queued', attempts: [], result_paths: [], result_urls: [], submit_id: '' };
   assert.deepEqual(deriveTaskHistory(task), []);
+});
+
+test('buildGenerationStats counts successful videos by local calendar day without double counting paths and urls', () => {
+  const now = new Date(2026, 6, 24, 12, 0, 0);
+  const at = (daysAgo, hour) => {
+    const value = new Date(2026, 6, 24 - daysAgo, hour, 0, 0);
+    return value.toISOString();
+  };
+  const tasks = [{
+    id: 'stats',
+    execution_records: [
+      {
+        id: 'today',
+        status: 'succeeded',
+        started_at: at(0, 9),
+        finished_at: at(0, 10),
+        result_paths: ['/tmp/today-a.mp4'],
+        result_urls: ['https://cdn/today-a.mp4', 'https://cdn/today-b.mp4'],
+        input_snapshot: { params: { model_version: 'seedance2.0fast' } },
+      },
+      {
+        id: 'yesterday',
+        status: 'succeeded',
+        started_at: at(1, 8),
+        finished_at: at(1, 9),
+        result_paths: [],
+        result_urls: ['https://cdn/yesterday.mp4'],
+      },
+      {
+        id: 'week',
+        status: 'succeeded',
+        started_at: at(6, 8),
+        finished_at: at(6, 9),
+        result_paths: ['/tmp/week.mp4'],
+        result_urls: [],
+      },
+      {
+        id: 'old',
+        status: 'succeeded',
+        started_at: at(8, 8),
+        finished_at: at(8, 9),
+        result_paths: [],
+        result_urls: ['https://cdn/old.mp4'],
+      },
+      {
+        id: 'failed',
+        status: 'failed',
+        started_at: at(0, 8),
+        finished_at: at(0, 9),
+        result_paths: [],
+        result_urls: ['https://cdn/failed.mp4'],
+      },
+    ],
+  }];
+
+  const stats = buildGenerationStats(tasks, now);
+  assert.deepEqual({
+    today: stats.today,
+    yesterday: stats.yesterday,
+    last7Days: stats.last7Days,
+    total: stats.total,
+  }, {
+    today: 2,
+    yesterday: 1,
+    last7Days: 4,
+    total: 5,
+  });
+  assert.deepEqual(stats.days.map((day) => day.count), [2, 1, 0, 0, 0, 0, 1]);
+  assert.deepEqual(stats.days.map((day) => [day.standard, day.fast]), [
+    [0, 2],
+    [1, 0],
+    [0, 0],
+    [0, 0],
+    [0, 0],
+    [0, 0],
+    [1, 0],
+  ]);
+  assert.deepEqual(stats.days.map((day) => day.records.map((record) => record.id)), [
+    ['today'],
+    ['yesterday'],
+    [],
+    [],
+    [],
+    [],
+    ['week'],
+  ]);
+  assert.deepEqual({
+    totalStandard: stats.standard,
+    totalFast: stats.fast,
+    today: {
+      total: stats.ranges.today.total,
+      standard: stats.ranges.today.standard,
+      fast: stats.ranges.today.fast,
+    },
+    yesterday: {
+      total: stats.ranges.yesterday.total,
+      standard: stats.ranges.yesterday.standard,
+      fast: stats.ranges.yesterday.fast,
+    },
+    weekRecordIds: stats.ranges.last7Days.records.map((record) => record.id),
+  }, {
+    totalStandard: 3,
+    totalFast: 2,
+    today: { total: 2, standard: 0, fast: 2 },
+    yesterday: { total: 1, standard: 1, fast: 0 },
+    weekRecordIds: ['today', 'yesterday', 'week'],
+  });
+  assert.deepEqual(stats.ranges.today.records[0], {
+    id: 'today',
+    taskId: 'stats',
+    taskTitle: '未命名任务',
+    finishedAt: at(0, 10),
+    count: 2,
+    modelKind: 'fast',
+    modelVersion: 'seedance2.0fast',
+  });
 });
 
 test('task with execution_records returns record items', () => {
