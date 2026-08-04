@@ -17,6 +17,7 @@
 | A5 | `plan.md#本期最小闭环` | README 图片路径、内部锚点、安装/测试/构建命令可解析 | P1 | Markdown 链接检查与命令检查 | passed |
 | A6 | `plan.md#不做` | 未修改产品功能代码，未覆盖工作区原有未提交改动 | P0 | `git diff -- README.md docs/...` 与 `git status` | passed |
 | A7 | `plan.md#复杂度预算` | 未新增运行时机制或第二事实源 | P0 | 变更文件清单 | passed |
+| A8 | `plan.md#本期最小闭环` | README 提供可执行的 MCP / Agent 接入说明，并准确区分 App 自动调度与纯 MCP 单步推进 | P0 | MCP 构建、`tools/list` 冒烟与 README 人工审阅 | passed |
 
 ## 不作为通过依据
 
@@ -35,7 +36,7 @@
 - 执行方式：Codex + `gg-harness`；截图阶段使用隔离演示实例
 - 执行时间：2026-08-04
 - 执行者/会话：Codex 当前任务
-- 关联提交/PR/变更摘要：未提交；修改 `README.md`，新增 `docs/images/queue-center.png`、`docs/images/queue-settings.png` 及本需求 Harness 记录
+- 关联提交/PR/变更摘要：`c7347fd` 完成首轮 README 与截图；本轮补充 MCP / Agent 接入说明与验收证据
 - 详细结果文件：无
 
 ### 验收项结果
@@ -49,6 +50,7 @@
 | A5 | passed | 图片存在性、编码、标题与 `git diff --check` 检查；`npm test`、`npm run build` | 命令与相对图片路径可用 |
 | A6 | passed | `git status --short` 与变更文件核对 | 仅 README、图片和本需求文档属于本轮；原有源码改动未触碰 |
 | A7 | passed | 本轮变更文件清单 | 无运行时代码、表、状态、线程或调度机制变更 |
+| A8 | passed | Release 构建成功；stdio `initialize + tools/list` 返回 `dreamina-scheduler 0.2.5` 与 6 个预期工具 | README 同时写明 App 常驻调度、纯 MCP 单步推进和共享数据目录 |
 
 ### 验证命令与结果
 
@@ -62,6 +64,9 @@
 | `cargo test submit_with_submit_id_and_exceed_concurrency_limit_enters_retry_wait` | pass | 1 passed |
 | `git diff --check` | pass | 无空白错误 |
 | README 图片与编码检查 | pass | 两张 PNG 存在且非空；README 无 Unicode replacement character |
+| `cargo build --release --manifest-path src-tauri/Cargo.toml --bin dreamina-mcp` | pass | Release MCP 二进制构建成功 |
+| MCP stdio `initialize + tools/list` | pass | Server `dreamina-scheduler 0.2.5`；返回 6 个 README 所列工具 |
+| `cargo test --manifest-path src-tauri/Cargo.toml --bin dreamina-mcp` | pass | 4 passed，覆盖标准、嵌套、别名包装与扁平参数 |
 
 ### 独立审查
 
