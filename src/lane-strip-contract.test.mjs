@@ -36,3 +36,17 @@ test('generation stats keeps its overview height and five-column rows inside lon
   assert.match(styles, /\.generation-record-list\s*\{[\s\S]*?flex:\s*1 1 auto/);
   assert.match(styles, /\.generation-sparkline button\.active > b\s*\{/);
 });
+
+test('lane performance shows real 24-hour occupancy and clickable seven-day speed hours', () => {
+  assert.doesNotMatch(source, /占用时间线（最近 60 分钟）/);
+  assert.match(source, /近 24 小时任务占用/);
+  assert.match(source, /近 7 天速度 · 按开始小时/);
+  assert.match(source, /buildLanePerformance/);
+  assert.match(source, /onSelectSpeedHour/);
+  assert.match(source, /PerformanceHourModal/);
+  assert.match(source, /同车道、同视频秒数的中位耗时为基线/);
+  assert.match(styles, /\.lane-speed-grid\s*\{[\s\S]*?grid-template-columns:\s*repeat\(24/);
+  assert.match(styles, /\.lane-occupancy-segment\s*\{[\s\S]*?position:\s*absolute/);
+  assert.doesNotMatch(styles, /occupancy-pulse/);
+  assert.match(styles, /\.lane-task-row\.performance-record-row\s*\{/);
+});

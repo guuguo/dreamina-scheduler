@@ -6,6 +6,9 @@
 /// Linux：暂不支持，is_active() 返回 false。
 use std::sync::Mutex;
 
+#[cfg(target_os = "macos")]
+const MACOS_CAFFEINATE_ARGS: &[&str] = &["-s", "-i"];
+
 #[cfg(target_os = "windows")]
 mod win {
     // kernel32 在 Windows 上由 Rust std 默认链接，无需额外依赖
@@ -50,7 +53,7 @@ impl KeepAwakeGuard {
         #[cfg(target_os = "macos")]
         {
             match std::process::Command::new("caffeinate")
-                .args(["-s", "-i"])
+                .args(MACOS_CAFFEINATE_ARGS)
                 .spawn()
             {
                 Ok(child) => {
@@ -112,5 +115,14 @@ impl KeepAwakeGuard {
     /// 当前是否已激活防休眠。
     pub fn is_active(&self) -> bool {
         self.state.lock().map(|s| s.active).unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_keep_awake_prevents_system_sleep_without_forcing_display_awake() {
+        assert_eq!(super::MACOS_CAFFEINATE_ARGS, &["-s", "-i"]);
     }
 }

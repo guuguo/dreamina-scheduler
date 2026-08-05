@@ -24,7 +24,7 @@ const SUPPORTED_MODELS: &[&str] = &["seedance2.0", "seedance2.0fast"];
 const MAX_IMAGES: usize = 9;
 const MAX_AUDIO: usize = 3;
 /// 自动查询最长等待时间，超过后停止自动查询，改为手动。
-const MAX_WAIT_HOURS: i64 = 6;
+const MAX_WAIT_HOURS: i64 = 30;
 const MAX_NO_REMOTE_QUEUE_INFO_MINUTES: i64 = 10;
 /// 5xx 服务器错误自动重试上限次数
 const MAX_SERVER_ERROR_RETRIES: u32 = 2;
@@ -2516,6 +2516,14 @@ pub fn is_past_max_wait(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
         .unwrap_or(false)
 }
 
+fn should_resume_after_legacy_max_wait(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
+    task.status == "submitted"
+        && task.auto_query_stopped
+        && task.last_error.contains("自动查询已停止（已等待超过")
+        && task.last_error.contains("小时")
+        && !is_past_max_wait(task, now)
+}
+
 fn is_past_no_remote_queue_info_wait(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
     let Some(ref submitted_at) = task.submitted_at else {
         return false;
@@ -4347,6 +4355,21 @@ pub fn recover_tasks_on_load(data: &mut AppData) {
             task.auto_query_stopped = true;
             if task.last_error.is_empty() || task.last_error.contains("查询超时") {
                 task.last_error = "自动查询已超时，请手动查询".to_string();
+            }
+        }
+        // 兼容旧版更短的自动查询上限：尚未达到当前上限的任务恢复自动查询。
+        if should_resume_after_legacy_max_wait(task, Utc::now()) {
+            reset_query_backoff(task);
+            task.last_error.clear();
+            task.updated_at = now_rfc3339();
+            if let Some(record) = task
+                .execution_records
+                .iter_mut()
+                .find(|record| record.submit_id == task.submit_id)
+            {
+                if record.error_detail.contains("自动查询已停止（已等待超过") {
+                    record.error_detail.clear();
+                }
             }
         }
         if task.status == "retry_wait" && is_concurrency_limit(&task.last_error) {
@@ -7981,9 +8004,11 @@ pub fn run() {
                 log_lifecycle_from_manager(app_handle, "app_resumed", "应用事件循环恢复", "");
             }
             tauri::RunEvent::ExitRequested { .. } => {
+                app_handle.state::<keep_awake::KeepAwakeGuard>().release();
                 log_lifecycle_from_manager(app_handle, "app_exit_requested", "应用请求退出", "");
             }
             tauri::RunEvent::Exit => {
+                app_handle.state::<keep_awake::KeepAwakeGuard>().release();
                 log_lifecycle_from_manager(app_handle, "app_exit", "应用退出", "");
             }
             _ => {}
@@ -11563,7 +11588,7 @@ mod tests {
 
     #[test]
     fn is_past_max_wait_under_limit_returns_false() {
-        let recent = (Utc::now() - Duration::hours(2)).to_rfc3339();
+        let recent = (Utc::now() - Duration::hours(29)).to_rfc3339();
         assert!(!is_past_max_wait(
             &make_past_max_task(Some(&recent)),
             Utc::now()
@@ -11571,8 +11596,8 @@ mod tests {
     }
 
     #[test]
-    fn is_past_max_wait_over_6_hours_returns_true() {
-        let past = (Utc::now() - Duration::hours(7)).to_rfc3339();
+    fn is_past_max_wait_over_30_hours_returns_true() {
+        let past = (Utc::now() - Duration::hours(31)).to_rfc3339();
         assert!(is_past_max_wait(
             &make_past_max_task(Some(&past)),
             Utc::now()
@@ -11580,8 +11605,8 @@ mod tests {
     }
 
     #[test]
-    fn is_past_max_wait_exactly_6_hours_returns_true() {
-        let past = (Utc::now() - Duration::hours(6)).to_rfc3339();
+    fn is_past_max_wait_exactly_30_hours_returns_true() {
+        let past = (Utc::now() - Duration::hours(30)).to_rfc3339();
         assert!(is_past_max_wait(
             &make_past_max_task(Some(&past)),
             Utc::now()
@@ -11599,7 +11624,7 @@ mod tests {
     // ── manual query bypasses max-wait cap ─────────────────────────────────
 
     fn make_long_pending_task() -> ScheduledTask {
-        let submitted = (Utc::now() - Duration::hours(6)).to_rfc3339();
+        let submitted = (Utc::now() - Duration::hours(30)).to_rfc3339();
         let mut task = make_backoff_task(0, None, true);
         task.id = "task-stale".to_string();
         task.title = "Stale".to_string();
@@ -12691,6 +12716,48 @@ mod tests {
         assert!(task.auto_query_stopped);
         // 自定义错误不包含"查询超时"，应保留原值
         assert_eq!(task.last_error, "自定义错误");
+    }
+
+    #[test]
+    fn recover_tasks_on_load_resumes_legacy_ten_hour_stop_before_new_limit() {
+        let mut task = make_migration_task(
+            "submitted",
+            "自动查询已停止（已等待超过 10 小时），请手动查询",
+        );
+        task.submitted_at = Some((Utc::now() - Duration::hours(12)).to_rfc3339());
+        task.auto_query_stopped = true;
+        let mut data = AppData {
+            tasks: vec![task],
+            ..AppData::default()
+        };
+
+        recover_tasks_on_load(&mut data);
+
+        let task = &data.tasks[0];
+        assert_eq!(task.status, "submitted");
+        assert!(!task.auto_query_stopped);
+        assert!(task.last_error.is_empty());
+        assert_eq!(task.last_auto_query_at, None);
+    }
+
+    #[test]
+    fn recover_tasks_on_load_keeps_legacy_stop_after_new_limit() {
+        let mut task = make_migration_task(
+            "submitted",
+            "自动查询已停止（已等待超过 10 小时），请手动查询",
+        );
+        task.submitted_at = Some((Utc::now() - Duration::hours(31)).to_rfc3339());
+        task.auto_query_stopped = true;
+        let mut data = AppData {
+            tasks: vec![task],
+            ..AppData::default()
+        };
+
+        recover_tasks_on_load(&mut data);
+
+        let task = &data.tasks[0];
+        assert!(task.auto_query_stopped);
+        assert!(task.last_error.contains("已等待超过 10 小时"));
     }
 
     #[test]

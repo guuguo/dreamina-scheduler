@@ -4,6 +4,7 @@ import { test } from 'node:test';
 
 const mainSource = readFileSync(new URL('./main.jsx', import.meta.url), 'utf8');
 const indexSource = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+const stylesSource = readFileSync(new URL('./styles.css', import.meta.url), 'utf8');
 const tauriConfig = JSON.parse(readFileSync(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
 const tauriSource = readFileSync(new URL('../src-tauri/src/lib.rs', import.meta.url), 'utf8');
 
@@ -12,6 +13,8 @@ test('webview is throttled without full suspension and uses the app shell color'
 
   assert.equal(mainWindow.backgroundThrottling, 'throttle');
   assert.equal(mainWindow.backgroundColor, '#F4F7FC');
+  const windowBarStyles = stylesSource.match(/\.window-bar\s*\{[^}]*\}/)?.[0] || '';
+  assert.doesNotMatch(windowBarStyles, /backdrop-filter/);
 });
 
 test('html paints a startup shell before the JavaScript bundle is ready', () => {
@@ -50,6 +53,13 @@ test('large state reads and task mutations use Tauri async command dispatch', ()
   ]) {
     assert.match(tauriSource, new RegExp(`#\\[tauri::command\\(async\\)\\]\\n    pub fn ${command}`));
   }
+});
+
+test('application exit releases its macOS keep-awake assertion', () => {
+  assert.match(
+    tauriSource,
+    /RunEvent::ExitRequested[\s\S]*?state::<keep_awake::KeepAwakeGuard>\(\)[\s\S]*?\.release\(\)/,
+  );
 });
 
 test('task prompt editor is loaded only when the create view needs it', () => {

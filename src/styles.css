@@ -174,8 +174,7 @@ textarea:focus {
 
 .desktop-shell {
   position: relative;
-  display: grid;
-  grid-template-columns: 160px minmax(0, 1fr);
+  display: block;
   width: 100vw;
   height: 100vh;
   margin: 0;
@@ -196,15 +195,13 @@ textarea:focus {
   justify-content: space-between;
   height: 56px;
   border-bottom: 1px solid var(--border);
-  background: rgb(255 255 255 / 96%);
-  backdrop-filter: blur(18px);
+  background: #ffffff;
   padding: 0 18px 0 0;
   -webkit-app-region: drag;
   user-select: none;
 }
 
-.window-title,
-.brand {
+.window-title {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -216,14 +213,33 @@ textarea:focus {
   flex: 0 0 auto;
 }
 
-.brand {
-  display: none;
+.window-home {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  height: 36px;
+  border-radius: 10px;
+  padding: 0 6px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
 }
 
-.window-title strong {
+.window-home:hover {
+  background: #f1f4fb;
+}
+
+.window-home strong {
   font-size: 14px;
   font-weight: 800;
   letter-spacing: 0;
+}
+
+.window-version {
+  color: #97a1b3;
+  font-size: 10px;
+  font-weight: 700;
 }
 
 .brand-mark {
@@ -353,95 +369,22 @@ textarea:focus {
   background: #f1f4fb;
 }
 
-.sidebar {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 72px 8px 16px;
-  border-right: 1px solid var(--border);
-  background: #ffffff;
-}
-
-.sidebar nav {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-
-.sidebar nav button {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  height: 38px;
-  border-radius: 8px;
-  background: transparent;
-  color: #59667d;
-  padding: 0 12px;
-  text-align: left;
-  cursor: pointer;
-  white-space: nowrap;
-}
-
-.sidebar nav button svg {
-  width: 16px;
-  height: 16px;
-  flex-shrink: 0;
-}
-
-.sidebar nav button span {
-  font-size: 12px;
-  line-height: 1;
-}
-
-.sidebar nav button:hover,
-.sidebar nav button.active {
+.window-actions button.active {
   background: #eef0ff;
   color: #3843e9;
-  font-weight: 800;
 }
 
-.sidebar-output-button {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: calc(100% - 4px);
-  min-height: 42px;
-  margin: 10px 2px 0;
-  border: 1px solid #bfe8d6;
-  border-radius: 8px;
-  background: linear-gradient(135deg, #e8fff5 0%, #edf8ff 100%);
+.window-actions button.output:not(:disabled) {
   color: #087a5b;
-  padding: 0 10px;
-  text-align: left;
-  cursor: pointer;
-  box-shadow: 0 10px 22px rgb(8 122 91 / 10%);
 }
 
-.sidebar-output-button span {
-  font-size: 12px;
-  font-weight: 900;
-  line-height: 1;
+.window-actions button.output:hover:not(:disabled) {
+  background: #e7f8f1;
 }
 
-.sidebar-output-button:hover:not(:disabled) {
-  border-color: #91d8be;
-  background: linear-gradient(135deg, #dcffef 0%, #e4f4ff 100%);
-}
-
-.sidebar-output-button:disabled {
-  border-color: #e4e8f0;
-  background: #f5f7fb;
-  color: #a1acbd;
+.window-actions button:disabled {
+  color: #b7bfcd;
   cursor: not-allowed;
-  box-shadow: none;
-}
-
-.version {
-  margin-top: auto;
-  color: #8792a6;
-  font-size: 11px;
-  text-align: center;
 }
 
 .app-window {
@@ -5187,38 +5130,152 @@ button:disabled {
   animation: spin .7s linear infinite;
 }
 
-.lane-timeline {
+.lane-performance {
   padding: 10px 14px 12px;
 }
 
-.lane-timeline div {
+.lane-performance-head,
+.lane-speed-head {
   display: flex;
+  align-items: center;
   justify-content: space-between;
   color: var(--muted);
   font-size: 10.5px;
   font-weight: 800;
-  margin-bottom: 8px;
 }
 
-.lane-timeline p {
-  display: grid;
-  grid-template-columns: repeat(54, minmax(2px, 1fr));
-  gap: 3px;
-  margin: 0;
+.lane-occupancy-track {
+  position: relative;
+  height: 12px;
+  margin-top: 7px;
+  overflow: hidden;
+  border-radius: 4px;
+  background: #e8edf5;
 }
 
-.lane-timeline i {
-  height: 10px;
-  border-radius: 999px;
-  background: #e1e7f0;
+.lane-occupancy-track > i {
+  position: absolute;
+  z-index: 1;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: rgb(255 255 255 / 80%);
+  pointer-events: none;
 }
 
-.lane-timeline i.on {
+.lane-occupancy-segment {
+  position: absolute;
+  z-index: 2;
+  top: 2px;
+  bottom: 2px;
+  min-width: 2px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
   background: var(--primary);
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 24%);
+  cursor: pointer;
 }
 
-.lane-card.fast .lane-timeline i.on {
+.lane-card.fast .lane-occupancy-segment {
   background: #10a36a;
+}
+
+.lane-occupancy-segment.status-failed {
+  background: #e15866;
+}
+
+.lane-occupancy-segment.status-active {
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 42%), 0 0 0 1px rgb(79 89 216 / 16%);
+}
+
+.lane-occupancy-axis {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 3px;
+  color: #9aa5b6;
+  font-family: var(--mono);
+  font-size: 8px;
+}
+
+.lane-speed-head {
+  margin-top: 8px;
+}
+
+.lane-speed-legend {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 8px;
+  font-weight: 700;
+}
+
+.lane-speed-legend i {
+  width: 6px;
+  height: 6px;
+  margin-left: 3px;
+  border-radius: 2px;
+}
+
+.lane-speed-legend .faster,
+.lane-speed-grid .faster {
+  background: #35b87f;
+}
+
+.lane-speed-legend .steady,
+.lane-speed-grid .steady {
+  background: #e9b949;
+}
+
+.lane-speed-legend .slower,
+.lane-speed-grid .slower {
+  background: #e86f6f;
+}
+
+.lane-speed-grid {
+  display: grid;
+  grid-template-columns: repeat(24, minmax(3px, 1fr));
+  gap: 2px;
+  margin-top: 5px;
+}
+
+.lane-speed-grid button {
+  height: 12px;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  color: rgb(255 255 255 / 92%);
+  font-family: var(--mono);
+  font-size: 6px;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.lane-speed-grid button:hover:not(:disabled),
+.lane-speed-grid button:focus-visible {
+  outline: 2px solid rgb(27 36 64 / 25%);
+  outline-offset: 1px;
+  transform: translateY(-1px);
+}
+
+.lane-speed-grid button.empty,
+.lane-speed-grid button:disabled {
+  background: #e1e7f0;
+  cursor: default;
+}
+
+.lane-speed-axis {
+  display: grid;
+  grid-template-columns: repeat(24, minmax(3px, 1fr));
+  margin-top: 2px;
+  color: #9aa5b6;
+  font-family: var(--mono);
+  font-size: 7px;
+}
+
+.lane-speed-axis span {
+  justify-self: center;
 }
 
 .lane-summary-row {
@@ -5759,6 +5816,87 @@ button:disabled {
 
 .generation-record-list {
   flex: 1 1 auto;
+}
+
+.performance-hour-dialog {
+  width: min(820px, calc(100vw - 48px));
+  max-height: min(82vh, 760px);
+}
+
+.performance-hour-summary {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+  padding: 12px 18px;
+  overflow-x: auto;
+  border-bottom: 1px solid #edf0f6;
+  background: #f8f9fc;
+}
+
+.performance-hour-summary > div {
+  min-width: 150px;
+  padding: 9px 11px;
+  border: 1px solid #e2e7f0;
+  border-radius: 9px;
+  background: #fff;
+}
+
+.performance-hour-summary span,
+.performance-hour-summary b {
+  display: block;
+}
+
+.performance-hour-summary span {
+  color: #8792a6;
+  font-size: 9px;
+}
+
+.performance-hour-summary b {
+  margin-top: 4px;
+  color: #27324b;
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+.performance-hour-summary b.faster,
+.performance-record-speed.faster {
+  color: #15865c;
+}
+
+.performance-hour-summary b.steady,
+.performance-record-speed.steady {
+  color: #b47708;
+}
+
+.performance-hour-summary b.slower,
+.performance-record-speed.slower {
+  color: #d34f59;
+}
+
+.performance-record-list {
+  flex: 1 1 auto;
+  margin: 12px 18px;
+  min-height: 90px;
+  border: 1px solid #e6ebf3;
+  border-radius: 11px;
+}
+
+.lane-task-row.performance-record-row {
+  grid-template-columns: 46px minmax(0, 1fr) 72px 84px 18px;
+}
+
+.performance-record-duration {
+  color: #59667d;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 800;
+  text-align: right;
+}
+
+.performance-record-speed {
+  font-size: 10px;
+  font-weight: 900;
+  text-align: right;
 }
 
 .lane-task-row {
@@ -7775,7 +7913,13 @@ button:disabled {
   .lane-task-row.generation-record-row {
     grid-template-columns: 42px minmax(0, 1fr) 72px 18px;
   }
+  .lane-task-row.performance-record-row {
+    grid-template-columns: 42px minmax(0, 1fr) 68px 18px;
+  }
   .generation-record-model {
+    display: none;
+  }
+  .performance-record-speed {
     display: none;
   }
   .lane-strip {
@@ -7835,6 +7979,10 @@ button:disabled {
     grid-row: 1 / span 2;
   }
   .lane-task-row.generation-record-row .lane-task-open-icon {
+    grid-column: 4;
+    grid-row: auto;
+  }
+  .lane-task-row.performance-record-row .lane-task-open-icon {
     grid-column: 4;
     grid-row: auto;
   }

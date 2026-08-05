@@ -6,11 +6,9 @@ import {
   laneModelVersion,
   formatNextCheckAt,
   getLaneRemoteOccupancyDisplay,
-  taskSubmitQueueKind,
 } from '../lane-utils.js';
+import { buildLanePerformance } from '../lane-performance-utils.js';
 import { resolveMediaSrc } from '../media-src.js';
-
-const ACTIVE_STATUSES = ['submitting', 'submitted', 'querying'];
 
 /**
  * LaneStrip — 双车道状态条（原型 lane-strip 区域）
@@ -36,6 +34,7 @@ export default function LaneStrip({
 }) {
   const [sharedPoolOpen, setSharedPoolOpen] = React.useState(false);
   const [generationStatsOpen, setGenerationStatsOpen] = React.useState(false);
+  const [performanceHour, setPerformanceHour] = React.useState(null);
   const standard = laneStatuses.find(s => s.queueKind === 'standard') || null;
   const fast = laneStatuses.find(s => s.queueKind === 'fast') || null;
   const enabledCount = laneStatuses.filter((lane) => lane.enabled !== false).length;
@@ -45,6 +44,7 @@ export default function LaneStrip({
   const selectTask = (taskId) => {
     setSharedPoolOpen(false);
     setGenerationStatsOpen(false);
+    setPerformanceHour(null);
     onSelectTask?.(taskId);
   };
 
@@ -52,9 +52,11 @@ export default function LaneStrip({
     <section className="lane-strip" aria-label="模型车道状态">
       <LaneCard lane={standard} kind="standard" tasks={tasks} nowMs={nowMs} sharedTaskCount={sharedStats.total}
         onToggleLane={onToggleLane} onProbeLane={onProbeLane}
+        onSelectTask={selectTask} onSelectSpeedHour={(hour) => setPerformanceHour({ kind: 'standard', hour })}
         pending={pendingLaneKind === 'standard'} probePending={pendingProbeLaneKind === 'standard'} canDisable={enabledCount > 1} />
       <LaneCard lane={fast} kind="fast" tasks={tasks} nowMs={nowMs} sharedTaskCount={sharedStats.total}
         onToggleLane={onToggleLane} onProbeLane={onProbeLane}
+        onSelectTask={selectTask} onSelectSpeedHour={(hour) => setPerformanceHour({ kind: 'fast', hour })}
         pending={pendingLaneKind === 'fast'} probePending={pendingProbeLaneKind === 'fast'} canDisable={enabledCount > 1} />
       <div className="lane-summary-row">
         <button type="button" className="shared-dispatch-pool" onClick={() => setSharedPoolOpen(true)}
@@ -95,6 +97,18 @@ export default function LaneStrip({
           roles={roles}
           onSelectTask={selectTask}
           onClose={() => setGenerationStatsOpen(false)}
+        />
+      ) : null}
+      {performanceHour ? (
+        <PerformanceHourModal
+          kind={performanceHour.kind}
+          hour={performanceHour.hour}
+          tasks={tasks}
+          nowMs={nowMs}
+          assetById={assetById}
+          roles={roles}
+          onSelectTask={selectTask}
+          onClose={() => setPerformanceHour(null)}
         />
       ) : null}
     </section>
@@ -279,7 +293,24 @@ function GenerationStatsModal({ stats, tasks, assetById, roles, onSelectTask, on
   );
 }
 
-function LaneCard({ lane, kind, tasks, nowMs, sharedTaskCount, onToggleLane, onProbeLane, pending, probePending, canDisable }) {
+function LaneCard({
+  lane,
+  kind,
+  tasks,
+  nowMs,
+  sharedTaskCount,
+  onToggleLane,
+  onProbeLane,
+  onSelectTask,
+  onSelectSpeedHour,
+  pending,
+  probePending,
+  canDisable,
+}) {
+  const performance = React.useMemo(
+    () => buildLanePerformance(tasks, kind, nowMs),
+    [tasks, kind, nowMs]
+  );
   if (!lane) {
     return (
       <article className={`lane-card ${kind === 'fast' ? 'fast' : ''}`}>
@@ -300,7 +331,6 @@ function LaneCard({ lane, kind, tasks, nowMs, sharedTaskCount, onToggleLane, onP
   const nextAt = formatLaneNextClock(lane.nextCheckAt, nowMs);
   const remote = getLaneRemoteOccupancyDisplay(lane);
   const nextStep = getLaneNextStep(lane, sharedTaskCount);
-  const ticks = getLaneTicks(tasks, kind, nowMs);
 
   return (
     <article className={`lane-card ${isFast ? 'fast' : ''}${enabled ? '' : ' disabled'}`}>
@@ -347,13 +377,125 @@ function LaneCard({ lane, kind, tasks, nowMs, sharedTaskCount, onToggleLane, onP
         </div>
       </div>
 
-      <div className="lane-timeline">
-        <div><span>占用时间线（最近 60 分钟）</span><span>{formatHourRange(nowMs)}</span></div>
-        <p>
-          {ticks.map((on, index) => <i key={index} className={on ? 'on' : ''} />)}
-        </p>
+      <div className="lane-performance">
+        <div className="lane-performance-head">
+          <span>近 24 小时任务占用</span>
+          <span>{formatDayRange(nowMs)}</span>
+        </div>
+        <div className="lane-occupancy-track" aria-label={`${title}近 24 小时任务占用`}>
+          {[0, 1, 2, 3, 4].map((index) => <i key={index} style={{ left: `${index * 25}%` }} />)}
+          {performance.occupancy.map((record) => (
+            <button
+              type="button"
+              key={record.id}
+              className={`lane-occupancy-segment status-${record.active ? 'active' : record.status || 'finished'}`}
+              style={{ left: `${record.leftPercent}%`, width: `${record.widthPercent}%` }}
+              title={`${record.taskTitle} · ${record.active ? `已运行 ${formatElapsed(record.elapsedMs)}` : `耗时 ${formatElapsed(record.elapsedMs)}`}`}
+              aria-label={`${record.taskTitle}，${record.active ? '正在生成' : '已结束'}，${formatElapsed(record.elapsedMs)}`}
+              onClick={() => onSelectTask?.(record.taskId)}
+            />
+          ))}
+        </div>
+        <div className="lane-occupancy-axis">
+          {formatRollingHourLabels(nowMs).map((label) => <span key={label}>{label}</span>)}
+        </div>
+
+        <div className="lane-speed-head">
+          <span>近 7 天速度 · 按开始小时</span>
+          <span className="lane-speed-legend"><i className="faster" />快 <i className="steady" />正常 <i className="slower" />慢</span>
+        </div>
+        <div className="lane-speed-grid" aria-label={`${title}近 7 天分时速度`}>
+          {performance.hours.map((hour) => (
+            <button
+              type="button"
+              key={hour.hour}
+              className={hour.tone}
+              disabled={!hour.count}
+              title={formatSpeedHourTitle(hour)}
+              aria-label={formatSpeedHourTitle(hour)}
+              onClick={() => onSelectSpeedHour?.(hour.hour)}
+            >
+              {hour.count || ''}
+            </button>
+          ))}
+        </div>
+        <div className="lane-speed-axis">
+          {[0, 3, 6, 9, 12, 15, 18, 21, 23].map((hour) => (
+            <span key={hour} style={{ gridColumn: hour + 1 }}>{String(hour).padStart(2, '0')}</span>
+          ))}
+        </div>
       </div>
     </article>
+  );
+}
+
+function PerformanceHourModal({ kind, hour, tasks, nowMs, assetById, roles, onSelectTask, onClose }) {
+  const performance = React.useMemo(
+    () => buildLanePerformance(tasks, kind, nowMs),
+    [tasks, kind, nowMs]
+  );
+  const selectedHour = performance.hours[hour] || { records: [], durationGroups: [], count: 0, speedRatio: NaN };
+  const hourLabel = `${String(hour).padStart(2, '0')}:00–${String((hour + 1) % 24).padStart(2, '0')}:00`;
+
+  React.useEffect(() => {
+    const closeOnEscape = (event) => {
+      if (event.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [onClose]);
+
+  return (
+    <div className="modal-backdrop lane-tasks-modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="lane-tasks-dialog performance-hour-dialog" role="dialog" aria-modal="true"
+        aria-labelledby="performance-hour-title" onMouseDown={(event) => event.stopPropagation()}>
+        <header className="lane-tasks-dialog-head">
+          <div>
+            <span>LANE PERFORMANCE</span>
+            <h2 id="performance-hour-title">{laneLabel(kind)}车道 · {hourLabel}</h2>
+          </div>
+          <strong>近 7 天 {selectedHour.count} 个</strong>
+          <button type="button" className="icon-ghost" onClick={onClose} title="关闭"><X size={17} /></button>
+        </header>
+
+        <div className="performance-hour-summary">
+          <div><span>相对速度</span><b className={selectedHour.tone}>{formatSpeedRatio(selectedHour.speedRatio)}</b></div>
+          {selectedHour.durationGroups.map((group) => (
+            <div key={group.duration}>
+              <span>{group.duration} 秒视频 · {group.count} 个</span>
+              <b>中位 {formatElapsed(group.medianMs)} · P90 {formatElapsed(group.p90Ms)}</b>
+            </div>
+          ))}
+        </div>
+
+        <div className="lane-tasks-list performance-record-list">
+          {selectedHour.records.length ? selectedHour.records.map((record) => {
+            const task = (tasks || []).find((item) => item.id === record.taskId);
+            const thumbPath = findTaskThumbPath(task || {}, assetById, roles);
+            return (
+              <button type="button" className="lane-task-row performance-record-row"
+                key={`${record.taskId}:${record.id}`} onClick={() => onSelectTask(record.taskId)}>
+                <span className="lane-task-thumb">
+                  {thumbPath ? <img src={resolveMediaSrc(thumbPath)} alt="" /> : <Image size={17} />}
+                </span>
+                <span className="lane-task-copy">
+                  <b>{record.taskTitle}</b>
+                  <em>{formatPerformanceRecordTime(record.startedAt)} 开始 · {record.videoDuration} 秒视频</em>
+                </span>
+                <span className="performance-record-duration">{formatElapsed(record.elapsedMs)}</span>
+                <span className={`performance-record-speed ${speedTone(record.speedRatio)}`}>
+                  {formatSpeedRatio(record.speedRatio)}
+                </span>
+                <ChevronRight className="lane-task-open-icon" size={16} />
+              </button>
+            );
+          }) : (
+            <div className="generation-record-empty">这个开始时段暂无完成记录</div>
+          )}
+        </div>
+        <footer>速度以最近 7 天同车道、同视频秒数的中位耗时为基线；点击任务可查看完整详情。</footer>
+      </section>
+    </div>
   );
 }
 
@@ -495,38 +637,6 @@ function getLaneNextStep(lane, sharedTaskCount) {
   return { tone: 'idle', title: '空闲', copy: '暂无本地待提交任务，继续按间隔探测。' };
 }
 
-function getLaneTicks(tasks, kind, nowMs) {
-  const bucketCount = 54;
-  const bucketMs = 60 * 60 * 1000 / bucketCount;
-  const ticks = new Array(bucketCount).fill(false);
-  const startMs = nowMs - 60 * 60 * 1000;
-
-  const mark = (value) => {
-    if (!value) return;
-    const ms = new Date(value).getTime();
-    if (!Number.isFinite(ms) || ms < startMs || ms > nowMs) return;
-    const index = Math.min(bucketCount - 1, Math.max(0, Math.floor((ms - startMs) / bucketMs)));
-    ticks[index] = true;
-  };
-
-  for (const task of tasks) {
-    if (taskSubmitQueueKind(task) === kind && ACTIVE_STATUSES.includes(task.status)) {
-      mark(task.submitted_at || task.updated_at);
-    }
-    for (const record of task.execution_records || []) {
-      const recordKind = record?.input_snapshot?.params?.model_version === 'seedance2.0fast' ? 'fast' : 'standard';
-      if (recordKind !== kind) continue;
-      mark(record.started_at);
-      mark(record.finished_at);
-      for (const query of record.query_records || record.attempts || []) {
-        mark(query.started_at);
-        mark(query.finished_at);
-      }
-    }
-  }
-  return ticks;
-}
-
 function formatLaneTime(isoTime, nowMs, immediateText) {
   if (!isoTime) return '—';
   const time = new Date(isoTime).getTime();
@@ -549,10 +659,60 @@ function formatLaneNextClock(isoTime, nowMs) {
   return formatClock(isoTime);
 }
 
-function formatHourRange(nowMs) {
-  const start = new Date(nowMs - 60 * 60 * 1000);
+function formatDayRange(nowMs) {
+  const start = new Date(nowMs - 24 * 60 * 60 * 1000);
   const end = new Date(nowMs);
-  return `${String(start.getHours()).padStart(2, '0')}:${String(start.getMinutes()).padStart(2, '0')} 至 ${String(end.getHours()).padStart(2, '0')}:${String(end.getMinutes()).padStart(2, '0')}`;
+  return `${formatMonthDayClock(start)} 至 ${formatMonthDayClock(end)}`;
+}
+
+function formatMonthDayClock(time) {
+  return `${time.getMonth() + 1}/${time.getDate()} ${String(time.getHours()).padStart(2, '0')}:${String(time.getMinutes()).padStart(2, '0')}`;
+}
+
+function formatRollingHourLabels(nowMs) {
+  return [24, 18, 12, 6, 0].map((hoursAgo) => {
+    if (hoursAgo === 0) return '现在';
+    const time = new Date(nowMs - hoursAgo * 60 * 60 * 1000);
+    return `${String(time.getHours()).padStart(2, '0')}:00`;
+  });
+}
+
+function formatElapsed(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return '—';
+  const minutes = Math.max(1, Math.round(ms / 60_000));
+  if (minutes < 60) return `${minutes}分`;
+  const hours = Math.floor(minutes / 60);
+  const remain = minutes % 60;
+  return remain ? `${hours}时${remain}分` : `${hours}时`;
+}
+
+function speedTone(ratio) {
+  if (!Number.isFinite(ratio)) return 'empty';
+  if (ratio < 0.85) return 'faster';
+  if (ratio > 1.15) return 'slower';
+  return 'steady';
+}
+
+function formatSpeedRatio(ratio) {
+  if (!Number.isFinite(ratio)) return '样本不足';
+  const percent = Math.round(Math.abs(ratio - 1) * 100);
+  if (percent < 5) return '接近基线';
+  return ratio < 1 ? `快 ${percent}%` : `慢 ${percent}%`;
+}
+
+function formatSpeedHourTitle(hour) {
+  const label = `${String(hour.hour).padStart(2, '0')}:00–${String((hour.hour + 1) % 24).padStart(2, '0')}:00`;
+  if (!hour.count) return `${label}，近 7 天暂无完成样本`;
+  const groups = hour.durationGroups
+    .map((group) => `${group.duration}秒：中位${formatElapsed(group.medianMs)}，${group.count}个`)
+    .join('；');
+  return `${label}，${formatSpeedRatio(hour.speedRatio)}，${groups}`;
+}
+
+function formatPerformanceRecordTime(value) {
+  const time = new Date(value);
+  if (!Number.isFinite(time.getTime())) return '时间未知';
+  return `${time.getMonth() + 1}月${time.getDate()}日 ${String(time.getHours()).padStart(2, '0')}:${String(time.getMinutes()).padStart(2, '0')}`;
 }
 
 function formatDuration(ms) {

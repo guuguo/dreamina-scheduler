@@ -27,8 +27,13 @@ test('image generation backend commands remain registered without page UI action
   }
 });
 
-test('sidebar exposes disabled-aware latest output folder shortcut', () => {
-  assert.match(source, /className="sidebar-output-button"/);
+test('top bar replaces the sidebar with role and output shortcuts', () => {
+  assert.doesNotMatch(source, /<aside className="sidebar">/);
+  assert.match(source, /className="window-home"/);
+  assert.match(source, /title="返回任务中心"/);
+  assert.match(source, /className=\{`window-action-button\$\{activeView === 'roles' \? ' active' : ''\}`\}/);
+  assert.match(source, /title="角色库"/);
+  assert.match(source, /className="window-action-button output"/);
   assert.match(source, /disabled=\{!latestSuccessfulResultPath\}/);
   assert.match(source, /产出文件夹/);
   assert.match(source, /invoke\('open_result_dir_command', \{ path: latestSuccessfulResultPath \}\)/);
@@ -75,7 +80,7 @@ test('queue center keeps actions in the right detail column and exposes lane swi
   assert.match(source, /className="qc-detail-column"/);
   assert.match(source, /onToggleLane=\{handleToggleLane\}/);
   assert.match(source, /invoke\('set_lane_enabled_command'/);
-  assert.match(source, /> 立即排队</);
+  assert.match(source, /'立即排队'/);
 });
 
 test('queue center exposes task search above the paginated task list', () => {
@@ -141,10 +146,19 @@ test('queue detail primary actions always expose task deletion', () => {
   assert.doesNotMatch(source, /className="qc-detail-actions"/);
 });
 
-test('main navigation icons are imported before use', () => {
+test('completed and failed tasks expose an explicit requeue action', () => {
+  const detailActions = source.match(/<div className="qc-console-actions">[\s\S]*?<\/div>/)?.[0] || '';
+  assert.match(detailActions, /selectedTask\.status === 'succeeded'/);
+  assert.match(detailActions, /openPrepareGenerate\(selectedTask\)/);
+  assert.match(detailActions, /重新排队/);
+});
+
+test('top bar navigation icons are imported before use', () => {
   const lucideImport = source.match(/import \{[\s\S]*?\} from 'lucide-react';/)?.[0] || '';
-  assert.match(source, /icon: ListChecks/);
-  assert.match(lucideImport, /\bListChecks\b/);
+  for (const icon of ['User', 'FolderOpen', 'Settings']) {
+    assert.match(lucideImport, new RegExp(`\\b${icon}\\b`));
+    assert.match(source, new RegExp(`<${icon} size=\\{16\\}`));
+  }
 });
 
 test('unused logs and image generation pages are removed from the main UI', () => {

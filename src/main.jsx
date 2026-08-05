@@ -83,7 +83,6 @@ import {
   FolderOpen,
   Image,
   ImagePlus,
-  ListChecks,
   Loader2,
   MoreHorizontal,
   Pause,
@@ -159,12 +158,6 @@ const defaultImageModelConfig = {
   base_url: 'https://api.openai.com/v1',
   model: 'gpt-image-1',
 };
-const views = [
-  { id: 'roles', label: '角色库', icon: User },
-  { id: 'queue', label: '任务中心', icon: ListChecks },
-  { id: 'settings', label: '设置', icon: Settings },
-];
-
 const emptyState = {
   settings: {
     concurrency_limit_policy: 'SilentRetry',
@@ -977,47 +970,15 @@ function App() {
 
   return (
     <main className="desktop-shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="brand-mark" />
-          <strong>Dreamina Scheduler</strong>
-        </div>
-        <nav>
-          {views.map((item) => {
-            const Icon = item.icon;
-            return (
-              <button
-                key={item.id}
-                type="button"
-                className={activeView === item.id ? 'active' : ''}
-                onClick={() => setActiveView(item.id)}
-                title={item.label}
-              >
-                <Icon size={17} />
-                <span>{item.label}</span>
-              </button>
-            );
-          })}
-        </nav>
-        <button
-          type="button"
-          className="sidebar-output-button"
-          disabled={!latestSuccessfulResultPath}
-          onClick={openLatestOutputFolder}
-          title={latestSuccessfulResultPath ? `打开最近产出目录：${latestSuccessfulResultPath}` : '暂无成功视频'}
-        >
-          <FolderOpen size={17} />
-          <span>产出文件夹</span>
-        </button>
-        {appVersion ? <span className="version">v{appVersion}</span> : null}
-      </aside>
-
       <section className="app-window">
         <header className="window-bar" data-tauri-drag-region onMouseDown={startWindowDrag}>
           <div className="window-title" data-tauri-drag-region onMouseDown={startWindowDrag}>
             <span className="traffic-spacer" data-tauri-drag-region />
-            <div className="brand-mark small" />
-            <strong>Dreamina Scheduler</strong>
+            <button type="button" className="window-home" title="返回任务中心" onClick={() => setActiveView('queue')}>
+              <span className="brand-mark small" />
+              <strong>Dreamina Scheduler</strong>
+              {appVersion ? <span className="window-version">v{appVersion}</span> : null}
+            </button>
             <StatusPill variant={cli.available ? 'ok' : 'bad'}>
               <CheckCircle2 size={13} />
               {cli.available ? `dreamina CLI ${cli.version || '已连接'}` : cli.message}
@@ -1037,9 +998,35 @@ function App() {
             ) : null}
           </div>
           <div className="window-actions">
+            <button
+              type="button"
+              className={`window-action-button${activeView === 'roles' ? ' active' : ''}`}
+              title="角色库"
+              aria-label="角色库"
+              onClick={() => setActiveView('roles')}
+            >
+              <User size={16} />
+            </button>
+            <button
+              type="button"
+              className="window-action-button output"
+              disabled={!latestSuccessfulResultPath}
+              title={latestSuccessfulResultPath ? `产出文件夹：${latestSuccessfulResultPath}` : '暂无成功视频'}
+              aria-label="产出文件夹"
+              onClick={openLatestOutputFolder}
+            >
+              <FolderOpen size={16} />
+            </button>
             <button type="button" title="重新检测 CLI" onClick={checkCli}><RefreshCcw size={16} /></button>
             <button type="button" title="通知"><Bell size={16} /></button>
-            <button type="button" title="设置" onClick={() => setActiveView('settings')}><Settings size={16} /></button>
+            <button
+              type="button"
+              className={`window-action-button${activeView === 'settings' ? ' active' : ''}`}
+              title="设置"
+              onClick={() => setActiveView('settings')}
+            >
+              <Settings size={16} />
+            </button>
           </div>
         </header>
 
@@ -2400,9 +2387,16 @@ function QueueView({
                     ) : (
                       <button type="button" className="qc-btn qc-btn-primary" onClick={() => openPrepareGenerate(selectedTask)}
                         disabled={!canScheduleTask(selectedTask) || pendingTaskOps[selectedTask.id]?.submit}>
-                        {pendingTaskOps[selectedTask.id]?.submit ? <><Loader2 size={13} className="spin" /> 排队中</> : <><Play size={13} /> 立即排队</>}
+                        {pendingTaskOps[selectedTask.id]?.submit
+                          ? <><Loader2 size={13} className="spin" /> 排队中</>
+                          : <><Play size={13} /> {['failed', 'succeeded'].includes(selectedTask.status) ? '重新排队' : '立即排队'}</>}
                       </button>
                     )}
+                    {selectedTask.status === 'succeeded' && resultItems.length ? (
+                      <button type="button" className="qc-btn" onClick={() => openPrepareGenerate(selectedTask)}>
+                        <RefreshCcw size={13} /> 重新排队
+                      </button>
+                    ) : null}
                     <button type="button" className="qc-btn" onClick={() => handleEditTask(selectedTask)}><Pencil size={13} /> 编辑</button>
                     <button type="button" className="qc-btn" onClick={() => handleDuplicateTask(selectedTask)}><Copy size={13} /> 复制</button>
                     {['scheduled', 'queued', 'retry_wait'].includes(selectedTask.status) ? (
